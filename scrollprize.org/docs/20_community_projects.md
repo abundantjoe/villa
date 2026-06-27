@@ -164,6 +164,8 @@ For state-of-the-art updates join our [Discord server](https://discord.com/invit
   
 - [ScrollFiesta -- virtual meshing & unwrapping for the Herculaneum papyri](https://github.com/Hob3rMallow/scrollfiesta_public) by HariSeldon and friends
 
+- [nml-toolkit](https://github.com/abundantjoe/vesuvius) by Joseph Balmaceda. Converts WEBKNOSSOS NML fiber-skeleton annotations from the fiber-skeletons dataset into CSV, lossless JSON, and SWC (the standard tree-morphology format from neuroscience/connectomics tooling), making per-fiber centerlines, radii, and branch topology usable outside WEBKNOSSOS for fiber-direction-aware segmentation work. Includes a CLI, 23 tests, and an orientation analysis showing real fiber-alignment signal across the annotated cubes.
+
 ### 📦 Materials
 
 #### 🌟 Highlighted
