@@ -55,6 +55,8 @@ from vesuvius.utils.cli import HyphenUnderscoreParser
 LOGGER = logging.getLogger(__name__)
 DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
 DEFAULT_OVERLAP = 0.5
+REVERSE_LAYERS_DIRECTIONS = {"auto": "auto", "true": "reverse", "false": "forward"}
+SEGMENT_METADATA_NAMES = ("metadata.json", "meta.json")
 
 
 @dataclass(frozen=True)
@@ -1471,9 +1473,91 @@ def infer_single_zarr(
         shutil.rmtree(temporary, ignore_errors=True)
 
 
-def resolve_run_directions(direction: str) -> tuple[str, ...]:
-    """Expand the CLI direction to concrete ordered runs."""
+def _metadata_bool(value: Any) -> bool | None:
+    if isinstance(value, (bool, int, float)):
+        return bool(value)
+    text = value.strip().lower() if isinstance(value, str) else None
+    if text in {"true", "1", "yes"}:
+        return True
+    if text in {"false", "0", "no"}:
+        return False
+    return None
 
+
+def read_segment_reverse_layers(
+    input_zarr: str | Path | None,
+) -> tuple[bool | None, Path | None]:
+    """Return an explicit ``reverse_layers`` next to a local Zarr, and its file.
+
+    The segment's ``metadata.json`` / ``meta.json`` sit beside its surface
+    volume (in folder mode, in the segment directory). A remote input, or a
+    missing, unreadable or malformed document, states nothing.
+    """
+
+    if input_zarr is None or _is_url(input_zarr):
+        return None, None
+    for name in SEGMENT_METADATA_NAMES:
+        path = Path(input_zarr).parent / name
+        try:
+            document = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            continue
+        if isinstance(document, dict):
+            value = _metadata_bool(document.get("reverse_layers"))
+            if value is not None:
+                return value, path
+    return None, None
+
+
+def resolve_auto_direction(input_zarr: str | Path | None) -> str:
+    """Resolve ``--direction auto`` for one segment and log the choice.
+
+    An explicit ``reverse_layers`` in the segment metadata wins. Otherwise the
+    layers are read against the VC3D surface normal n = dP/dcol x dP/drow (the
+    anti-normal rule): ``reverse`` for a ``vc_render_tifxyz`` surface volume
+    rendered without ``--flip-normals``, whose layer index increases along +n.
+    The rule is a convention of the organizers' tifxyz meshes and of the public
+    9 um models trained on them. A volume rendered with ``--flip-normals``, or
+    from a mesh whose grid is transposed or mirrored, has the opposite order
+    and needs ``reverse_layers: false``.
+    """
+
+    reverse_layers, source = read_segment_reverse_layers(input_zarr)
+    if reverse_layers is None:
+        LOGGER.info(
+            "direction=auto resolved to reverse for %s: no local segment "
+            "metadata sets reverse_layers (anti-normal rule)",
+            input_zarr,
+        )
+        return "reverse"
+    if not reverse_layers:
+        LOGGER.warning(
+            "direction=auto resolved to forward for %s: %s sets "
+            "reverse_layers=false, overriding the anti-normal rule (reverse)",
+            input_zarr,
+            source,
+        )
+        return "forward"
+    LOGGER.info(
+        "direction=auto resolved to reverse for %s: %s sets reverse_layers=true",
+        input_zarr,
+        source,
+    )
+    return "reverse"
+
+
+def resolve_run_directions(
+    direction: str,
+    input_zarr: str | Path | None = None,
+) -> tuple[str, ...]:
+    """Expand the CLI direction to concrete ordered runs for one input.
+
+    ``auto`` is resolved here, once per segment, so each run and each
+    folder-mode output name carries a concrete ``forward`` or ``reverse``.
+    """
+
+    if direction == "auto":
+        return (resolve_auto_direction(input_zarr),)
     return ("forward", "reverse") if direction == "both" else (direction,)
 
 
@@ -1553,7 +1637,7 @@ def infer_folder(
             LOGGER.warning("Skipping %s: %s", segment_dir, exc)
             skipped_count += 1
             continue
-        for direction in resolve_run_directions(args.direction):
+        for direction in resolve_run_directions(args.direction, input_zarr):
             name_prefix = (
                 f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
             )
@@ -1701,7 +1785,18 @@ def parse_args(argv: Sequence[str] | None = None):
     parser.add_argument("--layer-end", type=int)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument(
-        "--direction", choices=("forward", "reverse", "both"), default="forward"
+        "--direction",
+        choices=("forward", "reverse", "both", "auto"),
+        help=(
+            "Layer order, default forward. 'auto' resolves per segment: a "
+            "reverse_layers value in the segment's metadata.json / meta.json "
+            "wins, otherwise reverse (against the VC3D surface normal)."
+        ),
+    )
+    parser.add_argument(
+        "--reverse-layers",
+        choices=("auto", "true", "false"),
+        help="Shorthand for --direction auto, reverse or forward.",
     )
     parser.add_argument(
         "--amp-dtype",
@@ -1733,6 +1828,16 @@ def parse_args(argv: Sequence[str] | None = None):
         parser.error("--batch-size must be positive")
     if args.tta_batch_size is not None and args.tta_batch_size <= 0:
         parser.error("--tta-batch-size must be positive")
+    if args.reverse_layers is not None:
+        implied = REVERSE_LAYERS_DIRECTIONS[args.reverse_layers]
+        if args.direction not in (None, implied):
+            parser.error(
+                f"--reverse-layers {args.reverse_layers} conflicts with "
+                f"--direction {args.direction}"
+            )
+        args.direction = implied
+    if args.direction is None:
+        args.direction = "forward"
     try:
         args.gpu_ids = parse_gpu_ids(args.gpus)
     except ValueError as exc:
@@ -1762,7 +1867,7 @@ def main(argv: Sequence[str] | None = None) -> int:
     if args.folder is not None:
         infer_folder(args, configured, device=device)
     else:
-        for direction in resolve_run_directions(args.direction):
+        for direction in resolve_run_directions(args.direction, args.input_zarr):
             infer_single_zarr(
                 args=args,
                 input_zarr=args.input_zarr,

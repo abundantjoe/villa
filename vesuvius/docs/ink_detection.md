@@ -461,7 +461,8 @@ the second output.
 | `--blend-mode` | `auto`, `constant`, `gaussian`, or `hann`; default `auto` (constant without overlap, Hann otherwise). |
 | `--layer-start`, `--layer-end` | Half-open source-Z selection before centered depth cropping; negative indices count from the end. The window is clamped to the source depth, and if nothing is left of it (empty, inverted, or entirely out of range) the full depth is used instead and a warning is logged. |
 | `--batch-size` | Batch size per selected device, default `1`. |
-| `--direction` | `forward`, `reverse`, or `both`; default `forward`. |
+| `--direction` | `forward`, `reverse`, `both`, or `auto`; default `forward`. `auto` resolves once per segment: a `reverse_layers` value in the `metadata.json` / `meta.json` next to the segment's Zarr wins, otherwise `reverse` (against the VC3D surface normal; a volume rendered with `vc_render_tifxyz --flip-normals` needs `reverse_layers: false`). Folder-mode output names carry the resolved direction. |
+| `--reverse-layers` | `auto`, `true`, or `false`: shorthand for `--direction auto`, `reverse`, or `forward`. A different explicit `--direction` is an error. |
 | `--amp-dtype` | `auto`, `default`, `fp16`, or `bf16`; `auto` reads checkpoint precision. |
 | `--tta-mirror` | Average valid mirror variants. |
 | `--tta-batch-size` | Maximum mirror variants evaluated together. |
