@@ -6,9 +6,16 @@
 #endif
 
 #include <qapplication.h>
+#include <QAbstractSpinBox>
 #include <QCommandLineParser>
+#include <QComboBox>
+#include <QEvent>
+#include <QImageReader>
+#include <QSurfaceFormat>
 
 #include "CWindow.hpp"
+#include "SshPrompts.hpp"
+#include "agent_bridge/AgentBridgeServer.hpp"
 #include "VCSettings.hpp"
 #include "vc/core/Version.hpp"
 #include <QSettings>
@@ -19,16 +26,28 @@
 #include "vc/core/util/QuadSurface.hpp"
 
 #include <opencv2/core.hpp>
+#include <algorithm>
+#include <cmath>
+#include <cstdio>
 #include <iostream>
 #include <thread>
 #include <omp.h>
-#include <blosc.h>
 #include <cstdlib>
 #include <cstring>
+#include <limits>
+#include <optional>
 #if defined(__GLIBC__)
 #include <malloc.h>
 #endif
-#ifndef _WIN32
+#ifdef _WIN32
+#ifndef WIN32_LEAN_AND_MEAN
+#define WIN32_LEAN_AND_MEAN
+#endif
+#ifndef NOMINMAX
+#define NOMINMAX
+#endif
+#include <windows.h>
+#else
 #include <dlfcn.h>
 #include <sys/resource.h>
 #endif
@@ -36,6 +55,17 @@
 #include <sys/syscall.h>
 #include <unistd.h>
 #endif
+
+// POSIX setenv with an MSVCRT/UCRT fallback (Windows has no setenv).
+static void vcSetEnv(const char* name, const char* value, int overwrite)
+{
+#if defined(_WIN32)
+    if (!overwrite && std::getenv(name)) return;
+    _putenv_s(name, value);
+#else
+    ::setenv(name, value, overwrite);
+#endif
+}
 
 // Runs before main() AND before all shared-library constructors.
 // .preinit_array is processed by the dynamic linker before any .init_array,
@@ -45,13 +75,13 @@ static void setThreadPoliciesEarly()
     // Force passive wait policy so OpenMP threads sleep instead of
     // spin-waiting with sched_yield.  overwrite=1 is intentional —
     // spin-waiting on 500+ OMP threads kills the machine.
-    setenv("OMP_WAIT_POLICY", "passive", 1);
-    setenv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
-    setenv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
-    setenv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
-    setenv("OPENBLAS_NUM_THREADS", "1", 0);
-    setenv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
-    setenv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
+    vcSetEnv("OMP_WAIT_POLICY", "passive", 1);
+    vcSetEnv("OMP_NUM_THREADS", "1", 0);       // limit OpenMP parallelism
+    vcSetEnv("KMP_BLOCKTIME", "0", 1);         // LLVM/Intel OpenMP: sleep immediately
+    vcSetEnv("KMP_AFFINITY", "disabled", 0);   // skip sched_setaffinity per fork/join
+    vcSetEnv("OPENBLAS_NUM_THREADS", "1", 0);
+    vcSetEnv("GOTO_NUM_THREADS", "1", 0);      // legacy name for OpenBLAS
+    vcSetEnv("MKL_NUM_THREADS", "1", 0);       // Intel MKL
 }
 #ifdef __linux__
 __attribute__((section(".preinit_array"), used))
@@ -67,9 +97,65 @@ static bool hasCliFlag(int argc, char* argv[], const char* flag)
     return false;
 }
 
+class WheelFocusFilter final : public QObject
+{
+protected:
+    bool eventFilter(QObject* watched, QEvent* event) override
+    {
+        // Polish fires once per widget as it is styled, so this catches every
+        // combo/spinner app-wide, including ones created later. StrongFocus
+        // (vs the default WheelFocus) stops the wheel from focusing the
+        // widget as the cursor passes over it.
+        if (event->type() == QEvent::Polish) {
+            auto* widget = qobject_cast<QWidget*>(watched);
+            if (widget && (qobject_cast<QAbstractSpinBox*>(widget) ||
+                           qobject_cast<QComboBox*>(widget))) {
+                widget->setFocusPolicy(Qt::StrongFocus);
+            }
+            return QObject::eventFilter(watched, event);
+        }
+
+        if (event->type() != QEvent::Wheel)
+            return QObject::eventFilter(watched, event);
+
+        auto* widget = qobject_cast<QWidget*>(watched);
+        while (widget) {
+            if (auto* spinBox = qobject_cast<QAbstractSpinBox*>(widget)) {
+                if (!spinBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            if (auto* comboBox = qobject_cast<QComboBox*>(widget)) {
+                if (!comboBox->hasFocus()) {
+                    event->ignore();
+                    return true;
+                }
+                break;
+            }
+            widget = widget->parentWidget();
+        }
+
+        return QObject::eventFilter(watched, event);
+    }
+};
+
+#if defined(__GNUC__) || defined(__clang__)
 __attribute__((visibility("default")))
+#endif
 auto main(int argc, char* argv[]) -> int
 {
+#ifdef _WIN32
+    // GUI-subsystem exe: stdout/stderr are detached by default. When launched
+    // from a terminal, reattach them so logs and --version/--help output are
+    // visible; double-click launches still get no console window.
+    if (::AttachConsole(ATTACH_PARENT_PROCESS)) {
+        std::freopen("CONOUT$", "w", stdout);
+        std::freopen("CONOUT$", "w", stderr);
+    }
+#endif
+
     vc::crash::install();
 
 #ifndef __linux__
@@ -80,6 +166,12 @@ auto main(int argc, char* argv[]) -> int
 
 #if defined(__GLIBC__) && !defined(VC_HAVE_MIMALLOC)
     // Tune glibc's malloc to give freed pages back to the OS more aggressively.
+    // Bound per-thread arenas before VC3D creates its worker pools. Smaller
+    // volume chunks increasingly use arena allocations rather than independent
+    // mmaps; allowing glibc's default (up to 8 * CPU count) let OpenMP/thread
+    // pool multiplication retain tens of GiB in 128-MiB arena mappings even
+    // after the cache references were released.
+    ::mallopt(M_ARENA_MAX, 4);
     // Lower M_MMAP_THRESHOLD pushes bigger allocations through mmap (returned
     // independently on free), reducing main-heap fragmentation. Lower
     // M_TRIM_THRESHOLD runs sbrk-trim more often. Only takes effect when
@@ -121,25 +213,8 @@ auto main(int argc, char* argv[]) -> int
         fn();
 #endif
 
-    omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool, IOPool); OMP threads just spin-wait
+    omp_set_num_threads(1);  // All parallelism is explicit (QThreadPool); OMP threads just spin-wait
     cv::setNumThreads(1);
-    blosc_set_nthreads(1);  // We parallelize at tile level; blosc internal threads just spin-wait
-
-    // VC3D's interactive renderer performs better without BlockPipeline's
-    // per-frame fetchInteractive dedup. Keep this app default scoped to VC3D,
-    // while allowing users to set VC_DISABLE_FETCHINTERACTIVE_DEDUP=0 to
-    // compare or debug the dedup path.
-    if (qEnvironmentVariableIsEmpty("VC_DISABLE_FETCHINTERACTIVE_DEDUP")) {
-        qputenv("VC_DISABLE_FETCHINTERACTIVE_DEDUP", "1");
-    }
-
-    // Qt selects its platform plugin while QApplication is constructed, before
-    // QCommandLineParser runs. Pre-scan this replay flag so the flag alone is
-    // enough for headless offscreen benchmarking.
-    if (qEnvironmentVariableIsEmpty("QT_QPA_PLATFORM") &&
-        hasCliFlag(argc, argv, "--replay-offscreen-4k")) {
-        qputenv("QT_QPA_PLATFORM", "offscreen");
-    }
 
     // Workaround for Qt dock widget issues on Wayland (QTBUG-87332)
     // Floating dock widgets become unmovable after initial drag on Wayland.
@@ -158,14 +233,76 @@ auto main(int argc, char* argv[]) -> int
         qputenv("QT_WIDGETS_RHI", "0");
     }
 
+    // QOpenGLWidget's compositing/share contexts must use the same core profile
+    // as Fibers 3D. On macOS this must be set before QApplication construction;
+    // a legacy share context otherwise falls back to an unshared renderer.
+    // CT views continue to use their existing QWidget/CPU rendering path.
+    QSurfaceFormat glFormat;
+    glFormat.setVersion(3, 3);
+    glFormat.setProfile(QSurfaceFormat::CoreProfile);
+    glFormat.setDepthBufferSize(24);
+    glFormat.setSamples(4);
+    QSurfaceFormat::setDefaultFormat(glFormat);
+
     QApplication app(argc, argv);
+#ifdef VC_TESTING
+    if (hasCliFlag(argc, argv, "--test-viewer-regressions")) {
+        extern int runViewerRegressionTests();
+        const int result = runViewerRegressionTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
+    if (hasCliFlag(argc, argv, "--test-scene-3d")) {
+        extern int runScene3DPanelTests();
+        const int result = runScene3DPanelTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
+    if (hasCliFlag(argc, argv, "--test-object-store")) {
+        extern int runObjectStoreControllerTests();
+        const int result=runObjectStoreControllerTests();
+        std::cout.flush(); std::cerr.flush();
+        // Match normal vc3d shutdown after controller/state cleanup.
+        std::_Exit(result);
+    }
+    if (hasCliFlag(argc, argv, "--test-surface-panel")) {
+        extern int runSurfacePanelStoreTests();
+        const int result = runSurfacePanelStoreTests();
+        std::cout.flush(); std::cerr.flush();
+        std::_Exit(result);
+    }
+#endif
+    // Wide surface-aligned Spiral overlays can legitimately exceed Qt's
+    // 128-MiB default image-I/O allocation limit. Set the Qt runtime value
+    // after QApplication construction because Qt may cache the environment
+    // setting before VC3D's pre-main hook runs. Preserve an explicit user
+    // override and retain a finite allocation guard.
+    if (qEnvironmentVariableIsEmpty("QT_IMAGEIO_MAXALLOC")) {
+        QImageReader::setAllocationLimit(512);
+    }
+    WheelFocusFilter wheelFocusFilter;
+    app.installEventFilter(&wheelFocusFilter);
     QApplication::setOrganizationName("Vesuvius Challenge");
     QApplication::setApplicationName("VC3D");
     QApplication::setWindowIcon(QIcon(":/images/logo.png"));
     QApplication::setApplicationVersion(QString::fromStdString(ProjectInfo::VersionString()));
+    vc3d::installSshPrompts();
+
+    // Handle this before constructing the main window. QCommandLineParser's
+    // built-in version option normally exits from process(), but keeping the
+    // probe explicit makes the packaged GUI-subsystem executable a reliable
+    // non-interactive smoke test on Windows.
+    if (hasCliFlag(argc, argv, "--version")) {
+        std::cout << QApplication::applicationName().toStdString() << ' '
+                  << QApplication::applicationVersion().toStdString() << std::endl;
+        std::cout.flush();
+        std::cerr.flush();
+        std::_Exit(0);
+    }
+
     std::cout << "VC3D commit: " << ProjectInfo::RepositoryHash() << std::endl;
     std::cout << "creating remote volume cache at "
-              << vc3d::remoteCachePath().toStdString() << std::endl;
+              << vc3d::remoteCachePath().toUtf8().constData() << std::endl;
 
     QCommandLineParser parser;
     parser.setApplicationDescription("VC3D - Volume Cartographer 3D Viewer");
@@ -179,17 +316,19 @@ auto main(int argc, char* argv[]) -> int
 
     QCommandLineOption cacheSizeOption(
         "cache-size",
-        QString("Set the chunk cache size in gigabytes (default: %1 GB).")
-            .arg(CHUNK_CACHE_SIZE_GB),
-        "GB",
-        QString::number(CHUNK_CACHE_SIZE_GB));
+        QString("Set the memory cache size in gigabytes (default: the RAM cache setting, %1 GB if unset).")
+            .arg(vc3d::settings::perf::RAM_CACHE_SIZE_GB_DEFAULT),
+        "GB");
     parser.addOption(cacheSizeOption);
 
-    QCommandLineOption loadFirstOption(
-        "load-first",
-        "Load the named segmentation folder first instead of loading all segmentation folders.",
-        "folder");
-    parser.addOption(loadFirstOption);
+    QCommandLineOption volumePackageOption(
+        "project",
+        "Open a project (.vcproj) at startup.",
+        "path");
+    parser.addOption(volumePackageOption);
+    QCommandLineOption attachStoreOption(
+        "attach-store", "Attach an existing writable object store (.vcobj) beside the project.", "path");
+    parser.addOption(attachStoreOption);
 
     QCommandLineOption debugOption(
         "debug",
@@ -201,56 +340,18 @@ auto main(int argc, char* argv[]) -> int
         "Enable VC3D render profiling logs.");
     parser.addOption(profileOption);
 
-    QCommandLineOption recordOption(
-        "record",
-        "Record a navigation camera-state timeline to the given JSON file.",
-        "file");
-    parser.addOption(recordOption);
+    QCommandLineOption agentBridgeOption(
+        "agent-bridge",
+        "Enable the agent bridge (JSON-RPC over a local socket) on the default "
+        "socket name vc3d-agent-<pid>.");
+    parser.addOption(agentBridgeOption);
 
-    QCommandLineOption replayOption(
-        "replay",
-        "Replay a recorded navigation timeline (implies --profile), then exit.",
-        "file");
-    parser.addOption(replayOption);
-
-    QCommandLineOption replayWarmOption(
-        "replay-warm",
-        "With --replay, run a discarded warm-up pass before the timed pass.");
-    parser.addOption(replayWarmOption);
-
-    QCommandLineOption replayOffscreen4kOption(
-        "replay-offscreen-4k",
-        "With --replay, force the replay viewport to 3840x2160.");
-    parser.addOption(replayOffscreen4kOption);
-
-    QCommandLineOption replayLimitOption(
-        "replay-limit",
-        "With --replay, replay only the first N recorded keyframes (0 = all).",
-        "frames",
-        "0");
-    parser.addOption(replayLimitOption);
-
-    QCommandLineOption replaySkipChunkCompleteOption(
-        "replay-skip-chunk-complete",
-        "With --replay, advance after the first full render instead of waiting for chunk-complete quiet settle.");
-    parser.addOption(replaySkipChunkCompleteOption);
-
-    QCommandLineOption replaySkipFastRenderOption(
-        "replay-skip-fast-render",
-        "With --replay, skip any fast-render phase and submit the full render directly.");
-    parser.addOption(replaySkipFastRenderOption);
-
-    QCommandLineOption replayTimedProfileOption(
-        "replay-timed-profile",
-        "With --replay, switch frames on a fixed timer and print one row per paint.");
-    parser.addOption(replayTimedProfileOption);
-
-    QCommandLineOption replayTimedProfilePeriodOption(
-        "replay-timed-profile-period-ms",
-        "With --replay-timed-profile, milliseconds between frame switches.",
-        "ms",
-        "200");
-    parser.addOption(replayTimedProfilePeriodOption);
+    QCommandLineOption agentBridgeNameOption(
+        "agent-bridge-name",
+        "Enable the agent bridge on an explicit QLocalServer name (implies "
+        "--agent-bridge).",
+        "name");
+    parser.addOption(agentBridgeNameOption);
 
     parser.process(app);
 
@@ -259,20 +360,6 @@ auto main(int argc, char* argv[]) -> int
         SetLogLevel("debug");
     }
 
-    RenderBenchOptions benchOptions;
-    benchOptions.recordPath = parser.value(recordOption).trimmed();
-    benchOptions.replayPath = parser.value(replayOption).trimmed();
-    benchOptions.replayWarm = parser.isSet(replayWarmOption);
-    benchOptions.replayOffscreen4k = parser.isSet(replayOffscreen4kOption);
-    benchOptions.replaySkipChunkComplete = parser.isSet(replaySkipChunkCompleteOption);
-    benchOptions.replaySkipFastRender = parser.isSet(replaySkipFastRenderOption);
-    benchOptions.replayTimedProfile = parser.isSet(replayTimedProfileOption);
-    bool limitOk = false;
-    const int replayLimit = parser.value(replayLimitOption).toInt(&limitOk);
-    benchOptions.replayLimit = (limitOk && replayLimit > 0) ? replayLimit : 0;
-    bool periodOk = false;
-    const int timedPeriod = parser.value(replayTimedProfilePeriodOption).toInt(&periodOk);
-    benchOptions.replayTimedProfilePeriodMs = (periodOk && timedPeriod > 0) ? timedPeriod : 200;
 
     if (parser.isSet(profileOption)) {
         SetProfileLoggingEnabled(true);
@@ -283,16 +370,12 @@ auto main(int argc, char* argv[]) -> int
         Volume::skipShapeCheck = true;
     }
 
-    // RAM cache size: CLI flag > QSettings > CMake default
-    size_t cacheSizeGB = CHUNK_CACHE_SIZE_GB;
+    // RAM cache size: CLI flag > settings > default
+    size_t cacheSizeGB = 0;
     {
         using namespace vc3d::settings;
         QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
         cacheSizeGB = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
-
-        // Per-segment rotating-backup count -> core (used by saveOverwrite/growth).
-        QuadSurface::setBackupCount(
-            settings.value(backup::SEGMENT_COUNT, backup::SEGMENT_COUNT_DEFAULT).toInt());
     }
     if (parser.isSet(cacheSizeOption)) {
         bool ok = false;
@@ -308,16 +391,55 @@ auto main(int argc, char* argv[]) -> int
         cacheSizeGB = static_cast<size_t>(parsed);
     }
 
-    if (parser.isSet(loadFirstOption)) {
-        const QString loadFirstDir = parser.value(loadFirstOption).trimmed();
-        if (!loadFirstDir.isEmpty()) {
-            VolumePkg::setLoadFirstSegmentationDirectory(loadFirstDir.toStdString());
-        }
-    }
-
     int rc = 0;
     {
-        CWindow aWin(cacheSizeGB, benchOptions);
+        CWindow aWin(cacheSizeGB);
+
+        if (parser.isSet(volumePackageOption)) {
+            QString errorMessage;
+            if (!aWin.openVolumePackage(parser.value(volumePackageOption).trimmed(),
+                                        false,
+                                        &errorMessage)) {
+                std::cerr << "Error: " << errorMessage.toStdString() << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                std::_Exit(2);
+            }
+        }
+
+        if (parser.isSet(attachStoreOption)) {
+            aWin.attachStore(parser.value(attachStoreOption).trimmed());
+        }
+
+        // Agent bridge (opt-in, off by default). Constructed only when a bridge
+        // flag is present, so normal runs pay zero cost and open no socket.
+        std::unique_ptr<AgentBridgeServer> agentBridge;
+        const bool bridgeRequested =
+            parser.isSet(agentBridgeOption) || parser.isSet(agentBridgeNameOption);
+        if (bridgeRequested) {
+            QString bridgeName = parser.value(agentBridgeNameOption).trimmed();
+            if (bridgeName.isEmpty()) {
+                bridgeName = QStringLiteral("vc3d-agent-%1")
+                                 .arg(QCoreApplication::applicationPid());
+            }
+            agentBridge = std::make_unique<AgentBridgeServer>(&aWin);
+            if (!agentBridge->listen(bridgeName)) {
+                std::cerr << "Error: agent bridge failed to listen on '"
+                          << bridgeName.toStdString() << "'." << std::endl;
+                std::cout.flush();
+                std::cerr.flush();
+                // Exit like the std::_Exit path below rather than returning: a plain
+                // return runs DSO finalizers (gnutls/libtasn1 free through mimalloc
+                // post-teardown) and segfaults in _dl_fini. Nothing has loaded yet.
+                std::_Exit(2);
+            }
+            std::cout << "VC3D-AGENT-BRIDGE: listening name="
+                      << agentBridge->serverName().toStdString()
+                      << " path=" << agentBridge->fullServerName().toStdString()
+                      << std::endl;
+            std::cout.flush();
+        }
+
         aWin.show();
         rc = QApplication::exec();
     }

@@ -1,0 +1,280 @@
+#include "vc/core/util/RemoteCacheSettings.hpp"
+#include <vc_reader/zarr.hpp>
+
+#include <charconv>
+#include <algorithm>
+#include <atomic>
+#include <chrono>
+#include <cctype>
+#include <cstdint>
+#include <cstdlib>
+#include <fstream>
+#include <stdexcept>
+#include <string>
+#include <string_view>
+#include <utility>
+
+namespace fs = std::filesystem;
+
+namespace vc::settings {
+namespace {
+
+fs::path pathFromUtf8(std::string_view value)
+{
+    std::u8string utf8;
+    utf8.reserve(value.size());
+    for (const unsigned char byte : value)
+        utf8.push_back(static_cast<char8_t>(byte));
+    return fs::path(utf8);
+}
+
+std::string pathToUtf8(const fs::path& path)
+{
+    const auto utf8 = path.u8string();
+    std::string result;
+    result.reserve(utf8.size());
+    for (const char8_t byte : utf8)
+        result.push_back(static_cast<char>(byte));
+    return result;
+}
+
+std::string trim(std::string value)
+{
+    const auto first = value.find_first_not_of(" \t\r\n");
+    if (first == std::string::npos)
+        return {};
+    const auto last = value.find_last_not_of(" \t\r\n");
+    return value.substr(first, last - first + 1);
+}
+
+std::string decodeIniValue(std::string value)
+{
+    value = trim(std::move(value));
+    if (value.size() >= 2 && value.front() == '"' && value.back() == '"')
+        value = value.substr(1, value.size() - 2);
+
+    std::string decoded;
+    decoded.reserve(value.size());
+    for (std::size_t i = 0; i < value.size(); ++i) {
+        if (value[i] != '\\' || i + 1 == value.size()) {
+            decoded.push_back(value[i]);
+            continue;
+        }
+        const char escaped = value[++i];
+        switch (escaped) {
+        case '\\': decoded.push_back('\\'); break;
+        case '"': decoded.push_back('"'); break;
+        case 'n': decoded.push_back('\n'); break;
+        case 'r': decoded.push_back('\r'); break;
+        case 't': decoded.push_back('\t'); break;
+        default:
+            decoded.push_back('\\');
+            decoded.push_back(escaped);
+            break;
+        }
+    }
+    return decoded;
+}
+
+std::string configuredIniValue(
+    const fs::path& settingsPath,
+    std::string_view section,
+    std::string_view key)
+{
+    std::ifstream input(settingsPath);
+    if (!input)
+        return {};
+
+    bool matchingSection = false;
+    std::string line;
+    while (std::getline(input, line)) {
+        const std::string stripped = trim(line);
+        if (stripped.empty() || stripped.front() == ';' || stripped.front() == '#')
+            continue;
+        if (stripped.front() == '[' && stripped.back() == ']') {
+            matchingSection =
+                stripped.size() == section.size() + 2 &&
+                stripped.substr(1, section.size()) == section;
+            continue;
+        }
+        if (!matchingSection)
+            continue;
+        const auto separator = stripped.find('=');
+        if (separator == std::string::npos ||
+            trim(stripped.substr(0, separator)) != key) {
+            continue;
+        }
+        return decodeIniValue(stripped.substr(separator + 1));
+    }
+    return {};
+}
+
+std::uint64_t configuredGiB(
+    const fs::path& settingsPath, std::string_view key, std::uint64_t fallback)
+{
+    // key is "section/name", as QSettings writes it to the [section] group.
+    const auto separator = key.find('/');
+    const auto configured = configuredIniValue(
+        settingsPath, key.substr(0, separator), key.substr(separator + 1));
+    // Digits only: std::stoull would also accept a sign and wrap "-5".
+    if (configured.empty() ||
+        configured.find_first_not_of("0123456789") != std::string::npos) {
+        return fallback;
+    }
+    try {
+        return std::stoull(configured);
+    } catch (const std::out_of_range&) {
+        return fallback;
+    }
+}
+
+fs::path ensureDirectory(fs::path path)
+{
+    if (path.is_relative())
+        path = fs::absolute(path);
+    path = path.lexically_normal();
+    std::error_code ec;
+    fs::create_directories(path, ec);
+    if (ec || !fs::is_directory(path)) {
+        throw std::runtime_error(
+            "Cannot create remote cache directory '" + pathToUtf8(path) + "': " +
+            (ec ? ec.message() : "path is not a directory"));
+    }
+
+    return path;
+}
+
+fs::path ensureWritableDirectory(fs::path path)
+{
+    path = ensureDirectory(std::move(path));
+
+    static std::atomic<std::uint64_t> probeSequence{0};
+    const auto stamp = std::chrono::steady_clock::now().time_since_epoch().count();
+    const fs::path probe = path / (
+        ".vc3d-write-probe-" + std::to_string(stamp) + "-" +
+        std::to_string(probeSequence.fetch_add(1, std::memory_order_relaxed)));
+
+    {
+        std::ofstream output(probe, std::ios::binary | std::ios::trunc);
+        output.put('\0');
+        output.close();
+        if (!output) {
+            std::error_code cleanupEc;
+            fs::remove(probe, cleanupEc);
+            throw std::runtime_error(
+                "Remote cache directory '" + pathToUtf8(path) +
+                "' is not writable by this user");
+        }
+    }
+
+    std::error_code ec;
+    fs::remove(probe, ec);
+    if (ec) {
+        throw std::runtime_error(
+            "Cannot remove write probe from remote cache directory '" +
+            pathToUtf8(path) + "': " + ec.message());
+    }
+    return path;
+}
+
+} // namespace
+
+fs::path settingsFilePath()
+{
+    return ensureDirectory(vcr::zarr::vc3dConfigDirectory()) / "VC3D.ini";
+}
+
+fs::path remoteCachePath()
+{
+    static const fs::path active = ensureWritableDirectory(vcr::zarr::selectedVc3dCacheRoot());
+    return active;
+}
+
+namespace {
+
+bool iniBool(const char* key, bool fallback)
+{
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
+    if (configured.empty())
+        return fallback;
+
+    std::string normalized;
+    normalized.reserve(configured.size());
+    std::transform(
+        configured.begin(), configured.end(), std::back_inserter(normalized),
+        [](unsigned char value) { return static_cast<char>(std::tolower(value)); });
+    return normalized == "1" || normalized == "true" || normalized == "yes" ||
+           normalized == "on";
+}
+
+unsigned long long iniNumber(const char* key, unsigned long long fallback)
+{
+    const auto configured = configuredIniValue(settingsFilePath(), "perf", key);
+    unsigned long long value = fallback;
+    const auto* end = configured.data() + configured.size();
+    if (std::from_chars(configured.data(), end, value).ptr != end)
+        return fallback;
+    return value;
+}
+
+constexpr std::int64_t kGib = std::int64_t{1} << 30;
+
+}  // namespace
+
+bool remoteCacheDelta3dEnabled()
+{
+    return iniBool("remote_cache_delta3d", kRemoteCacheDelta3dDefault);
+}
+
+std::optional<std::int64_t> remoteCacheMaxBytes()
+{
+    const auto gib = iniNumber("remote_cache_max_gib", kRemoteCacheMaxGibDefault);
+    if (gib == 0)
+        return std::nullopt;
+    return static_cast<std::int64_t>(gib) * kGib;
+}
+
+std::int64_t remoteCacheMinFreeBytes()
+{
+    return static_cast<std::int64_t>(iniNumber("remote_cache_min_free_gib", kRemoteCacheMinFreeGibDefault)) * kGib;
+}
+
+std::optional<int> remoteDownloadParallelism()
+{
+    if (iniBool("remote_download_automatic", kRemoteDownloadAutomaticDefault))
+        return std::nullopt;
+    return static_cast<int>(std::clamp<unsigned long long>(
+        iniNumber("remote_download_parallelism", kRemoteDownloadParallelismDefault), 1, 64));
+}
+
+RemoteOffline remoteOffline()
+{
+    auto value = configuredIniValue(settingsFilePath(), "perf", "remote_offline");
+    std::transform(value.begin(), value.end(), value.begin(),
+                   [](unsigned char c) { return static_cast<char>(std::tolower(c)); });
+    if (value == "fill")
+        return RemoteOffline::Fill;
+    if (value == "on" || value == "1" || value == "true" || value == "yes")
+        return RemoteOffline::On;
+    return RemoteOffline::Off;
+}
+
+vcr::zarr::OpenOptions remoteOpenOptions(const fs::path& root)
+{
+    vcr::zarr::OpenOptions options;
+    const auto offline = remoteOffline();
+    options.offline = offline != RemoteOffline::Off;
+    options.offlineFill = offline == RemoteOffline::Fill;
+    if (!root.empty()) {
+        options.cacheDirs = {root.string()};
+        options.cacheMaxBytes = remoteCacheMaxBytes().value_or(std::numeric_limits<std::int64_t>::max());
+        options.cacheMinFreeBytes = remoteCacheMinFreeBytes();
+    }
+    if (const auto parallelism = remoteDownloadParallelism()) {
+        options.connections = *parallelism;
+        options.threads = static_cast<std::size_t>(*parallelism);
+    }
+    return options;
+}
+
+} // namespace vc::settings

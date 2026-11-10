@@ -4,16 +4,25 @@
 
 namespace vc {
 
-struct ResolvedUrl {
-    std::string httpsUrl;      // resolved HTTPS URL
-    std::string awsRegion;     // empty if not S3
-    bool useAwsSigv4 = false;  // true if s3:// and credentials detected
+inline constexpr int kMaxRemoteVolumeBaseScale = 5;
+
+// A remote volume has two deliberately separate identities:
+//
+// * sourceUrl is the fragment-free URL used for network requests.
+// * portableLocator includes the canonical client-side selector, when any,
+//   and is used when persisting or handing the view to another VC process.
+//
+struct RemoteVolumeSpec {
+    std::string sourceUrl;
+    std::string portableLocator;
+    int baseScaleLevel = 0;
+    bool hasBaseScaleSelector = false;
+    bool useAwsSigv4 = false;
 };
 
-// Resolve s3://bucket/key -> https://... with optional SigV4 flag.
-// Supports s3://bucket/key (defaults to us-east-1) and
-// s3+REGION://bucket/key (explicit region).
-// Passes through http:// and https:// URLs unchanged.
-ResolvedUrl resolveRemoteUrl(const std::string& input);
+// Parse #vc-base-scale=N before URL/S3 resolution. Unknown, duplicate, or
+// malformed selectors throw std::invalid_argument. N is restricted to 0..5;
+// zero canonicalizes to a selector-free portable locator.
+RemoteVolumeSpec parseRemoteVolumeSpec(const std::string& input);
 
 }  // namespace vc

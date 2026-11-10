@@ -11,6 +11,22 @@
 #include <vector>
 
 namespace {
+struct NativeSurfaceSample {
+    cv::Vec2d grid;
+    cv::Vec3f volume;
+    bool valid() const { return std::isfinite(cv::norm(volume)); }
+    explicit operator bool() const { return valid(); }
+};
+NativeSurfaceSample sampleNative(const QuadSurface& surface, const cv::Vec2d& uv) {
+    NativeSurfaceSample sample;
+    sample.grid=surface.surfaceToGrid(uv);
+    const cv::Vec2f xy(sample.grid);
+    surface.pointSurface()->pointsAt(xy.val,1,sample.volume.val,nullptr);
+    return sample;
+}
+}
+
+namespace {
 
 cv::Mat_<cv::Vec3f> makePlanarGrid(int rows, int cols, float z = 50.f)
 {
@@ -34,11 +50,52 @@ cv::Mat_<cv::Vec3f> makeSparseGrid(int rows, int cols, int patchH, int patchW)
 
 } // namespace
 
+TEST_CASE("pointTo supports two- and three-support ribbons on either axis")
+{
+    for (const int narrow : {2, 3}) {
+        for (const bool transpose : {false, true}) {
+            const auto points = makePlanarGrid(transpose ? narrow : 7,
+                                              transpose ? 7 : narrow);
+            QuadSurface surface(points, {1, 1});
+            surface.shiftSurfaceOrigin({123, -17});
+            const cv::Vec2d grid = transpose ? cv::Vec2d(3, 0.5) : cv::Vec2d(0.5, 3);
+            const auto uv = surface.gridToSurface(grid);
+            const cv::Vec3f target(float(grid[0]), float(grid[1]), 50);
+            cv::Vec3f ptr(float(uv[0]), float(uv[1]), 0);
+            const float distance = surface.pointTo(ptr, target, 0.01f, 10);
+            CHECK(distance >= 0);
+            CHECK(distance < 0.01f);
+            CHECK(cv::norm(surface.coord(ptr) - target) < 0.01f);
+            // Force restart sampling rather than returning from the initial hint.
+            CHECK(surface.pointTo(ptr, target + cv::Vec3f(0, 0, 10), 0.01f, 10) >= 9.99f);
+            cv::Vec2f loc;
+            const float floatDistance = pointTo(loc, points, target, 0.01f, 10, 1);
+            CHECK(floatDistance >= 0);
+            CHECK(floatDistance < 0.01f);
+            cv::Mat_<cv::Vec3d> doublePoints;
+            points.convertTo(doublePoints, CV_64FC3);
+            const float doubleDistance = pointTo(loc, doublePoints, target, 0.01f, 10, 1);
+            CHECK(doubleDistance >= 0);
+            CHECK(doubleDistance < 0.01f);
+        }
+    }
+}
+
 TEST_CASE("Rect3D default-construction is zero box")
 {
     Rect3D r;
     CHECK(r.low == cv::Vec3f(0, 0, 0));
     CHECK(r.high == cv::Vec3f(0, 0, 0));
+}
+
+TEST_CASE("Rect3D containment is inclusive in base XYZ")
+{
+    const Rect3D bounds{{1.0f, 2.0f, 3.0f}, {4.0f, 5.0f, 6.0f}};
+    CHECK(contains_point(bounds, cv::Vec3f(1.0f, 2.0f, 3.0f)));
+    CHECK(contains_point(bounds, cv::Vec3d(4.0, 5.0, 6.0)));
+    CHECK(contains_point(bounds, cv::Vec3d(2.5, 3.5, 4.5)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3f(0.99f, 3.0f, 4.0f)));
+    CHECK_FALSE(contains_point(bounds, cv::Vec3d(2.0, 5.01, 4.0)));
 }
 
 TEST_CASE("expand_rect grows box to include a new point")
@@ -99,7 +156,6 @@ TEST_CASE("QuadSurface ctor from Mat retains scale and is loaded")
     CHECK(qs.isLoaded());
     CHECK(qs.scale()[0] == doctest::Approx(1.5f));
     CHECK(qs.scale()[1] == doctest::Approx(2.0f));
-    CHECK(qs.canUnload() == false); // no path
 }
 
 TEST_CASE("size() returns scaled grid size")
@@ -141,6 +197,98 @@ TEST_CASE("isPointValid / isQuadValid honor -1 sentinels")
     CHECK_FALSE(qs.isQuadValid(0, 0)); // quad (0,0)-(1,1) touches sentinel
     CHECK(qs.isPointValid(0, 0));
     CHECK(qs.isQuadValid(2, 2));
+}
+
+TEST_CASE("surface/grid conversion and sampling use one exact affine convention")
+{
+    cv::Mat_<cv::Vec3f> points(3, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(
+                100.0f + 2.0f * col + 3.0f * row,
+                200.0f - 4.0f * col + 5.0f * row,
+                300.0f + 7.0f * col - 2.0f * row);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(2.0f, 4.0f));
+    const cv::Vec2d grid(1.25, 0.5);
+    const cv::Vec2d flat = surface.gridToSurface(grid);
+    const cv::Vec2d roundTrip = surface.surfaceToGrid(flat);
+    CHECK(roundTrip[0] == doctest::Approx(grid[0]).epsilon(1e-12));
+    CHECK(roundTrip[1] == doctest::Approx(grid[1]).epsilon(1e-12));
+
+    const auto sample = sampleNative(surface, flat);
+    REQUIRE(sample);
+    CHECK(sample.grid[0] == doctest::Approx(1.25));
+    CHECK(sample.grid[1] == doctest::Approx(0.5));
+    CHECK(sample.volume[0] == doctest::Approx(104.0f));
+    CHECK(sample.volume[1] == doctest::Approx(197.5f));
+    CHECK(sample.volume[2] == doctest::Approx(307.75f));
+
+    // The outermost grid edge belongs to the final quad and is clickable.
+    const auto edge = sampleNative(surface,
+        surface.gridToSurface({3.0, 2.0}));
+    REQUIRE(edge);
+    CHECK(edge.volume == points(2, 3));
+    const cv::Vec2d nearEdge = surface.gridToSurface({3.0 + 5e-7, 2.0});
+    CHECK_FALSE(sampleNative(surface, nearEdge));
+    const cv::Vec2d outside = surface.gridToSurface({3.0 + 2e-6, 2.0});
+    CHECK_FALSE(sampleNative(surface, outside));
+}
+
+TEST_CASE("shiftSurfaceOrigin moves content by -delta in every surface mapping")
+{
+    cv::Mat_<cv::Vec3f> points(3, 4);
+    for (int row = 0; row < points.rows; ++row) {
+        for (int col = 0; col < points.cols; ++col) {
+            points(row, col) = cv::Vec3f(
+                100.0f + 2.0f * col + 3.0f * row,
+                200.0f - 4.0f * col + 5.0f * row,
+                300.0f + 7.0f * col - 2.0f * row);
+        }
+    }
+    QuadSurface surface(points, cv::Vec2f(2.0f, 4.0f));
+    const cv::Vec2d grid(1.25, 0.5);
+    const cv::Vec2d before = surface.gridToSurface(grid);
+    const cv::Vec3f volumeBefore = sampleNative(surface, before).volume;
+
+    const cv::Vec2d delta(0.75, -0.25);
+    surface.shiftSurfaceOrigin(delta);
+
+    // The same grid sample is now addressed by (before - delta)...
+    const cv::Vec2d after = surface.gridToSurface(grid);
+    CHECK(after[0] == doctest::Approx(before[0] - delta[0]).epsilon(1e-6));
+    CHECK(after[1] == doctest::Approx(before[1] - delta[1]).epsilon(1e-6));
+    // ...and the shifted address samples the identical content, through the
+    // surface path and the ptr path (coord), which must stay in agreement.
+    const auto sample = sampleNative(surface, after);
+    REQUIRE(sample);
+    CHECK(sample.volume[0] == doctest::Approx(volumeBefore[0]));
+    CHECK(sample.volume[1] == doctest::Approx(volumeBefore[1]));
+    CHECK(sample.volume[2] == doctest::Approx(volumeBefore[2]));
+    const cv::Vec3f ptr(static_cast<float>(after[0] * 2.0f),
+                        static_cast<float>(after[1] * 4.0f),
+                        0.0f);
+    const cv::Vec3f viaPtr = surface.coord(ptr);
+    CHECK(viaPtr[0] == doctest::Approx(volumeBefore[0]).epsilon(1e-4));
+    CHECK(viaPtr[1] == doctest::Approx(volumeBefore[1]).epsilon(1e-4));
+    CHECK(viaPtr[2] == doctest::Approx(volumeBefore[2]).epsilon(1e-4));
+
+    // Non-finite deltas are ignored.
+    surface.shiftSurfaceOrigin({std::numeric_limits<double>::quiet_NaN(), 0.0});
+    const cv::Vec2d unchanged = surface.gridToSurface(grid);
+    CHECK(unchanged[0] == doctest::Approx(after[0]));
+    CHECK(unchanged[1] == doctest::Approx(after[1]));
+}
+
+TEST_CASE("surface sampling rejects any location owned by an invalid quad")
+{
+    auto points = makePlanarGrid(3, 3);
+    points(1, 1) = cv::Vec3f(-1.0f, -1.0f, -1.0f);
+    QuadSurface surface(points, cv::Vec2f(1.0f, 1.0f));
+    const auto sample = sampleNative(surface,
+        surface.gridToSurface({0.25, 0.25}));
+    CHECK_FALSE(sample);
 }
 
 TEST_CASE("countValidPoints / countValidQuads on dense grid")
@@ -225,6 +373,33 @@ TEST_CASE("valid/coord/normal on an in-memory grid")
     CHECK(std::isfinite(n[0]));
 }
 
+TEST_CASE("valid and coord include the final complete quad")
+{
+    auto pts = makePlanarGrid(3, 4);
+    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
+    const cv::Vec2d surface = qs.gridToSurface({2.5, 1.5});
+    const cv::Vec3f ptr(
+        static_cast<float>(surface[0]),
+        static_cast<float>(surface[1]),
+        0.0f);
+
+    CHECK(qs.valid(ptr));
+    const cv::Vec3f point = qs.coord(ptr);
+    CHECK(point[0] == doctest::Approx(2.5f));
+    CHECK(point[1] == doctest::Approx(1.5f));
+    CHECK(point[2] == doctest::Approx(50.0f));
+
+    pts(2, 3) = cv::Vec3f(-1.f, -1.f, -1.f);
+    QuadSurface invalid(pts, cv::Vec2f(1.f, 1.f));
+    const cv::Vec2d invalidSurface = invalid.gridToSurface({2.5, 1.5});
+    const cv::Vec3f invalidPtr(
+        static_cast<float>(invalidSurface[0]),
+        static_cast<float>(invalidSurface[1]),
+        0.0f);
+    CHECK_FALSE(invalid.valid(invalidPtr));
+    CHECK(invalid.coord(invalidPtr) == cv::Vec3f(-1.f, -1.f, -1.f));
+}
+
 TEST_CASE("move adds offset to ptr")
 {
     auto pts = makePlanarGrid(4, 4);
@@ -265,19 +440,6 @@ TEST_CASE("rotate runs without crashing on dense grid")
     CHECK(qs.rawPointsPtr() != nullptr);
 }
 
-TEST_CASE("overlappingIds get/set/add/remove")
-{
-    auto pts = makePlanarGrid(2, 2);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    CHECK(qs.overlappingIds().empty());
-    qs.setOverlappingIds({"a", "b"});
-    CHECK(qs.overlappingIds().size() == 2);
-    qs.addOverlappingId("c");
-    CHECK(qs.overlappingIds().count("c") == 1);
-    qs.removeOverlappingId("a");
-    CHECK(qs.overlappingIds().count("a") == 0);
-}
-
 TEST_CASE("dpi getter / setter")
 {
     auto pts = makePlanarGrid(2, 2);
@@ -311,9 +473,3 @@ TEST_CASE("invalidateCache / invalidateMask are no-throw")
     CHECK(true);
 }
 
-TEST_CASE("canUnload is false without a path")
-{
-    auto pts = makePlanarGrid(2, 2);
-    QuadSurface qs(pts, cv::Vec2f(1.f, 1.f));
-    CHECK_FALSE(qs.canUnload());
-}

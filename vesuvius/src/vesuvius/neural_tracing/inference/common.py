@@ -9,9 +9,8 @@ from pathlib import Path
 
 import numpy as np
 import torch
-import zarr
 
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
 from vesuvius.neural_tracing.datasets.common import voxelize_surface_grid
 from vesuvius.neural_tracing.inference.extrap_lookup import ExtrapLookupArrays
 
@@ -639,35 +638,6 @@ def get_cond_edge_bboxes(cond_zyxs, cond_direction, crop_size, overlap_frac=0.15
     return bboxes, edge
 
 
-def _resolve_segment_volume(segment, volume_scale=None):
-    volume = segment.volume
-    if isinstance(volume, zarr.Group):
-        target_level = None
-        if volume_scale is not None:
-            target_level = int(volume_scale)
-        else:
-            extra = getattr(segment, "extra", None)
-            if isinstance(extra, dict):
-                for key in ("volume_scale", "vol_scale", "zarr_level", "volume_level", "level"):
-                    if key in extra:
-                        try:
-                            target_level = int(extra[key])
-                            break
-                        except (TypeError, ValueError):
-                            continue
-        if target_level is None:
-            target_level = 0
-        level_key = str(target_level)
-        if level_key in volume:
-            return volume[level_key]
-        numeric_levels = sorted([k for k in volume.keys() if k.isdigit()], key=int)
-        if numeric_levels:
-            level_ints = [int(k) for k in numeric_levels]
-            nearest = min(level_ints, key=lambda v: abs(v - target_level))
-            return volume[str(nearest)]
-    return volume
-
-
 def _bbox_to_min_corner_and_bounds_array(bbox):
     z_min, z_max, y_min, y_max, x_min, x_max = bbox
     min_corner = np.floor([z_min, y_min, x_min]).astype(np.int64)
@@ -1167,8 +1137,8 @@ def _scale_to_subsample_stride(scale):
 
 def _stored_to_full_bounds(tgt_segment, stored_bounds):
     r0_s, r1_s, c0_s, c1_s = stored_bounds
-    scale_y, scale_x = tgt_segment._scale
-    full_h, full_w = tgt_segment.full_resolution_shape
+    scale_y, scale_x = tgt_segment.scale
+    full_h, full_w = tgt_segment.full_shape
     sub_r = _scale_to_subsample_stride(scale_y)
     sub_c = _scale_to_subsample_stride(scale_x)
     # Convert stored grid indices to full-resolution UV indices using integer
@@ -1183,11 +1153,9 @@ def _stored_to_full_bounds(tgt_segment, stored_bounds):
 
 def _initialize_window_state(tgt_segment, full_bounds):
     r0_full, r1_full, c0_full, c1_full = full_bounds
-    tgt_segment.use_full_resolution()
-    x, y, z, valid = tgt_segment[r0_full:r1_full, c0_full:c1_full]
-
-    window_zyxs = np.stack([z, y, x], axis=-1)
-    return window_zyxs.copy(), valid.copy(), (r0_full, c0_full)
+    xyz, valid = tgt_segment.resample_full((r0_full, c0_full), (r1_full - r0_full, c1_full - c0_full), interpolation="smooth")
+    window_zyxs = np.where(valid[..., None], xyz[..., ::-1], -1.0).astype(np.float32)
+    return window_zyxs, valid, (r0_full, c0_full)
 
 
 def setup_segment(args, volume):
@@ -1197,14 +1165,12 @@ def setup_segment(args, volume):
     if not tifxyz_path.is_dir():
         raise NotADirectoryError(f"tifxyz path must be a directory: {tifxyz_path}")
 
-    tgt_segment = tifxyz.read_tifxyz(tifxyz_path)
+    tgt_segment = tifxyz.read(tifxyz_path)
     retarget_factor = 2 ** args.volume_scale
     tgt_segment = tgt_segment.retarget(retarget_factor)
-    tgt_segment.volume = volume
 
-    tgt_segment.use_stored_resolution()
-    x_s, y_s, z_s, valid_s = tgt_segment[:]
-    stored_zyxs = np.stack([z_s, y_s, x_s], axis=-1)
+    valid_s = tgt_segment.valid
+    stored_zyxs = tgt_segment.xyz[..., ::-1].copy()
 
     h_s, w_s = stored_zyxs.shape[:2]
     valid_rows = np.any(valid_s, axis=1)
@@ -1349,6 +1315,18 @@ def _print_agg_extrap_sampling_debug(samples, extrap_lookup, grow_direction, max
         print(f"stack-count min/max/mean: {int(sc.min())}/{int(sc.max())}/{sc.mean():.2f}")
 
 
+def _existing_surface_uuid(tifxyz_path):
+    """The meta.json uuid of an existing tifxyz directory, or None."""
+    meta_path = os.path.join(tifxyz_path, "meta.json")
+    try:
+        with open(meta_path, "r", encoding="utf-8") as stream:
+            meta = json.load(stream)
+    except (OSError, ValueError):
+        return None
+    value = meta.get("uuid") if isinstance(meta, dict) else None
+    return value if isinstance(value, str) and value else None
+
+
 def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, call_args,
                                  input_scale=None):
     merged_zyxs = np.asarray(merged.get("merged_zyxs"), dtype=np.float32)
@@ -1377,6 +1355,8 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
     )
 
     overwrite_input_surface = bool(getattr(args, "overwrite_input_surface", False))
+    # meta.json identity: None mints a fresh uuid4 for a new output surface.
+    surface_uuid = None
     if overwrite_input_surface:
         input_tifxyz_path = os.path.abspath(str(args.tifxyz_path))
         tifxyz_uuid = os.path.basename(os.path.normpath(input_tifxyz_path))
@@ -1385,6 +1365,8 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
                 "--overwrite-input-surface requires --tifxyz-path to point to a tifxyz directory."
             )
         out_dir = os.path.dirname(input_tifxyz_path)
+        # An in-place rewrite keeps the surface's existing identity.
+        surface_uuid = _existing_surface_uuid(input_tifxyz_path)
         if args.tifxyz_out_dir:
             print("--overwrite-input-surface set: ignoring --tifxyz-out-dir.")
     else:
@@ -1417,6 +1399,7 @@ def _save_merged_surface_tifxyz(args, merged, checkpoint_path, model_config, cal
         step_size=tifxyz_step_size,
         voxel_size_um=tifxyz_voxel_size_um,
         source=source,
+        surface_uuid=surface_uuid,
         additional_metadata={
             "grow_direction": args.grow_direction,
             "extrapolation_method": args.extrapolation_method,

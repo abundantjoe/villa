@@ -5,6 +5,7 @@
 #include <doctest/doctest.h>
 
 #include "vc/core/PointCollections.hpp"
+#include <vc_object_store/Uuid.hpp>
 
 #include <algorithm>
 #include <cmath>
@@ -22,14 +23,13 @@ TEST_CASE("add/query points and collections")
     const auto p0 = c.addPoint("alpha", {1, 2, 3});
     const auto p1 = c.addPoint("alpha", {4, 5, 6});
 
-    const uint64_t cid = c.getCollectionId("alpha");
-    CHECK(cid != 0);
+    const uint64_t cid = c.getCollectionId("alpha").value();
     CHECK(c.getAllCollections().size() == 1);
     CHECK(c.getAllCollections().at(cid).points.size() == 2);
     CHECK(p0.id != p1.id);
     CHECK(p0.collectionId == cid);
 
-    auto got = c.getPoint(p0.id);
+    auto got = c.getPoint({cid, p0.id});
     REQUIRE(got.has_value());
     CHECK(got->p == cv::Vec3f(1, 2, 3));
 
@@ -42,20 +42,20 @@ TEST_CASE("update and remove")
     auto p = c.addPoint("a", {0, 0, 0});
     p.p = {9, 9, 9};
     c.updatePoint(p);
-    CHECK(c.getPoint(p.id)->p == cv::Vec3f(9, 9, 9));
+    CHECK(c.getPoint({p.collectionId, p.id})->p == cv::Vec3f(9, 9, 9));
 
-    c.removePoint(p.id);
-    CHECK_FALSE(c.getPoint(p.id).has_value());
+    c.removePoint({p.collectionId, p.id});
+    CHECK_FALSE(c.getPoint({p.collectionId, p.id}).has_value());
 }
 
 TEST_CASE("rename, clear, clearAll")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
     c.renameCollection(cid, "b");
     CHECK(c.getCollectionId("b") == cid);
-    CHECK(c.getCollectionId("a") == 0);
+    CHECK_FALSE(c.getCollectionId("a").has_value());
 
     c.clearCollection(cid);  // removes the collection entirely
     CHECK(c.getAllCollections().count(cid) == 0);
@@ -69,17 +69,17 @@ TEST_CASE("tags and anchor2d + offset")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
 
     c.setCollectionTag(cid, "k", "v");
-    CHECK(c.getCollectionTag(cid, "k") == std::optional<std::string>("v"));
+    CHECK(c.getAllCollections().at(cid).tags.at("k") == "v");
     c.removeCollectionTag(cid, "k");
-    CHECK_FALSE(c.getCollectionTag(cid, "k").has_value());
+    CHECK_FALSE(c.getAllCollections().at(cid).tags.contains("k"));
 
     c.setCollectionAnchor2d(cid, cv::Vec2f(10, 20));
-    REQUIRE(c.getCollectionAnchor2d(cid).has_value());
+    REQUIRE(c.getAllCollections().at(cid).anchor2d.has_value());
     c.applyAnchorOffset(5, -5);
-    auto a = c.getCollectionAnchor2d(cid);
+    auto a = c.getAllCollections().at(cid).anchor2d;
     REQUIRE(a.has_value());
     CHECK((*a)[0] == doctest::Approx(15));
     CHECK((*a)[1] == doctest::Approx(15));
@@ -101,7 +101,7 @@ TEST_CASE("setCollectionMetadata round-trips the flag")
 {
     PointCollections c;
     c.addPoint("a", {0, 0, 0});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
     CollectionMetadata m;
     m.absolute_winding_number = false;
     c.setCollectionMetadata(cid, m);
@@ -121,7 +121,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Incremental);
         CHECK(windings(c, "a") == std::vector<float>{1, 2, 3});
     }
@@ -129,7 +129,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}, {2, 2, 2}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Decremental);
         CHECK(windings(c, "a") == std::vector<float>{1, 2, 3});  // sorted; values are 3,2,1
     }
@@ -137,7 +137,7 @@ TEST_CASE("autofill winding modes")
     {
         PointCollections c;
         c.addPoints("a", {{0, 0, 0}, {1, 1, 1}});
-        const uint64_t cid = c.getCollectionId("a");
+        const uint64_t cid = c.getCollectionId("a").value();
         c.autoFillWindingNumbers(cid, PointCollections::WindingFillMode::Constant, 7.5f);
         CHECK(windings(c, "a") == std::vector<float>{7.5f, 7.5f});
     }
@@ -147,11 +147,11 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 {
     PointCollections c;
     c.addPoints("a", {{0, 0, 0}, {1, 1, 1}});
-    const uint64_t cid = c.getCollectionId("a");
+    const uint64_t cid = c.getCollectionId("a").value();
 
     c.setAutoFillMode(cid, PointCollections::WindingFillMode::Constant, 4.0f);
     CHECK(c.getAutoFillMode(cid) == PointCollections::WindingFillMode::Constant);
-    CHECK(c.getAutoFillConstant(cid) == doctest::Approx(4.0f));
+    CHECK(c.getAllCollections().at(cid).autoFillConstant == doctest::Approx(4.0f));
     CHECK(c.computeAutoFillValue(cid) == doctest::Approx(4.0f));
 
     // Incremental → max existing winding + 1; none set yet → 1.
@@ -164,38 +164,41 @@ TEST_CASE("setAutoFillMode + computeAutoFillValue")
 TEST_CASE("missing-id queries are safe")
 {
     PointCollections c;
-    CHECK(c.getCollectionId("nope") == 0);
-    CHECK_FALSE(c.getPoint(424242).has_value());
+    CHECK_FALSE(c.getCollectionId("nope").has_value());
+    CHECK_FALSE(c.getPoint({0, 424242}).has_value());
     CHECK(c.getPoints("nope").empty());
     CHECK(c.getAutoFillMode(999) == PointCollections::WindingFillMode::None);
 }
 
-TEST_CASE("segment-path round-trip (anchored collections only)")
+TEST_CASE("anchored collections round-trip (anchored collections only)")
 {
-    const fs::path dir = fs::temp_directory_path() /
-        ("pc_seg_" + std::to_string(::getpid()));
-    fs::create_directories(dir);
-
     PointCollections c;
     c.addPoint("anchored", {1, 2, 3});
     c.addPoint("plain", {4, 5, 6});
-    const uint64_t anchored = c.getCollectionId("anchored");
+    const uint64_t anchored = c.getCollectionId("anchored").value();
+    const std::string anchoredUuid = c.getAllCollections().at(anchored).uuid;
     c.setCollectionAnchor2d(anchored, cv::Vec2f(8, 9));
-    REQUIRE(c.saveToSegmentPath(dir));
-    CHECK(fs::exists(dir / "corrections.json"));
+    const auto saved = c.anchoredCollections();
+    REQUIRE(saved.size() == 1);
 
     PointCollections loaded;
-    REQUIRE(loaded.loadFromSegmentPath(dir));
-    // Only the anchored collection is persisted.
-    bool has_anchored = false, has_plain = false;
+    loaded.addPoint("previous", {0, 0, 0});
+    loaded.setCollectionAnchor2d(loaded.getCollectionId("previous").value(), cv::Vec2f(1, 1));
+    REQUIRE(loaded.replaceAnchoredCollections(saved));
+    // Only the anchored collection is carried, and it replaces the previous surface's.
+    bool has_anchored = false, has_plain = false, has_previous = false;
     for (const auto& [id, col] : loaded.getAllCollections()) {
-        if (col.name == "anchored") has_anchored = true;
+        if (col.name == "anchored") {
+            has_anchored = true;
+            CHECK(col.uuid == anchoredUuid);
+            CHECK(col.anchor2d == cv::Vec2f(8, 9));
+        }
         if (col.name == "plain") has_plain = true;
+        if (col.name == "previous") has_previous = true;
     }
     CHECK(has_anchored);
     CHECK_FALSE(has_plain);
-
-    fs::remove_all(dir);
+    CHECK_FALSE(has_previous);
 }
 
 TEST_CASE("JSON round-trip preserves data")
@@ -204,7 +207,10 @@ TEST_CASE("JSON round-trip preserves data")
     c.addPoint("alpha", {1, 2, 3});
     c.addPoint("alpha", {4, 5, 6});
     c.addPoint("beta", {7, 8, 9});
-    const uint64_t alpha = c.getCollectionId("alpha");
+    const uint64_t alpha = c.getCollectionId("alpha").value();
+    const std::string alphaUuid = c.getAllCollections().at(alpha).uuid;
+    CHECK(vc::objects::util::isUuid(alphaUuid));
+    CHECK(c.getAllCollections().at(c.getCollectionId("beta").value()).uuid != alphaUuid);
     c.setCollectionColor(alpha, {0.1f, 0.2f, 0.3f});
     c.setCollectionTag(alpha, "kind", "correction");
 
@@ -217,11 +223,78 @@ TEST_CASE("JSON round-trip preserves data")
     fs::remove(tmp);
 
     CHECK(loaded.getAllCollections().size() == c.getAllCollections().size());
-    const uint64_t la = loaded.getCollectionId("alpha");
+    const uint64_t la = loaded.getCollectionId("alpha").value();
     CHECK(la != 0);
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
     CHECK(loaded.getPoints("alpha").size() == 2);
     CHECK(loaded.getPoints("beta").size() == 1);
-    CHECK(loaded.getCollectionTag(la, "kind") == std::optional<std::string>("correction"));
+    CHECK(loaded.getAllCollections().at(la).tags.at("kind") == "correction");
+    loaded.renameCollection(la, "renamed");
+    CHECK(loaded.getAllCollections().at(la).uuid == alphaUuid);
+}
+
+TEST_CASE("zero and duplicate point ids retain collection-local identity")
+{
+    const fs::path input = fs::temp_directory_path() /
+        ("pc_duplicate_ids_" + std::to_string(::getpid()) + ".json");
+    {
+        std::ofstream out(input);
+        out << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "0": {
+                    "name": "zero_collection",
+                    "points": {
+                        "0": {"p": [1, 2, 3], "creation_time": 1, "links": [5]},
+                        "5": {"p": [4, 5, 6], "creation_time": 2}
+                    },
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [1, 0, 0]
+                },
+                "7": {
+                    "name": "other",
+                    "points": {
+                        "0": {"p": [10, 20, 30], "creation_time": 3},
+                        "5": {"p": [40, 50, 60], "creation_time": 4}
+                    },
+                    "metadata": {"winding_is_absolute": true},
+                    "color": [0, 1, 0]
+                }
+            }
+        })";
+    }
+
+    PointCollections points;
+    REQUIRE(points.loadFromJSON(input.string()));
+    REQUIRE(points.getCollectionId("zero_collection") == std::optional<uint64_t>{0});
+    CHECK_FALSE(points.getCollectionId("missing").has_value());
+    CHECK(points.getPoint({0, 0})->p == cv::Vec3f(1, 2, 3));
+    CHECK(points.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+    CHECK(points.findPointRefs(0) ==
+          std::vector<vc::PointRef>{{0, 0}, {7, 0}});
+
+    ColPoint changed = *points.getPoint({0, 0});
+    changed.p = {9, 8, 7};
+    points.updatePoint(changed);
+    CHECK(points.getPoint({0, 0})->p == cv::Vec3f(9, 8, 7));
+    CHECK(points.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+
+    points.removePoint({7, 5});
+    CHECK_FALSE(points.getPoint({7, 5}).has_value());
+    CHECK(points.getPoint({0, 5}).has_value());
+
+    const fs::path output = fs::temp_directory_path() /
+        ("pc_duplicate_ids_roundtrip_" + std::to_string(::getpid()) + ".json");
+    REQUIRE(points.saveToJSON(output.string()));
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(output.string()));
+    REQUIRE(loaded.getPoint({0, 0}).has_value());
+    CHECK(loaded.getPoint({0, 0})->links == std::vector<uint64_t>{5});
+    CHECK(loaded.getPoint({7, 0})->p == cv::Vec3f(10, 20, 30));
+    CHECK_FALSE(loaded.getPoint({7, 5}).has_value());
+
+    fs::remove(input);
+    fs::remove(output);
 }
 
 TEST_CASE("JSON round-trip preserves per-point fields")
@@ -301,6 +374,12 @@ TEST_CASE("old point JSON defaults links and fiber direction")
 
     PointCollections loaded;
     REQUIRE(loaded.loadFromJSON(tmp.string()));
+    const std::string uuid = loaded.getAllCollections().begin()->second.uuid;
+    CHECK(vc::objects::util::isUuid(uuid));
+    REQUIRE(loaded.saveToJSON(tmp.string()));
+    PointCollections reloaded;
+    REQUIRE(reloaded.loadFromJSON(tmp.string()));
+    CHECK(reloaded.getAllCollections().begin()->second.uuid == uuid);
     fs::remove(tmp);
 
     const auto points = loaded.getPoints("old");
@@ -309,6 +388,35 @@ TEST_CASE("old point JSON defaults links and fiber direction")
     CHECK(points.front().fiber_dir.empty());
     CHECK(loaded.getAllCollections().begin()->second.metadata.absolute_winding_number);
     CHECK(loaded.getAllCollections().begin()->second.windings_linked.empty());
+}
+
+TEST_CASE("minimal display-only PCL JSON defaults collection presentation")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_minimal_pcl_" + std::to_string(::getpid()) + ".json");
+    std::ofstream out(tmp);
+    out << R"({
+        "vc_pointcollections_json_version": "1",
+        "collections": {
+            "1": {
+                "name": "same_winding",
+                "points": {"2": {"p": [1, 2, 3]}}
+            }
+        }
+    })";
+    out.close();
+
+    PointCollections loaded;
+    REQUIRE(loaded.loadFromJSON(tmp.string()));
+    fs::remove(tmp);
+
+    const auto& collection = loaded.getAllCollections().begin()->second;
+    CHECK(collection.metadata.absolute_winding_number);
+    CHECK(collection.color == cv::Vec3f{0.2f, 0.8f, 1.0f});
+    const auto points = loaded.getPoints("same_winding");
+    REQUIRE(points.size() == 1);
+    CHECK(points.front().creation_time == 0);
+    CHECK(std::isnan(points.front().winding_annotation));
 }
 
 TEST_CASE("loadFromJSON rejects bad input and returns false")
@@ -368,4 +476,39 @@ TEST_CASE("ids stay unique across a load + further adds")
     }
     CHECK(matches == 1);
     CHECK(loaded.getPoints("a").size() == 3);
+}
+
+TEST_CASE("an invalid collection uuid leaves the store unchanged")
+{
+    const fs::path tmp = fs::temp_directory_path() /
+        ("pc_bad_uuid_" + std::to_string(::getpid()) + ".json");
+    {
+        std::ofstream o(tmp);
+        o << R"({
+            "vc_pointcollections_json_version": "1",
+            "collections": {
+                "1": {"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1]},
+                "2": {"uuid": "not-a-uuid", "name": "bad", "points": {},
+                      "metadata": {}, "color": [1, 1, 1]}
+            }
+        })";
+    }
+
+    PointCollections c;
+    c.addPoint("kept", {1, 2, 3});
+    const std::string keptUuid =
+        c.getAllCollections().at(c.getCollectionId("kept").value()).uuid;
+    CHECK_FALSE(c.loadFromJSON(tmp.string()));
+    REQUIRE(c.getAllCollections().size() == 1);
+    CHECK(c.getAllCollections().begin()->second.uuid == keptUuid);
+    CHECK(c.getPoints("kept").size() == 1);
+    fs::remove(tmp);
+
+    // Anchored corrections fail the same way: nothing is half-loaded.
+    std::map<uint64_t, nlohmann::json> corrections;
+    corrections[1] = nlohmann::json::parse(R"({"name": "good", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [1, 2]})");
+    corrections[2] = nlohmann::json::parse(R"({"uuid": "not-a-uuid", "name": "bad", "points": {}, "metadata": {}, "color": [1, 1, 1], "anchor2d": [3, 4]})");
+    CHECK_FALSE(c.replaceAnchoredCollections(corrections));
+    CHECK(c.getAllCollections().size() == 1);
+    CHECK(c.getCollectionId("good") == std::nullopt);
 }

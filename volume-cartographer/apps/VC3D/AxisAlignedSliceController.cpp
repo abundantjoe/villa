@@ -8,7 +8,6 @@
 #include "VCSettings.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include <QTimer>
 #include <QCheckBox>
 #include <QSpinBox>
@@ -71,11 +70,6 @@ bool isFiniteVec3(const cv::Vec3f& v)
     return std::isfinite(v[0]) && std::isfinite(v[1]) && std::isfinite(v[2]);
 }
 
-bool isValidSurfacePoint(const cv::Vec3f& v)
-{
-    return isFiniteVec3(v) && v[0] != -1.0f && v[1] != -1.0f && v[2] != -1.0f;
-}
-
 struct SegmentSliceFrame {
     cv::Vec3f origin{0, 0, 0};
     cv::Vec3f xNormal{0, 0, 0};
@@ -89,18 +83,19 @@ struct SegmentSliceFrame {
 std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     QuadSurface& segment,
     const cv::Vec3f& focus,
-    SurfacePatchIndex* patchIndex)
+    const ViewerManager* viewerManager)
 {
-    if (!isFiniteVec3(focus)) {
+    if (!isFiniteVec3(focus) || !viewerManager) {
         return std::nullopt;
     }
 
-    cv::Vec3f ptr(0, 0, 0);
     constexpr float kProjectionThreshold = 1.0f;
-    const float dist = segment.pointTo(ptr, focus, kProjectionThreshold, 1000, patchIndex);
-    if (!std::isfinite(dist) || dist < 0.0f || dist >= kProjectionThreshold || !isFiniteVec3(ptr)) {
+    const auto hit = viewerManager->locate(segment, focus, kProjectionThreshold);
+    if (!hit || hit->distance >= kProjectionThreshold || !isFiniteVec3(hit->ptr)) {
         return std::nullopt;
     }
+    const cv::Vec3f ptr = hit->ptr;
+    const float dist = hit->distance;
 
     const cv::Vec2f grid = segment.ptrToGrid(ptr);
     if (!std::isfinite(grid[0]) || !std::isfinite(grid[1])) {
@@ -123,17 +118,19 @@ std::optional<SegmentSliceFrame> segmentSliceFrameAtFocus(
     }
     const int nearestCol = static_cast<int>(std::lround(grid[0]));
     const int nearestRow = static_cast<int>(std::lround(grid[1]));
+    cv::Vec3f normal;
+    segment.pointAt(float(nearestCol), float(nearestRow), nullptr, normal.val);
     if (!segment.isPointValid(nearestRow, nearestCol) ||
-        !isFiniteVec3(segment.gridNormal(nearestRow, nearestCol))) {
+        !isFiniteVec3(normal)) {
         return std::nullopt;
     }
 
     const cv::Vec3f surfOrigin = segment.coord(ptr, {0, 0, 0});
     const cv::Vec3f xDir = segment.coord(ptr, {1, 0, 0});
     const cv::Vec3f yDir = segment.coord(ptr, {0, 1, 0});
-    if (!isValidSurfacePoint(surfOrigin) ||
-        !isValidSurfacePoint(xDir) ||
-        !isValidSurfacePoint(yDir)) {
+    if (!vc::geometry::validSurfacePoint(surfOrigin) ||
+        !vc::geometry::validSurfacePoint(xDir) ||
+        !vc::geometry::validSurfacePoint(yDir)) {
         return std::nullopt;
     }
 
@@ -174,7 +171,58 @@ AxisAlignedSliceController::AxisAlignedSliceController(CState* state, QObject* p
     connect(_rotationTimer, &QTimer::timeout, this, &AxisAlignedSliceController::processOrientationUpdate);
 }
 
-void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayCheckbox, QSpinBox* overlayOpacitySpin)
+void AxisAlignedSliceController::setViewerManager(ViewerManager* mgr)
+{
+    _viewerManager = mgr;
+    if (!mgr) {
+        return;
+    }
+    // The manager drives plane reorientation on focus changes, so it needs
+    // to know its workspace's slice controller.
+    mgr->setAxisAlignedSliceController(this);
+    // Rotation/tilt interaction is per viewer; wire every viewer this
+    // workspace has or will create.
+    connect(mgr, &ViewerManager::baseViewerCreated,
+            this, &AxisAlignedSliceController::attachViewer);
+    for (auto* viewer : mgr->baseViewers()) {
+        attachViewer(viewer);
+    }
+}
+
+void AxisAlignedSliceController::attachViewer(VolumeViewerBase* baseViewer)
+{
+    auto* viewer = baseViewer ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject()) : nullptr;
+    if (!viewer) {
+        return;
+    }
+
+    const std::string& surfName = viewer->surfName();
+    if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
+        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
+                this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onMousePress(viewer, volLoc, button, modifiers);
+                });
+
+        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
+                this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
+                    onMouseMove(viewer, volLoc, buttons, modifiers);
+                });
+
+        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
+                this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+                    onMouseRelease(viewer, button, modifiers);
+                });
+
+        viewer->setProperty("vc_axisaligned_bound", true);
+    }
+
+    // Middle-button pan mode and tilt-handle binding/visibility for the new
+    // viewer (idempotent across all viewers).
+    updateSliceInteraction();
+}
+
+void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayCheckbox, QSpinBox* overlayOpacitySpin,
+                                            bool persistSetting)
 {
     _enabled = enabled;
     if (enabled) {
@@ -193,8 +241,10 @@ void AxisAlignedSliceController::setEnabled(bool enabled, QCheckBox* overlayChec
     if (overlayOpacitySpin) {
         overlayOpacitySpin->setEnabled(enabled && (!overlayCheckbox || overlayCheckbox->isChecked()));
     }
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+    if (persistSetting) {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
+    }
     updateSliceInteraction();
     applyOrientation();
 }
@@ -246,7 +296,6 @@ void AxisAlignedSliceController::onTiltHandleChanged(VolumeViewerBase* viewer, Q
         return;
     }
 
-    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, 96.0);
     scheduleOrientationUpdate();
     updateTiltHandles();
 }
@@ -300,7 +349,6 @@ void AxisAlignedSliceController::onMouseMove(VolumeViewerBase* viewer, const cv:
     }
 
     setRotationDegrees(surfaceName, candidate);
-    _pendingOrientationMotionPx = std::max(_pendingOrientationMotionPx, std::abs(double(dragPixels)));
     scheduleOrientationUpdate();
 }
 
@@ -347,11 +395,18 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
                                     float yawDeg = 0.0f,
                                     double tilt = 0.0) {
         auto planeShared = std::dynamic_pointer_cast<PlaneSurface>(_state->surface(planeName));
-        if (!planeShared) {
+        // Preserve the plane's scroll displacement along its normal (set by
+        // shift-scrolling its viewer) so re-orienting (e.g. rotating via the
+        // xy-view handles) doesn't snap the plane back to the focus point.
+        // Lateral drift relative to the focus is still discarded.
+        float scrollOffset = 0.0f;
+        if (planeShared) {
+            const cv::Vec3f oldNormal = normalizeOrZero(planeShared->normal({}, {}));
+            scrollOffset = (planeShared->origin() - origin).dot(oldNormal);
+        } else {
             planeShared = std::make_shared<PlaneSurface>();
         }
 
-        planeShared->setOrigin(origin);
         planeShared->setInPlaneRotation(0.0f);
 
         cv::Vec3f rotatedNormal = baseNormal;
@@ -370,16 +425,20 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
         }
 
         planeShared->setNormal(rotatedNormal);
+        planeShared->setOrigin(origin + rotatedNormal * scrollOffset);
+
+        // Up/right alignment first, then the volumetric-camera azimuth folded
+        // on top (in-plane rotations commute, so one setInPlaneRotation call).
+        const float azimuthDeg = volumetricAzimuthDeg(planeName);
+        _appliedVolumetricAzimuthDeg[planeName] = azimuthDeg;
+        float inPlaneRot = azimuthInPlaneRotation(*planeShared, azimuthDeg);
 
         if (planeName == "xy plane") {
             const cv::Vec3f projectedRight = projectVectorOntoPlane({1.0f, 0.0f, 0.0f}, rotatedNormal);
             const cv::Vec3f desiredRight = normalizeOrZero(projectedRight);
             if (cv::norm(desiredRight) > kEpsilon) {
                 const cv::Vec3f currentRight = planeShared->basisX();
-                const float delta = signedAngleBetween(currentRight, desiredRight, rotatedNormal);
-                if (std::abs(delta) > kEpsilon) {
-                    planeShared->setInPlaneRotation(delta);
-                }
+                inPlaneRot += signedAngleBetween(currentRight, desiredRight, rotatedNormal);
             }
         } else {
             // Adjust in-plane rotation so "up" is aligned with volume Z when possible.
@@ -389,13 +448,11 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
             if (cv::norm(desiredUp) > kEpsilon) {
                 const cv::Vec3f currentUp = planeShared->basisY();
-                const float delta = signedAngleBetween(currentUp, desiredUp, rotatedNormal);
-                if (std::abs(delta) > kEpsilon) {
-                    planeShared->setInPlaneRotation(delta);
-                }
-            } else {
-                planeShared->setInPlaneRotation(0.0f);
+                inPlaneRot += signedAngleBetween(currentUp, desiredUp, rotatedNormal);
             }
+        }
+        if (std::abs(inPlaneRot) > kEpsilon) {
+            planeShared->setInPlaneRotation(inPlaneRot);
         }
 
         _state->setSurface(planeName, planeShared, false, true);
@@ -432,8 +489,7 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
             segYZShared = std::make_shared<PlaneSurface>();
         }
 
-        auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndexIfReady() : nullptr;
-        const auto frame = segmentSliceFrameAtFocus(*segment, origin, patchIndex);
+        const auto frame = segmentSliceFrameAtFocus(*segment, origin, _viewerManager);
         if (!frame) {
             if (!hadSegmentPlanes) {
                 configurePlane("seg xz", {0.0f, 1.0f, 0.0f}, _segXZRotationDeg, _segXZTilt);
@@ -447,8 +503,12 @@ void AxisAlignedSliceController::applyOrientation(Surface* sourceOverride)
 
             segXZShared->setNormal(frame->xNormal);
             segYZShared->setNormal(frame->yNormal);
-            segXZShared->setInPlaneRotation(0.0f);
-            segYZShared->setInPlaneRotation(0.0f);
+            const float azXZ = volumetricAzimuthDeg("seg xz");
+            const float azYZ = volumetricAzimuthDeg("seg yz");
+            _appliedVolumetricAzimuthDeg["seg xz"] = azXZ;
+            _appliedVolumetricAzimuthDeg["seg yz"] = azYZ;
+            segXZShared->setInPlaneRotation(azimuthInPlaneRotation(*segXZShared, azXZ));
+            segYZShared->setInPlaneRotation(azimuthInPlaneRotation(*segYZShared, azYZ));
 
             _state->setSurface("seg xz", segXZShared, false, true);
             _state->setSurface("seg yz", segYZShared, false, true);
@@ -467,6 +527,52 @@ float AxisAlignedSliceController::normalizeDegrees(float degrees)
         return 0.0f;
     }
     return std::remainder(degrees, 360.0f);
+}
+
+float AxisAlignedSliceController::volumetricAzimuthDeg(const std::string& surfaceName) const
+{
+    if (!_viewerManager) {
+        return 0.0f;
+    }
+    for (auto* viewer : _viewerManager->baseViewers()) {
+        if (!viewer || viewer->surfName() != surfaceName) {
+            continue;
+        }
+        const auto& s = viewer->compositeRenderSettings();
+        if (s.planeEnabled && s.params.volumetric) {
+            return s.params.camAzimuthDeg;
+        }
+        return 0.0f;
+    }
+    return 0.0f;
+}
+
+void AxisAlignedSliceController::syncVolumetricAzimuths()
+{
+    static const char* kPlaneNames[] = {"xy plane", "seg xz", "seg yz"};
+    for (const char* name : kPlaneNames) {
+        const float az = volumetricAzimuthDeg(name);
+        const auto it = _appliedVolumetricAzimuthDeg.find(name);
+        const float applied = it != _appliedVolumetricAzimuthDeg.end() ? it->second : 0.0f;
+        if (std::abs(az - applied) > 1e-3f) {
+            scheduleOrientationUpdate();
+            return;
+        }
+    }
+}
+
+float AxisAlignedSliceController::azimuthInPlaneRotation(PlaneSurface& plane, float azimuthDeg)
+{
+    if (std::abs(azimuthDeg) <= kEpsilon) {
+        return 0.0f;
+    }
+    // setInPlaneRotation spins about the normal, but vxy_from_normal
+    // sign-normalizes the basis per axis, so (vx, vy, n) handedness varies by
+    // plane. Correct for it so the screen-space spin direction is the same
+    // everywhere: vx -> cos·vx − sin·vy.
+    const cv::Vec3f n = plane.normal({0, 0, 0});
+    const float h = plane.basisX().cross(plane.basisY()).dot(n) >= 0.0f ? 1.0f : -1.0f;
+    return -h * azimuthDeg * kDegToRad;
 }
 
 float AxisAlignedSliceController::currentRotationDegrees(const std::string& surfaceName) const
@@ -511,11 +617,9 @@ void AxisAlignedSliceController::flushOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
-    const double motionPx = _pendingOrientationMotionPx;
     cancelOrientationTimer();
     applyOrientation();
-    notifyInteractiveOrientationViewers(motionPx);
-    _pendingOrientationMotionPx = 0.0;
+    notifyInteractiveOrientationViewers();
 }
 
 void AxisAlignedSliceController::processOrientationUpdate()
@@ -523,11 +627,9 @@ void AxisAlignedSliceController::processOrientationUpdate()
     if (!_orientationDirty) {
         return;
     }
-    const double motionPx = _pendingOrientationMotionPx;
     _orientationDirty = false;
-    _pendingOrientationMotionPx = 0.0;
     applyOrientation();
-    notifyInteractiveOrientationViewers(motionPx);
+    notifyInteractiveOrientationViewers();
 }
 
 void AxisAlignedSliceController::cancelOrientationTimer()
@@ -538,21 +640,20 @@ void AxisAlignedSliceController::cancelOrientationTimer()
     _orientationDirty = false;
 }
 
-void AxisAlignedSliceController::notifyInteractiveOrientationViewers(double motionPx)
+void AxisAlignedSliceController::notifyInteractiveOrientationViewers()
 {
     if (!_viewerManager) {
         return;
     }
 
-    const double clampedMotionPx = std::max(0.0, motionPx);
-    _viewerManager->forEachBaseViewer([clampedMotionPx](VolumeViewerBase* viewer) {
+    _viewerManager->forEachBaseViewer([](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
         }
         const std::string name = viewer->surfName();
         if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
             if (auto* chunkedViewer = dynamic_cast<CChunkedVolumeViewer*>(viewer)) {
-                chunkedViewer->notifyInteractiveViewChange(clampedMotionPx);
+                chunkedViewer->notifyInteractiveViewChange();
             }
         }
     });

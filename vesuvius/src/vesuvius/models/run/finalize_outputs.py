@@ -4,16 +4,14 @@ from dataclasses import dataclass
 from typing import Optional
 from tqdm.auto import tqdm
 import argparse
-import zarr
-import fsspec
-import numcodecs
 import shutil
 import multiprocessing as mp
 from concurrent.futures import ProcessPoolExecutor
 from functools import partial
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from vesuvius.utils.io.zarr_utils import wait_for_zarr_creation
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 @dataclass
@@ -45,6 +43,12 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
 
     if is_empty:
         return None, True
+
+    # Blending leaves voxels no patch covered at logits exactly 0 in every
+    # channel. With two or more channels softmax made those p = 0.5 (and
+    # foreground at thresholds below 0.5), the halo of #1114 / #1875; write them
+    # as background. One channel is a sigmoid logit, where 0 is a valid value.
+    uncovered = np.all(logits_np == 0, axis=0) if logits_np.shape[0] >= 2 else None
 
     mode = config.mode
     threshold = config.threshold
@@ -99,34 +103,41 @@ def apply_finalization(logits_np, num_classes, config: FinalizeConfig):
                 fg_prob = softmax[1:2]
                 output_data = fg_prob
     else:  # multiclass
-        argmax = np.argmax(logits_np, axis=0).astype(np.float32)
+        # Quantise on fixed, chunk-independent scales: the class index is
+        # written raw and the softmax probabilities use the same [0, 1] ->
+        # [0, 255] scale as the binary path, so a byte means the same thing in
+        # every chunk of the volume. The previous code min-max rescaled the
+        # concatenated [softmax, argmax] array per chunk, so the largest class
+        # index present in a chunk set the scale: class 1 and class 3 both
+        # landed on 255 in their own chunks, a probability of 1.0 was stored
+        # as 85 in one chunk and 255 in the next, and the encoding jumped at
+        # every chunk boundary (#1432).
+        if num_classes > 256:
+            raise ValueError(
+                f"multiclass finalization stores the class index as uint8; got {num_classes} classes"
+            )
+        argmax = np.argmax(logits_np, axis=0).astype(np.uint8)
         argmax = argmax[np.newaxis, ...]
         if threshold is not None:
             # In multiclass the CLI only allows the bare-flag form (arrives as 0.5); emit argmax only.
-            output_data = argmax
+            output_np = argmax
         else:
             exp_logits = np.exp(logits_np - np.max(logits_np, axis=0, keepdims=True))
             softmax = exp_logits / np.sum(exp_logits, axis=0, keepdims=True)
-            output_data = np.concatenate([softmax, argmax], axis=0)
+            softmax_u8 = np.clip(np.rint(softmax * 255.0), 0, 255).astype(np.uint8)
+            output_np = np.concatenate([softmax_u8, argmax], axis=0)
+        if uncovered is not None:
+            output_np[:, uncovered] = 0
 
-    output_np = output_data
-
-    if mode == "binary":
-        output_np = np.clip(output_np * 255.0, 0, 255).astype(np.uint8)
-    else:
-        # Scale to uint8 range [0, 255]
-        min_val = output_np.min()
-        max_val = output_np.max()
-        if min_val < max_val:
-            output_np = ((output_np - min_val) / (max_val - min_val) * 255).astype(np.uint8)
-        else:
+        # Empty chunks were caught above; skip a finalized chunk only when
+        # every byte is identical, which is what the old path did after scaling.
+        if np.all(output_np == output_np.flat[0]):
             return None, True
+        return output_np, False
 
-        # Final check: if the processed data is homogeneous, don't write it
-        first_processed_value = output_np.flat[0]
-        if np.all(output_np == first_processed_value):
-            return None, True
-
+    output_np = np.clip(output_data * 255.0, 0, 255).astype(np.uint8)
+    if uncovered is not None:
+        output_np[:, uncovered] = 0
     return output_np, False
 
 
@@ -184,17 +195,10 @@ def process_chunk(chunk_info, input_path, output_path, mode, threshold, num_clas
         for idx, chunk, shape_dim in zip(chunk_idx, output_chunks[1:], spatial_shape)
     )
     
-    input_store = open_zarr(
-        path=input_path,
-        mode='r',
-        storage_options={'anon': False} if input_path.startswith('s3://') else None
-    )
+    # The worker pool already reads chunks in parallel.
+    input_store = open_zarr(input_path, threads=1)
     
-    output_store = open_zarr(
-        path=output_path,
-        mode='r+',
-        storage_options={'anon': False} if output_path.startswith('s3://') else None
-    )
+    output_store = ZarrWriter.open(output_path, skip_empty=True)
     
     input_slice = (slice(None),) + spatial_slices
     logits_np = input_store[input_slice]
@@ -246,7 +250,6 @@ def finalize_logits(
     if not verbose:
         tqdm_kwargs['disable'] = True
 
-    numcodecs.blosc.use_threads = False
     
     if num_workers is None:
         num_workers = max(1, mp.cpu_count() // 2)
@@ -257,22 +260,11 @@ def finalize_logits(
     if num_parts > 1:
         print(f"Partitioned finalization: Processing part {part_id}/{num_parts}")
 
-    compressor = numcodecs.Blosc(
-        cname='zstd',
-        clevel=1,  # compression level is 1 because we're only using this for mostly empty chunks
-        shuffle=numcodecs.blosc.SHUFFLE
-    )
-    
     threshold_enabled = threshold is not None
 
     print(f"Opening input logits: {input_path}")
     print(f"Mode: {mode}, Threshold: {threshold if threshold_enabled else 'off'}")
-    input_store = open_zarr(
-        path=input_path,
-        mode='r',
-        storage_options={'anon': False} if input_path.startswith('s3://') else None,
-        verbose=verbose
-    )
+    input_store = open_zarr(input_path)
     
     input_shape = input_store.shape
     num_classes = input_shape[0]
@@ -311,7 +303,7 @@ def finalize_logits(
             if verbose:
                 print(f"Using input chunk size: {output_chunks}")
         except:
-            raise ValueError("Cannot determine input chunk size. Please specify --chunk-size.")
+            raise ValueError("Cannot determine input chunk size. Please specify --chunk_size.")
     else:
         output_chunks = chunk_size
         if verbose:
@@ -358,17 +350,17 @@ def finalize_logits(
         print(f"Creating output store: {output_path}")
         print(f"  Shape: {output_shape}, Chunks: {output_chunks}")
 
-        output_store = open_zarr(
-            path=output_path,
-            mode='w',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose,
+        # Compression level is 1 because we're only using this for mostly empty chunks
+        output_store = ZarrWriter.create(
+            output_path,
             shape=output_shape,
             chunks=output_chunks,
             dtype=np.uint8,
-            compressor=compressor,
-            write_empty_chunks=False,
-            overwrite=True
+            cname='zstd',
+            level=1,
+            shuffle=1,
+            overwrite=True,
+            skip_empty=True,
         )
     else:
         # Other parts wait for part 0 to create the array, then open it in r+ mode
@@ -379,12 +371,7 @@ def finalize_logits(
         print(f"Array found! Opening in r+ mode for part {part_id}")
 
         # Open existing array in r+ mode (no need to specify shape/chunks)
-        output_store = open_zarr(
-            path=output_path,
-            mode='r+',
-            storage_options={'anon': False} if output_path.startswith('s3://') else None,
-            verbose=verbose
-        )
+        output_store = ZarrWriter.open(output_path, skip_empty=True)
 
     def get_chunk_indices(shape, chunks):
         # For each dimension, calculate how many chunks we need
@@ -478,15 +465,13 @@ def finalize_logits(
     # Only part 0 updates metadata to avoid conflicts
     if part_id == 0:
         try:
-            if hasattr(input_store, 'attrs') and hasattr(output_store, 'attrs'):
-                for key in input_store.attrs:
-                    output_store.attrs[key] = input_store.attrs[key]
+            output_store.attrs.update(input_store.attrs)
 
-                output_store.attrs['processing_mode'] = mode
-                output_store.attrs['threshold_applied'] = threshold
-                output_store.attrs['empty_chunks_skipped'] = empty_chunks
-                output_store.attrs['total_chunks'] = total_chunks
-                output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
+            output_store.attrs['processing_mode'] = mode
+            output_store.attrs['threshold_applied'] = threshold
+            output_store.attrs['empty_chunks_skipped'] = empty_chunks
+            output_store.attrs['total_chunks'] = total_chunks
+            output_store.attrs['empty_chunk_percentage'] = float(empty_chunks/total_chunks) if total_chunks > 0 else 0.0
         except Exception as e:
             print(f"Warning: Failed to copy metadata: {e}")
     elif verbose:
@@ -496,17 +481,8 @@ def finalize_logits(
         # Only delete intermediates when not using partitioning
         print(f"Deleting intermediate logits: {input_path}")
         try:
-            # we have to use fsspec for s3/gs/azure paths 
-            # os module does not work well with them
-            if input_path.startswith(('s3://', 'gs://', 'azure://')):
-                fs_protocol = input_path.split('://', 1)[0]
-                fs = fsspec.filesystem(fs_protocol, anon=False if fs_protocol == 's3' else None)
-                
-                # Remove protocol prefix for fs operations
-                path_no_prefix = input_path.split('://', 1)[1]
-                
-                if fs.exists(path_no_prefix):
-                    fs.rm(path_no_prefix, recursive=True)
+            if input_path.startswith('s3://'):
+                if ObjectStore(input_path).remove_all():
                     print(f"Successfully deleted intermediate logits (remote path)")
             elif os.path.exists(input_path):
                 shutil.rmtree(input_path)
@@ -522,40 +498,40 @@ def finalize_logits(
 
 # --- Shared CLI helpers ---
 def add_threshold_arguments(parser):
-    """Register the shared `--threshold` / `--threshold-value` arguments on an argparse parser.
+    """Register the shared `--threshold` / `--threshold_value` arguments on an argparse parser.
 
     - `--threshold` toggles thresholding on (default cutoff = 0.5).
-    - `--threshold-value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
+    - `--threshold_value T` overrides the cutoff (must be in (0, 1)); requires --threshold.
     """
     parser.add_argument('--threshold', dest='threshold', action='store_true',
                         help='Binarize the probability map (default cutoff 0.5). '
                              'In multiclass mode this emits the argmax channel.')
-    parser.add_argument('--threshold-value', dest='threshold_value', type=float, default=None,
+    parser.add_argument('--threshold_value', type=float, default=None,
                         help='Override the probability cutoff used by --threshold '
                              '(float in (0, 1)). Binary mode only.')
 
 
 def resolve_threshold(parser, args):
-    """Validate --threshold / --threshold-value and return the effective Optional[float] cutoff.
+    """Validate --threshold / --threshold_value and return the effective Optional[float] cutoff.
 
     Returns None if thresholding is disabled, else a float in (0, 1) (0.5 if no override).
     Calls parser.error on invalid combinations.
     """
     if args.threshold_value is not None and not args.threshold:
-        parser.error("--threshold-value requires --threshold")
+        parser.error("--threshold_value requires --threshold")
     if args.threshold_value is not None and not (0.0 < args.threshold_value < 1.0):
-        parser.error(f"--threshold-value must be in (0, 1), got {args.threshold_value}")
+        parser.error(f"--threshold_value must be in (0, 1), got {args.threshold_value}")
     if args.mode == 'multiclass' and args.threshold_value is not None:
-        parser.error("--threshold-value is not applicable in multiclass mode (argmax ignores the cutoff)")
+        parser.error("--threshold_value is not applicable in multiclass mode (argmax ignores the cutoff)")
     if not args.threshold:
         return None
     return args.threshold_value if args.threshold_value is not None else 0.5
 
 
 # --- Command Line Interface ---
-def main():
-    """Entry point for the vesuvius.finalize command."""
-    parser = argparse.ArgumentParser(description='Process merged logits to produce final outputs.')
+def build_parser() -> argparse.ArgumentParser:
+    """Build the finalize_outputs CLI parser (separate from main so it can be tested)."""
+    parser = HyphenUnderscoreParser(description='Process merged logits to produce final outputs.')
     parser.add_argument('input_path', type=str,
                       help='Path to the merged logits Zarr store')
     parser.add_argument('output_path', type=str,
@@ -563,11 +539,11 @@ def main():
     parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
                       help='Processing mode. "binary" for 2-class segmentation, "multiclass" for >2 classes. Default: binary')
     add_threshold_arguments(parser)
-    parser.add_argument('--delete-intermediates', dest='delete_intermediates', action='store_true',
+    parser.add_argument('--delete_intermediates', action='store_true',
                       help='Delete intermediate logits after processing')
-    parser.add_argument('--chunk-size', dest='chunk_size', type=str, default=None,
+    parser.add_argument('--chunk_size', type=str, default=None,
                       help='Spatial chunk size (Z,Y,X) for output Zarr. Comma-separated. If not specified, input chunks will be used.')
-    parser.add_argument('--num-workers', dest='num_workers', type=int, default=None,
+    parser.add_argument('--num_workers', type=int, default=None,
                       help='Number of worker processes for parallel processing. Default: CPU_COUNT // 2')
     parser.add_argument('--quiet', dest='quiet', action='store_true',
                       help='Suppress verbose output')
@@ -575,7 +551,12 @@ def main():
                       help='Number of parts to split the finalization process into. Default: 1')
     parser.add_argument('--part_id', type=int, default=0,
                       help='Part ID for this process (0-indexed). Default: 0')
+    return parser
 
+
+def main():
+    """Entry point for the vesuvius.finalize command."""
+    parser = build_parser()
     args = parser.parse_args()
 
     # Validate partitioning arguments

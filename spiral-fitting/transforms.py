@@ -1,0 +1,556 @@
+import functools
+import os
+
+import numpy as np
+import scipy.ndimage
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+import pyro.distributions
+from einops import rearrange
+
+import flow_grad_smoothing
+import gap_triton
+import sample_spiral
+from flow_fields import (
+    BSplineCylindricalFlowField,
+    BSplineFlowField,
+    CartesianFlowField,
+    CylindricalFlowField,
+)
+from gap_parameterization import (
+    calibrated_gap_softplus_scale,
+    initial_dr_logit,
+    lower_bounded_dr,
+    lower_bounded_gap,
+)
+from geom_utils import expm_2x2, grid_sample_border, interp1d
+from sample_spiral import get_bounding_windings, get_theta_and_radii
+
+
+@functools.lru_cache(maxsize=None)
+def _acw_flip_scale(device):
+    # Cached so the ACW flip does not do a blocking host-to-device copy per
+    # call; built outside inference mode so it is also usable for training.
+    with torch.inference_mode(False):
+        return torch.tensor([1., 1., -1.], device=device)
+
+
+class IntegratedFlowDiffeomorphism(pyro.distributions.transforms.Transform):
+    """The diffeomorphism a piecewise-stationary flow field integrates to.
+
+    Each slab of the flow field is a stationary velocity field integrated for
+    unit time with ``num_steps`` RK4 steps; the slabs compose in order (spiral
+    -> slice), and the inverse runs them backwards in reverse order. The flow
+    and diffeomorphism represent shifts in normalised units [0, 1] over the
+    flow region.
+    """
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, flow_field, flow_min_corner_zyx, flow_max_corner_zyx, num_steps, solver, truncate_at_step=None, event_dim=0, cache_size=0):
+        super().__init__(cache_size=cache_size)
+        assert solver == 'rk4', solver
+        self.flow_field = flow_field
+        self.flow_min_corner_zyx = flow_min_corner_zyx
+        self.flow_max_corner_zyx = flow_max_corner_zyx
+        self.num_steps = num_steps
+        self.solver = solver
+        self.truncate_at_step = truncate_at_step
+        self._event_dim = event_dim
+        self._flow_range_zyx = self.flow_max_corner_zyx - self.flow_min_corner_zyx
+        # Cached integrator closure. Built once per diffeomorphism instance
+        # (one per training iteration), shared across forward and inverse
+        # calls so per-iteration setup (e.g. trilinear LR->HR upsampling) is
+        # amortised. A closure built under no_grad cannot route gradients to
+        # the field parameters, so it is upgraded (rebuilt) if a later call
+        # arrives with grad enabled.
+        self._cached_integrator = None
+        self._cached_integrator_grad_mode = False
+
+    def _call(self, input_zyx, inverse=False):
+        y = (input_zyx - self.flow_min_corner_zyx) / self._flow_range_zyx
+        # truncate_at_step integrates only the first steps of every slab (the
+        # warm-up ramp); the step size is always that of the full schedule.
+        n_steps = self.num_steps if self.truncate_at_step is None else self.truncate_at_step
+        h = (-1.0 if inverse else 1.0) / self.num_steps
+        if self._cached_integrator is None or (torch.is_grad_enabled() and not self._cached_integrator_grad_mode):
+            self._cached_integrator = self.flow_field.get_integrator()
+            self._cached_integrator_grad_mode = torch.is_grad_enabled()
+        if n_steps > 0:
+            # Every slab's RK4 walk runs as ONE autograd node on CUDA (see
+            # flow_triton); the eager fallback composes one node per slab.
+            orig_shape = y.shape
+            y = self._cached_integrator(y.reshape(-1, 3), h, n_steps, reverse=inverse).view(orig_shape)
+        return y * self._flow_range_zyx + self.flow_min_corner_zyx
+
+    def _inverse(self, input_yx):
+        return self._call(input_yx, inverse=True)
+
+
+class GapExpanderParams(nn.Module):
+
+    def __init__(self, resolution, min_z, max_z, num_windings, dr_per_winding):
+        super().__init__()
+        self.num_by_winding = (2 * torch.pi * (torch.arange(1, num_windings) + 0.5) * dr_per_winding / resolution + 0.5).to(torch.int64)
+        self.num_z = int((max_z - min_z) / resolution)
+        self.logits = nn.Parameter(torch.zeros([1, 1, self.num_z, sum(self.num_by_winding)]))
+        self.register_buffer('winding_first_logit_idx', torch.cat([torch.zeros([1]), torch.cumsum(self.num_by_winding, dim=0)]))
+
+
+class GapExpandingTransform(pyro.distributions.transforms.Transform):
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, params, dr_per_winding, min_z, max_z,
+                 gap_expander_lr_scale, min_gap=1.0, softplus_bias=4.0,
+                 softplus_scale=None, truncate_frac=None, event_dim=0,
+                 cache_size=0):
+        super().__init__(cache_size=cache_size)
+        self.params = params
+        self.dr_per_winding = dr_per_winding
+        self.min_z = min_z
+        self.max_z = max_z
+        self.gap_expander_lr_scale = gap_expander_lr_scale
+        self.min_gap = float(min_gap)
+        self.softplus_bias = float(softplus_bias)
+        self.softplus_scale = float(
+            softplus_scale
+            if softplus_scale is not None
+            else calibrated_gap_softplus_scale(
+                float(dr_per_winding.detach()), self.min_gap,
+                self.softplus_bias))
+        self.truncate_frac = truncate_frac
+        # One transform instance exists per training iteration, and the logits
+        # parameter does not change within an iteration. Build the pinned+scaled
+        # logits once and share it across every _call/_inverse; each grid_sample
+        # then saves a reference to this single tensor instead of a fresh
+        # full-size cat+mul copy per transform invocation.
+        self._pinned_scaled_logits = None
+
+    def _get_pinned_scaled_logits(self):
+        # Rebuild the cache if it was first created under no_grad but the
+        # current call needs gradients: a detached cache would silently
+        # disconnect the gap logits for every later use of this transform
+        # instance (e.g. when a no_grad step-estimation pre-pass is the
+        # instance's first call).
+        needs_grad = self.params.logits.requires_grad and torch.is_grad_enabled()
+        cached = self._pinned_scaled_logits
+        if cached is None or (needs_grad and not cached.requires_grad):
+            # Pin the 0th logit (i.e. theta=0 on 1th winding) to be zero, to avoid a jump going from winding #0 to #1.
+            # Keep this in sync with SpiralAndTransform.get_shared_transform_tensors,
+            # which precomputes the same tensor for injection as a detached leaf.
+            logits = torch.cat([torch.zeros_like(self.params.logits[..., :1]), self.params.logits[..., 1:]], dim=-1)
+            self._pinned_scaled_logits = logits * self.gap_expander_lr_scale
+        return self._pinned_scaled_logits
+
+    def _triton_consts(self):
+        # Constants for the fused gap_triton kernels, cached on the (long
+        # lived) params module so float() conversions of tensor scalars do not
+        # sync the GPU once per training iteration.
+        consts = getattr(self.params, '_triton_consts', None)
+        if consts is None:
+            idx = self.params.winding_first_logit_idx.to(torch.float32).contiguous()
+            consts = {
+                'idx': idx,
+                'idx_total': float(idx[-1]),
+                'min_z': float(self.min_z),
+                'max_z': float(self.max_z),
+                'min_gap': self.min_gap,
+                'softplus_bias': self.softplus_bias,
+                'softplus_denominator': float(F.softplus(
+                    torch.tensor(self.softplus_bias))),
+                'softplus_scale': self.softplus_scale,
+            }
+            self.params._triton_consts = consts
+        return consts
+
+    def _use_triton(self, input_zyx, dr):
+        return isinstance(dr, torch.Tensor) and gap_triton.gap_triton_available(
+            input_zyx, self.params.logits, dr)
+
+    def get_transformed_winding_radii(self, theta, z):
+        # This returns the sequence of winding radii (true, not shifted) for the radials given by theta and z
+        theta_normalised = theta / (2 * torch.pi)
+        logits_by_winding = self.get_logits_by_winding(theta, z)
+        inter_winding_distances = lower_bounded_gap(
+            logits_by_winding, self.dr_per_winding, self.min_gap,
+            self.softplus_bias, self.softplus_scale)
+        if self.truncate_frac is not None:
+            inter_winding_distances = torch.lerp(
+                self.dr_per_winding, inter_winding_distances,
+                self.truncate_frac)
+        winding_zero_radii = self.dr_per_winding * theta_normalised
+        winding_radii = winding_zero_radii[..., None] + torch.cat([torch.zeros_like(inter_winding_distances[..., :1]), torch.cumsum(inter_winding_distances, dim=-1)[..., :-1]], dim=-1)
+        return winding_radii
+
+    def get_logits_by_winding(self, theta, z):
+        """Pinned, interpolated native gap logits at ``(theta, z)``.
+
+        The returned values include ``gap_expander_lr_scale`` but deliberately
+        exclude the calibrated softplus scale. Keeping this interpolation in
+        one method makes the minimum-gap barrier use exactly the same pinning,
+        grid coordinates, and bilinear sampling as the forward transform.
+        """
+        num_windings = len(self.params.num_by_winding)
+        winding_first_logit_idx = self.params.winding_first_logit_idx
+        theta_normalised = theta / (2 * torch.pi)
+        winding_coords = torch.lerp(
+            winding_first_logit_idx[:-1], winding_first_logit_idx[1:],
+            theta_normalised[..., None])
+        winding_coords_normalised = (
+            winding_coords / winding_first_logit_idx[-1] * 2 - 1)
+        z_normalised = (z - self.min_z) / (self.max_z - self.min_z) * 2 - 1
+        return grid_sample_border(
+            self._get_pinned_scaled_logits(),
+            torch.stack([winding_coords_normalised, z_normalised[..., None].expand(*theta.shape, num_windings)], dim=-1).view(1, -1, num_windings, 2),
+        ).squeeze(1).squeeze(0).view(*theta.shape, num_windings)
+
+    def get_native_log_gaps(self, winding_idx, theta, z):
+        """Log native lower-bounded inter-winding distances.
+
+        ``dr_per_winding`` contributes to the value but is detached so a
+        minimum-gap violation can only update the sampled local gap logits.
+        This method is intentionally defined only for the untruncated transform:
+        warm-up truncation interpolates distances afterwards and has no
+        equivalent native log gap.
+        """
+        if self.truncate_frac is not None:
+            raise ValueError('native log gaps are defined only for the untruncated transform')
+        logits_by_winding = self.get_logits_by_winding(theta, z)
+        winding_idx = winding_idx.to(torch.long).clamp(
+            min=0, max=logits_by_winding.shape[-1] - 1)
+        sampled = torch.gather(
+            logits_by_winding, -1, winding_idx[..., None]).squeeze(-1)
+        gaps = lower_bounded_gap(
+            sampled, self.dr_per_winding.detach(), self.min_gap,
+            self.softplus_bias, self.softplus_scale)
+        return torch.log(gaps)
+
+    def _call(self, input_zyx):
+        theta, original_radius, inner_winding, _ = get_bounding_windings(input_zyx[..., 1:], self.dr_per_winding)
+        num_windings = len(self.params.num_by_winding)
+        inner_winding_clipped = inner_winding.to(torch.int64).clip(min=0, max=num_windings - 2)
+        if self._use_triton(input_zyx, self.dr_per_winding):
+            consts = self._triton_consts()
+            transformed_inner_radius, transformed_outer_radius = gap_triton.gap_bracketing_radii(
+                theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
+                consts['idx'], consts['idx_total'], self.dr_per_winding,
+                inner_winding_clipped, self.truncate_frac,
+                consts['min_z'], consts['max_z'], consts['min_gap'],
+                consts['softplus_bias'], consts['softplus_denominator'],
+                consts['softplus_scale'])
+        else:
+            transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
+            transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
+            transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
+        original_inner_radius = (inner_winding_clipped + theta / (2 * torch.pi)) * self.dr_per_winding
+        original_outer_radius = original_inner_radius + self.dr_per_winding
+        frac = (original_radius - original_inner_radius) / (original_outer_radius - original_inner_radius)
+        transformed_radius = torch.lerp(transformed_inner_radius, transformed_outer_radius, frac)
+        delta_radius = transformed_radius - original_radius
+        outward_direction = torch.cat([torch.zeros_like(input_zyx[..., :1]), F.normalize(input_zyx[..., 1:], dim=-1)], dim=-1)
+        transformed_zyx = input_zyx + outward_direction * delta_radius[..., None]
+        return transformed_zyx
+
+    def _inverse(self, input_zyx):
+        theta, transformed_radius, _ = get_theta_and_radii(input_zyx[..., 1:], self.dr_per_winding)
+        if self._use_triton(input_zyx, self.dr_per_winding):
+            consts = self._triton_consts()
+            transformed_inner_radius, transformed_outer_radius, inner_winding_clipped = gap_triton.gap_search_radii(
+                theta, input_zyx[..., 0], self._get_pinned_scaled_logits(),
+                consts['idx'], consts['idx_total'], self.dr_per_winding,
+                transformed_radius, self.truncate_frac,
+                consts['min_z'], consts['max_z'], consts['min_gap'],
+                consts['softplus_bias'], consts['softplus_denominator'],
+                consts['softplus_scale'])
+        else:
+            transformed_winding_radii = self.get_transformed_winding_radii(theta, input_zyx[..., 0])
+            inner_winding_indices = torch.searchsorted(transformed_winding_radii, transformed_radius[..., None]).squeeze(-1) - 1
+            # If shifted_radius is exactly zero, avoid this being -1.
+            inner_winding_clipped = inner_winding_indices.clip(min=0, max=transformed_winding_radii.shape[-1] - 2)
+
+            transformed_inner_radius = torch.gather(transformed_winding_radii, dim=-1, index=inner_winding_clipped[..., None]).squeeze(-1)
+            transformed_outer_radius = torch.gather(transformed_winding_radii, dim=-1, index=(inner_winding_clipped + 1)[..., None]).squeeze(-1)
+        original_inner_radius = (inner_winding_clipped + theta / (2 * torch.pi)) * self.dr_per_winding
+        original_outer_radius = original_inner_radius + self.dr_per_winding
+        frac = (transformed_radius - transformed_inner_radius) / (transformed_outer_radius - transformed_inner_radius)
+        original_radius = torch.lerp(original_inner_radius, original_outer_radius, frac)
+        delta_radius = original_radius - transformed_radius
+        outward_direction = torch.cat([torch.zeros_like(input_zyx[..., :1]), F.normalize(input_zyx[..., 1:], dim=-1)], dim=-1)
+        transformed_zyx = input_zyx + outward_direction * delta_radius[..., None]
+
+        return transformed_zyx
+
+
+class VaryingLinearTransform(pyro.distributions.transforms.Transform):
+
+    # This applies a z-dependent 2x2 linear transform M(z) on yx, parametrised
+    # as M(z) = expm(L(z)) where L(z) is an unconstrained 2x2 matrix.
+    # det(M) = exp(tr(L)) > 0, so M is always invertible and orientation-preserving.
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, logits, min_z, max_z, truncate_frac=None, event_dim=0, cache_size=0):
+        super().__init__(cache_size=cache_size)
+        self.min_z = min_z
+        self.max_z = max_z
+        self.logits = logits
+        self.truncate_frac = truncate_frac
+
+    def _call(self, input_zyx, inverse=False):
+        zs = input_zyx[..., :1]
+        if os.environ.get('FIT_SPIRAL_FAST_LINEAR', '1') != '0':
+            # Explicit 1-D lerp over z + elementwise 2x2 apply. The
+            # grid_sample this replaces is a pure z-interpolation on a
+            # [Z, 2, 2] table (W=1, align_corners=True, border padding), but
+            # its backward kernel serializes scattering millions of points
+            # into the tiny table; batched [N,2,2]@[N,2,1] matmul likewise
+            # dispatches to pathological tiny-gemm cublas launches. Same
+            # arithmetic per point (fp-association tolerance class).
+            Z = self.logits.shape[0]
+            zn = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z)
+            coord = (zn * 2 - 1 + 1) / 2 * (Z - 1)
+            coord = coord.clamp(min=0., max=float(Z - 1))
+            lo = coord.detach().floor().clamp(max=float(Z - 2) if Z > 1 else 0.)
+            frac = (coord - lo)[..., None]
+            lo = lo.to(torch.int64)
+            flat = self.logits.reshape(Z, 4)
+            if Z > 1:
+                logits = torch.lerp(
+                    F.embedding(lo, flat), F.embedding(lo + 1, flat), frac)
+            else:
+                logits = F.embedding(lo, flat)
+            logits = logits.view(*input_zyx.shape[:-1], 2, 2)
+        else:
+            normalised_zs = (zs.view(-1) - self.min_z) / (self.max_z - self.min_z) * 2 - 1
+            # grid_sample_border is F.grid_sample everywhere but MPS, which
+            # has no grid_sample backward.
+            logits = grid_sample_border(
+                rearrange(self.logits, 'z r c -> 1 (r c) z 1'),
+                torch.stack([torch.zeros_like(normalised_zs), normalised_zs], dim=-1)[None, None],
+            ).squeeze(2).squeeze(0).T.view(*input_zyx.shape[:-1], 2, 2)
+        if inverse:
+            logits = -logits
+        if self.truncate_frac is not None:
+            # In log-space, scaling by truncate_frac gives a geodesic interpolation
+            # towards the identity at frac=0
+            logits = logits * self.truncate_frac
+        M = expm_2x2(logits)
+        y, x = input_zyx[..., 1], input_zyx[..., 2]
+        yx_out = torch.stack([
+            M[..., 0, 0] * y + M[..., 0, 1] * x,
+            M[..., 1, 0] * y + M[..., 1, 1] * x,
+        ], dim=-1)
+        return torch.cat([zs, yx_out], dim=-1)
+
+    def _inverse(self, input_zyx):
+        return self._call(input_zyx, inverse=True)
+
+
+class UmbilicusTransform(pyro.distributions.transforms.Transform):
+
+    # This translates in the yx plane by a z-dependent value (i.e. shears the volume) s.t. the origin is moved to the umbilicus
+
+    domain = pyro.distributions.constraints.real_vector
+    codomain = domain
+
+    def __init__(self, umbilicus_zyx, event_dim=2, cache_size=0):
+        super().__init__(cache_size=cache_size)
+        self._event_dim = event_dim
+        yx_filtered = scipy.ndimage.gaussian_filter1d(umbilicus_zyx[:, 1:].cpu().numpy(), sigma=75., axis=0, mode='nearest')
+        self._yx = torch.from_numpy(yx_filtered).to(umbilicus_zyx.device).contiguous()
+        self._z = umbilicus_zyx[:, :1].contiguous()
+
+    def _call(self, input_zyx, inverse=False):
+        centre_yx = interp1d(input_zyx[..., 0].contiguous(), self._z, self._yx)
+        # Add the centre to the yx columns directly rather than materialising
+        # a zero-padded [..., 3] offset; z passes through untouched (it only
+        # gained an exact +0 before) and the yx additions are identical.
+        yx = (input_zyx[..., 1:] - centre_yx if inverse
+              else input_zyx[..., 1:] + centre_yx)
+        return torch.cat([input_zyx[..., :1], yx], dim=-1)
+
+    def _inverse(self, input_zyx):
+        return self._call(input_zyx, inverse=True)
+
+
+class SpiralAndTransform(nn.Module):
+
+    def __init__(self, flow_integration_steps, flow_integration_solver, flow_min_corner_zyx, flow_max_corner_zyx, umbilicus_zyx, config, spiral_outward_sense='CW'):
+
+        super().__init__()
+
+        self.cfg = config
+        self.spiral_outward_sense = spiral_outward_sense
+        self.flow_integration_steps = flow_integration_steps
+        self.flow_integration_solver = flow_integration_solver
+        self.flow_min_corner_zyx = flow_min_corner_zyx
+        self.flow_max_corner_zyx = flow_max_corner_zyx
+        self.spiral_intensity = 200 / 255
+        self.dr_per_winding_scale = 12.  # larger value increases effective learning rate
+        self.linear_logits_scale = 40.  # larger value increases effective learning rate
+
+        self.umbilicus_transform = UmbilicusTransform(umbilicus_zyx)
+        self.gap_min_gap = float(config.get(
+            'model_gap_expander_min_gap', 1.0))
+        self.gap_softplus_bias = float(
+            config.get('model_gap_expander_softplus_bias', 4.0))
+        self.gap_softplus_scale = calibrated_gap_softplus_scale(
+            float(config['model_initial_dr_per_winding']), self.gap_min_gap,
+            self.gap_softplus_bias)
+        self.dr_per_winding_logit = nn.Parameter(initial_dr_logit(
+            float(config['model_initial_dr_per_winding']), self.gap_min_gap))
+
+        flow_resolution = (flow_max_corner_zyx - flow_min_corner_zyx) // config['model_flow_voxel_resolution']
+        flow_field_cls = {
+            'cartesian': CartesianFlowField,
+            'cylindrical': CylindricalFlowField,
+            'bspline': BSplineFlowField,
+            'bspline_cylindrical': BSplineCylindricalFlowField,
+        }[config['model_flow_field_type']]
+
+        # num_flow_stages: number of stationary velocity fields whose integrated diffeomorphisms
+        # are composed sequentially (phi = exp(v_N) o ... o exp(v_1) in the spiral->slice
+        # direction; the inverse runs them backwards in reverse order). They are the slabs of
+        # one flow field's lattices ([num_flow_stages, 3, ...]), integrated by one
+        # IntegratedFlowDiffeomorphism, so num_flow_stages == 1 is exactly the original
+        # single-field model with identical parameters and state_dict keys.
+        self.num_flow_stages = int(config.get('model_num_flow_stages', 1) or 1)
+        assert self.num_flow_stages >= 1
+        self.flow_field = flow_field_cls(
+            flow_resolution,
+            num_stages=self.num_flow_stages,
+            direct_lr=config.get('model_flow_field_direct_lr', False),
+        )
+
+        self.linear_logits = nn.Parameter(torch.zeros([int(flow_max_corner_zyx[0] - flow_min_corner_zyx[0]) // config['model_linear_z_resolution'], 2, 2], dtype=torch.float32))
+
+        self.gap_expander_params = GapExpanderParams(
+            resolution=config['model_gap_expander_logit_resolution'],
+            min_z=flow_min_corner_zyx[0],
+            max_z=flow_max_corner_zyx[0],
+            num_windings=config.get(
+                'model_gap_expander_capacity_windings',
+                config['model_gap_expander_num_windings']),
+            dr_per_winding=config['model_initial_dr_per_winding'],  # this is a nominal (fixed) winding spacing which we only use to calculate the number of logits
+        )
+
+    @property
+    def device(self):
+        return self.linear_logits.device
+
+    def _get_transform_parts(self, truncate_at_step=None, shared=None):
+        truncate_frac = None if truncate_at_step is None else truncate_at_step / (self.flow_integration_steps - 1)
+        diffeomorphism = IntegratedFlowDiffeomorphism(self.flow_field, self.flow_min_corner_zyx, self.flow_max_corner_zyx, num_steps=self.flow_integration_steps, solver=self.flow_integration_solver, truncate_at_step=truncate_at_step)
+        gap_expander = GapExpandingTransform(
+            self.gap_expander_params,
+            shared[0] if shared is not None else self.get_dr_per_winding(),
+            self.flow_min_corner_zyx[0],
+            self.flow_max_corner_zyx[0],
+            self.cfg['model_gap_expander_lr_scale'],
+            self.gap_min_gap,
+            self.gap_softplus_bias,
+            self.gap_softplus_scale,
+            truncate_frac,
+        )
+        if shared is not None:
+            gap_expander._pinned_scaled_logits = shared[2]
+        if self.spiral_outward_sense == 'CW':
+            maybe_flip = []
+        else:
+            assert self.spiral_outward_sense == 'ACW'
+            # To make spiral go anticlockwise in slice space (going outwards from the centre), flip it horizontally
+            maybe_flip = [pyro.distributions.transforms.AffineTransform(loc=0., scale=_acw_flip_scale(self.device))]
+        return gap_expander, maybe_flip, diffeomorphism, truncate_frac
+
+    def get_slice_to_spiral_transform(self, truncate_at_step=None, shared=None):
+        # `shared` optionally supplies the (dr_per_winding, scaled_linear_logits,
+        # pinned_scaled_gap_logits) triple from get_shared_transform_tensors(),
+        # typically as detached leaves so many separate loss backwards can run
+        # through one transform instance without retain_graph.
+        gap_expander, maybe_flip, diffeomorphism, truncate_frac = self._get_transform_parts(truncate_at_step, shared)
+        scaled_linear_logits = (
+            shared[1] if shared is not None
+            else self.linear_logits * self.linear_logits_scale)
+        return pyro.distributions.transforms.ComposeTransform([
+            gap_expander,
+            *maybe_flip,
+            diffeomorphism,
+            VaryingLinearTransform(scaled_linear_logits, self.flow_min_corner_zyx[0], self.flow_max_corner_zyx[0], truncate_frac),
+            self.umbilicus_transform,
+        ]).inv
+
+    def get_dr_per_winding(self):
+        return lower_bounded_dr(
+            self.dr_per_winding_logit, self.gap_min_gap)
+
+    def smooth_flow_grad_(self, sigma_voxels, across_sigma_voxels=0.0,
+                          low_res_sigma_voxels=0.0):
+        """Gaussian-smooth the flow lattices' gradients in place.
+
+        ``sigma_voxels`` is the z/around-ring width for cylindrical lattices
+        (isotropic for Cartesian), ``across_sigma_voxels`` the across-ring
+        width (cylindrical only), and ``low_res_sigma_voxels`` a coarse-lattice
+        override for the first width (0 = same as ``sigma_voxels``). Directions
+        approximate along/across-sheet directions; see flow_grad_smoothing.
+        All widths use scroll-voxel units of the flow frame, not distances
+        measured on the deformed sheet. Convert using the nominal fine cell
+        width model_flow_voxel_resolution; each field scales for its coarse
+        lattice.
+        Applies to every flow stage. Call after apply_accumulated_field_grad
+        (and after any all-reduce) and before the optimizer step.
+        """
+        cell_voxels = float(self.cfg['model_flow_voxel_resolution'])
+        self.flow_field.smooth_grad_(
+            float(sigma_voxels) / cell_voxels,
+            float(across_sigma_voxels) / cell_voxels,
+            float(low_res_sigma_voxels or 0.0) / cell_voxels)
+
+    def describe_flow_grad_smoothing(self, sigma_voxels, across_sigma_voxels=0.0,
+                                     low_res_sigma_voxels=0.0):
+        """The effective smoothing widths per lattice, for the startup log."""
+        return flow_grad_smoothing.describe_widths(
+            sigma_voxels, across_sigma_voxels,
+            float(self.cfg['model_flow_voxel_resolution']),
+            self.flow_field.spatial_scale_factor,
+            self.cfg['model_flow_field_type'],
+            low_res_along_voxels=low_res_sigma_voxels)
+
+    def get_shared_transform_tensors(self):
+        """The tiny graph paths every evaluation of one transform instance
+        shares: the dr-per-winding softplus, the scaled linear logits, and the
+        pinned+scaled gap logits (kept in sync with
+        GapExpandingTransform._get_pinned_scaled_logits). The training loop
+        passes detached leaf copies to get_slice_to_spiral_transform(shared=...)
+        so each loss family's backward owns its whole graph and needs no
+        retain_graph, then propagates the accumulated leaf gradients through
+        these outputs once per step."""
+        gap_logits = self.gap_expander_params.logits
+        pinned_scaled_gap_logits = torch.cat(
+            [torch.zeros_like(gap_logits[..., :1]), gap_logits[..., 1:]], dim=-1,
+        ) * self.cfg['model_gap_expander_lr_scale']
+        return (
+            self.get_dr_per_winding(),
+            self.linear_logits * self.linear_logits_scale,
+            pinned_scaled_gap_logits,
+        )
+
+    def get_native_log_gaps(self, winding_idx, theta, z):
+        """Exact log gap for the native lower-bounded gap expander."""
+        gap_expander, _, _, truncate_frac = self._get_transform_parts()
+        assert truncate_frac is None
+        return gap_expander.get_native_log_gaps(winding_idx, theta, z)
+
+    def get_spiral_density(self, spiral_zyx, winding_range=None):
+        if winding_range is None:
+            winding_range = (self.cfg['output_first_winding'], float('inf'))
+        return sample_spiral.get_spiral_density(
+            spiral_zyx[..., 1:],
+            dr_per_winding=self.get_dr_per_winding(),
+            sigma=1.,
+            winding_range=winding_range,
+        ) * self.spiral_intensity

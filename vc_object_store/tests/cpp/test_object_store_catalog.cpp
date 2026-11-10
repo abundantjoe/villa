@@ -1,0 +1,367 @@
+// Open Data samples as catalog stores: placeholders from the catalog, geometry
+// fetched by reads that reach it (once, through the session), failures not
+// cached, imports shadowing catalog surfaces, published files and refresh.
+#include "vc_object_store/objects/StoreReader.hpp"
+#include "TestSupport.hpp"
+#include "vc_object_store/Tiff.hpp"
+#include "vc_object_store/objects/CatalogStore.hpp"
+#include "vc_object_store/objects/Project.hpp"
+#include "vc_object_store/objects/GeometryRegion.hpp"
+#include "vc_object_store/store/GeometryViews.hpp"
+#include <nlohmann/json.hpp>
+#include <cstring>
+#include <vector>
+#include <arpa/inet.h>
+#include <netinet/in.h>
+#include <sys/socket.h>
+#include <unistd.h>
+#include <atomic>
+#include <chrono>
+#include <fstream>
+#include <iostream>
+#include <map>
+#include <mutex>
+#include <sstream>
+#include <thread>
+
+using namespace vc::objects;
+namespace fs = std::filesystem;
+
+namespace {
+// Serves files under a root over HTTP/1.0, counting requests per path.
+class FileServer {
+public:
+    explicit FileServer(fs::path root) : root_(std::move(root))
+    {
+        socket_ = ::socket(AF_INET, SOCK_STREAM, 0);
+        int on = 1;
+        ::setsockopt(socket_, SOL_SOCKET, SO_REUSEADDR, &on, sizeof(on));
+        sockaddr_in address{};
+        address.sin_family = AF_INET;
+        address.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
+        require(::bind(socket_, reinterpret_cast<sockaddr*>(&address), sizeof(address)) == 0, "bind");
+        socklen_t length = sizeof(address);
+        ::getsockname(socket_, reinterpret_cast<sockaddr*>(&address), &length);
+        port_ = ntohs(address.sin_port);
+        require(::listen(socket_, 16) == 0, "listen");
+        thread_ = std::thread([this] { serve(); });
+    }
+    ~FileServer()
+    {
+        stopping_ = true;
+        ::shutdown(socket_, SHUT_RDWR);
+        ::close(socket_);
+        thread_.join();
+    }
+    std::string url(const std::string& path) const { return "http://127.0.0.1:" + std::to_string(port_) + "/" + path; }
+    int requests(const std::string& path)
+    {
+        std::lock_guard lock(mutex_);
+        return counts_[path];
+    }
+
+private:
+    void serve()
+    {
+        while (!stopping_) {
+            const int client = ::accept(socket_, nullptr, nullptr);
+            if (client < 0) continue;
+            std::string request;
+            char buffer[4096];
+            while (request.find("\r\n\r\n") == std::string::npos) {
+                const auto n = ::recv(client, buffer, sizeof(buffer), 0);
+                if (n <= 0) break;
+                request.append(buffer, size_t(n));
+            }
+            std::istringstream line(request);
+            std::string method, path;
+            line >> method >> path;
+            if (!path.empty() && path.front() == '/') path.erase(path.begin());
+            {
+                std::lock_guard lock(mutex_);
+                ++counts_[path];
+            }
+            std::ifstream file(root_ / path, std::ios::binary);
+            std::string body((std::istreambuf_iterator<char>(file)), std::istreambuf_iterator<char>());
+            const bool found = file.good() || (fs::is_regular_file(root_ / path));
+            const std::string head = std::string(found ? "HTTP/1.0 200 OK" : "HTTP/1.0 404 Not Found") +
+                                     "\r\nContent-Length: " + std::to_string(found ? body.size() : 0) + "\r\n\r\n";
+            ::send(client, head.data(), head.size(), MSG_NOSIGNAL);
+            if (found) ::send(client, body.data(), body.size(), MSG_NOSIGNAL);
+            ::close(client);
+        }
+    }
+    fs::path root_;
+    int socket_ = -1;
+    uint16_t port_ = 0;
+    std::atomic_bool stopping_{false};
+    std::mutex mutex_;
+    std::map<std::string, int> counts_;
+    std::thread thread_;
+};
+
+void writeSurface(const fs::path& directory, float z)
+{
+    fs::create_directories(directory);
+    const int rows = 6, cols = 8;
+    cv::Mat_<float> x(rows, cols), y(rows, cols), zs(rows, cols, z);
+    for (int r = 0; r < rows; ++r)
+        for (int c = 0; c < cols; ++c) { x(r, c) = float(10 + c); y(r, c) = float(10 + r); zs(r, c) = z + float(c) - 4; }
+    writeTiff(directory / "x.tif", x);
+    writeTiff(directory / "y.tif", y);
+    writeTiff(directory / "z.tif", zs);
+    std::ofstream(directory / "meta.json") << R"({"format":"tifxyz","type":"seg","uuid":"z_dbg_gen","scale":[1,1],
+        "bbox":[[0,0,0],[1,1,1]],"name":"not the record"})";
+}
+
+std::string sampleJson(const FileServer& server, const std::string& tifxyz, const std::string& missing, int downscale = 1)
+{
+    const auto origin = [&](const std::string& path) {
+        return nlohmann::json::array({{{"path", path}, {"access_roots", {{{"type", "https"}, {"url", server.url("")},
+                                                                         {"usage", "public-read"}}}}}});
+    };
+    nlohmann::json segment = {
+        {"id", "seg-a"}, {"long_id", "sample-seg-a"}, {"suffix", "w001"}, {"original_volume_id", "vol"},
+        {"creation", {{"date", "2026-03-11T00:00:00Z"}, {"process", "surface_mesh_generation"},
+                      {"derived_from", {{"type", "volume"}, {"id", "vol"}}}}},
+        {"properties", {{"original_volume_downscale", downscale},
+                        {"volume_coverage", {{"vol", {{"bbox_transformed", {{10, 10, 26}, {17, 15, 33}}},
+                                                       {"overlap_ratio", 1.0}, {"computed_at", "x"}}}}}}},
+        {"data", {{{"type", "tifxyz"}, {"origins", origin(tifxyz)}},
+                  {{"type", "ink-detection"}, {"origins", origin("ink.jpg")}}}}};
+    nlohmann::json offline = {
+        {"id", "seg-b"}, {"original_volume_id", "vol"},
+        {"properties", {{"volume_coverage", {{"vol", {{"bbox_transformed", {{900, 900, 900}, {901, 901, 901}}},
+                                                       {"overlap_ratio", 1.0}}}}}}},
+        {"data", {{{"type", "tifxyz"}, {"origins", origin(missing)}}}}};
+    return nlohmann::json{{"samples", {{"sample", {{"sample", {{"id", "sample"}}},
+                                                   {"volumes", {{"vol", {{"id", "vol"}}}}},
+                                                   {"segments", {{"seg-a", segment}, {"seg-b", offline}}}}}}}}
+        .dump();
+}
+
+template <class Predicate> void waitFor(Predicate&& done, const char* what)
+{
+    for (int i = 0; i < 300 && !done(); ++i) std::this_thread::sleep_for(std::chrono::milliseconds(20));
+    require(done(), what);
+}
+
+RegionResult regionAt(ObjectStoreSession& session, const AttachmentIdentity& attachment, double z)
+{
+    RegionSlice slice;
+    slice.origin = {12, 12, z};
+    slice.localBounds = {-20, -20, -1, 20, 20, 1};
+    RegionOptions options;
+    options.kind = "surface";
+    options.volume = "vol";
+    return session.geometryRegion({attachment}, slice, options).front().result;
+}
+} // namespace
+
+int main() try
+{
+    TemporaryDirectory directory;
+    const auto served = directory.path / "served";
+    writeSurface(served / "seg-a.tifxyz", 30);
+    std::ofstream(served / "ink.jpg") << "jpeg bytes";
+    FileServer server(served);
+    auto sample = vcr::catalog::parseOpenDataManifest(sampleJson(server, "seg-a.tifxyz/", "missing.tifxyz/"))
+                      .samples.front();
+    const auto surfaces = sample.surfaces(sample.segments.front());
+    require(surfaces.size() == 1, "one catalog surface");
+    const auto uuid = catalogSurfaceUuid(surfaces.front());
+    // RFC 4122 version 5, as Python uuid.uuid5 computes it.
+    require(util::nameUuid("3f0c2b8e-6a8d-4d5f-9a3e-7c1b2d4e5f60", "sample-seg-a-derived-native-L0-0123456789abcdef") ==
+                "d25d990e-3c53-59d3-9c1c-ad1de1b2956e",
+            "namespaced UUIDv5");
+
+    ObjectStoreSession session;
+    session.setGeometryFetcher(kCatalogMetaKey, fetchCatalogSurface);
+    OpenOptions user;
+    user.author = "catalog-test";
+    const auto projectPath = directory.path / "sample.vcobj";
+    createProject(projectPath, "sample", {{"open_data", {{"sample", "sample"}}}}, user);
+    const auto catalog = session.attach(projectPath, user);
+    const auto report = addCatalogSample(session, catalog, sample);
+    require(report.added == 2 && report.surfaces == 2, "placeholders for every catalog surface");
+    require(addCatalogSample(session, catalog, sample).added == 0, "adding the sample again adds nothing");
+
+    // Placeholder metadata comes from the catalog, never the published meta.json.
+    std::optional<ObjectRecord> record;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) { record = reader.currentObject(uuid)->record; });
+    require(record && record->name == "w001", "name from the catalog");
+    const auto meta = nlohmann::json::parse(record->meta);
+    require(meta.at("coordinates").at("volume_uuid") == "vol" && meta.at("provenance").at("tool") == "surface_mesh_generation",
+            "binding and provenance");
+    require(!meta.contains("format") && !meta.contains("uuid") && !meta.contains("bbox"), "no meta.json keys");
+    require(catalogReference(*record)->url == server.url("seg-a.tifxyz") && catalogReference(*record)->files.size() == 1,
+            "catalog reference");
+    require(record->surface && record->surface->bbox == std::array<double, 6>{10, 10, 26, 17, 15, 33}, "bounds from coverage");
+
+    // Spatial selection works before any geometry is fetched.
+    ObjectSelection near;
+    near.kind = "surface";
+    near.bbox = std::array<double, 6>{0, 0, 25, 20, 20, 35};
+    near.volume = "vol";
+    require(session.selectObjects({catalog}, near).size() == 1, "placeholder found by its bounds");
+    const auto local = [&](const std::string& object) {
+        bool found = false;
+        session.readStore(catalog, [&](const StoreReader& reader, const auto&) { found = reader.currentGeometry(object).has_value(); });
+        return found;
+    };
+    require(!local(uuid), "no geometry before a read reaches it");
+    require(server.requests("seg-a.tifxyz/x.tif") == 0, "nothing fetched at open");
+
+    // A region reaching it reports it and queues one fetch; the geometry arrives.
+    auto first = regionAt(session, catalog, 30);
+    require(first.runs.empty() && first.remote == std::vector<std::string>{uuid}, "region reports the placeholder");
+    (void)regionAt(session, catalog, 30);
+    waitFor([&] { return local(uuid); }, "fetched");
+    auto events = session.takeEvents();
+    require(server.requests("seg-a.tifxyz/x.tif") == 1, "concurrent reads share one fetch");
+    const auto fetched = regionAt(session, catalog, 30);
+    require(!fetched.runs.empty() && fetched.remote.empty(), "region has the geometry once local");
+    bool sawCommit = false;
+    for (auto& event : session.takeEvents()) events.push_back(std::move(event));
+    for (const auto& event : events)
+        sawCommit |= event.kind == StoreSessionEvent::Kind::Committed && event.attachment == catalog;
+    require(sawCommit, "the fetched geometry is a commit event");
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        const auto geometry = reader.currentGeometry(uuid);
+        require(geometry && nlohmann::json::parse(geometry->attributes).at("source_url") == server.url("seg-a.tifxyz"),
+                "revision records its source");
+        require(reader.currentObject(uuid)->record.name == "w001", "record not replaced by meta.json");
+        require(reader.currentObject(uuid)->record.surface->gridWidth == 8, "grid filled at fetch");
+    });
+    regionAt(session, catalog, 900);  // reaches the offline placeholder
+    // A failed fetch reports unavailable, caches nothing, and is retried.
+    const auto offline = catalogSurfaceUuid(sample.surfaces(sample.segments[1]).front());
+    mustFail([&] { session.ensureGeometry(catalog, offline); });
+    require(!local(offline), "failure not cached");
+    writeSurface(served / "missing.tifxyz", 900);
+    session.ensureGeometry(catalog, offline);
+    require(local(offline), "retried on the next read");
+
+    // Published files are fetched to where the caller keeps them; the store is not written.
+    std::optional<CatalogFile> published;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        for (const auto& file : catalogReference(reader.currentObject(uuid)->record)->files)
+            if (file.name == "ink-detection.jpg") published = file;
+    });
+    const auto target = directory.path / "published" / "ink-detection.jpg";
+    require(published && fetchPublishedFile(*published, target) == target && fs::is_regular_file(target) &&
+            !fs::exists(session.path(catalog).string() + ".artifacts"), "published image fetched");
+    const auto written = fs::last_write_time(target);
+    require(fetchPublishedFile(*published, target) == target && fs::last_write_time(target) == written, "fetched once");
+
+    // Editing a fetched surface edits it in place; resetting restores the fetched version.
+    (void)session.editRecords(catalog, {uuid}, [](ObjectRecord& record) {
+        auto meta = nlohmann::json::parse(record.meta); meta["review"] = "edited"; record.meta = meta.dump();
+    });
+    restoreCatalogVersion(session, catalog, uuid);
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        require(!nlohmann::json::parse(reader.currentObject(uuid)->record.meta).contains("review"), "reset to the catalog version");
+    });
+    // Other objects have no catalog version.
+    mustFail([&] { restoreCatalogVersion(session, catalog, util::newUuid()); });
+
+    // Importing brings the same object into another store, which then hides it in queries.
+    { auto created = ObjectStore::create(directory.path / "user.vcobj", user); }
+    const auto mine = session.attach(directory.path / "user.vcobj", user);
+    session.importObject(catalog, mine, uuid);
+    const auto both = session.selectObjects({mine, catalog}, near);
+    require(both.size() == 1 && both.front().attachment == mine, "imported copy shadows the original");
+
+    // Refresh follows the catalog only when asked; a changed tifxyz is fetched again.
+    writeSurface(served / "seg-a-v2.tifxyz", 31);
+    const auto revised = vcr::catalog::parseOpenDataManifest(sampleJson(server, "seg-a-v2.tifxyz/", "missing.tifxyz/"))
+                             .samples.front();
+    const auto refreshed = refreshCatalog(session, catalog, revised);
+    require(refreshed.updated == 1 && refreshed.stale == 1, "refresh updates and marks stale");
+    waitFor([&] { return server.requests("seg-a-v2.tifxyz/x.tif") == 1; }, "stale surface fetched again");
+    waitFor([&] {
+        bool fresh = false;
+        session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+            fresh = nlohmann::json::parse(reader.currentGeometry(uuid)->attributes).at("source_url") ==
+                    server.url("seg-a-v2.tifxyz");
+        });
+        return fresh;
+    }, "new revision");
+    session.readStore(mine, [&](const StoreReader& reader, const auto&) {
+        require(nlohmann::json::parse(reader.currentGeometry(uuid)->attributes).at("source_url") == server.url("seg-a.tifxyz"),
+                "other stores untouched by refresh");
+    });
+    // Local edits survive refresh and reopening.
+    (void)session.editCurrent(catalog, {uuid}, [&](const StoreReader& reader, const std::string& id) {
+        const auto view = GeometrySnapshot(reader).viewStored(id);
+        return std::vector<TransactionOperation>{EditGeometryOp{id, view.surfaceEdits(0, 0, 1, 1, {{42, 43, 44}}), {}}};
+    });
+    std::string editedGeometry;
+    session.readStore(catalog, [&](const StoreReader& reader, const auto&) {
+        editedGeometry = reader.currentGeometry(uuid)->uuid;
+    });
+    const auto kept = refreshCatalog(session, catalog, sample);
+    require(kept.preserved == 1 && kept.stale == 0, "refresh preserves locally edited geometry");
+    // A geometry edit, then a reset, returns the fetched geometry.
+    const auto edited = editedGeometry;
+    session.detach(catalog);
+    const auto reopened = session.attach(projectPath, user);
+    session.readStore(reopened, [&](const StoreReader& reader, const auto&) {
+        require(reader.currentGeometry(uuid)->uuid == edited, "edits survive reopening the project");
+        require(GeometrySnapshot(reader).surface(uuid).vertex(0, 0) == vc::geometry::SurfacePoint{42, 43, 44},
+                "saved coordinates survive refresh and reopening");
+    });
+    restoreCatalogVersion(session, reopened, uuid);
+    session.readStore(reopened, [&](const StoreReader& reader, const auto&) {
+        const auto record = reader.currentObject(uuid)->record;
+        require(nlohmann::json(reader.currentGeometry(uuid)->uuid) == nlohmann::json::parse(record.meta).at("catalog_geometry_revision"),
+                "reset restores the fetched geometry");
+    });
+    session.detach(reopened);
+    // Read-only attachments read local geometry but never fetch.
+    OpenOptions readOnly;
+    readOnly.readOnly = true;
+    const auto viewed = session.attach(projectPath, readOnly);
+    require(!session.writable(viewed), "explicit read-only attachments remain read-only");
+    mustFail([&] { session.editRecords(viewed, {uuid}, [](auto& r) { r.name = "forbidden"; }); });
+    const auto unfetchedPath = directory.path / "unfetched.vcobj";
+    createProject(unfetchedPath, "unfetched", nlohmann::json::object(), user);
+    const auto unfetched = session.attach(unfetchedPath, user);
+    addCatalogSample(session, unfetched, sample);
+    mustFail([&] { restoreCatalogVersion(session, unfetched, uuid); });  // never fetched
+    session.detach(unfetched);
+    const auto requests = server.requests("seg-a.tifxyz/x.tif");
+    const auto viewedUnfetched = session.attach(unfetchedPath, readOnly);
+    mustFail([&] { session.ensureGeometry(viewedUnfetched, uuid); });
+    (void)regionAt(session, viewedUnfetched, 30);
+    require(server.requests("seg-a.tifxyz/x.tif") == requests, "read-only attachments do not fetch");
+
+    // A surface authored at a downscale: stored * factor lands on the voxel centres it was
+    // drawn on, level voxel v being f * v + (f - 1) / 2 in the volume.
+    {
+        auto reduced = vcr::catalog::parseOpenDataManifest(sampleJson(server, "seg-a.tifxyz/", "missing.tifxyz/", 4))
+                           .samples.front();
+        const auto reducedUuid = catalogSurfaceUuid(reduced.surfaces(reduced.segments.front()).front());
+        const auto reducedPath = directory.path / "reduced.vcobj";
+        createProject(reducedPath, "sample", {{"open_data", {{"sample", "sample"}}}}, user);
+        const auto attached = session.attach(reducedPath, user);
+        addCatalogSample(session, attached, reduced);
+        session.ensureGeometry(attached, reducedUuid);
+        std::vector<float> xyz;
+        session.readStore(attached, [&](const StoreReader& reader, const auto&) {
+            const auto stored = reader.readGeometryData(reader.currentGeometry(reducedUuid)->uuid);
+            for (const auto& array : stored.arrays)
+                if (array.name == "points") {
+                    xyz.resize(array.bytes.size() / sizeof(float));
+                    std::memcpy(xyz.data(), array.bytes.data(), array.bytes.size());
+                }
+        });
+        require(!xyz.empty() && xyz[0] == 10.375f && xyz[1] == 10.375f, "authored vertices shifted to block centres");
+        require(4 * xyz[0] == 4 * 10 + 1.5f, "scale alone reaches the voxel centre");
+    }
+    std::cout << "ok\n";
+    return 0;
+} catch (const std::exception& error) {
+    std::cerr << "FAILED: " << error.what() << '\n';
+    return 1;
+}

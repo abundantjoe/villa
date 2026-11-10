@@ -1,0 +1,72 @@
+# syntax=docker/dockerfile:1.7
+#
+# Clean-room Linux AppImage build for Volume Cartographer (VC3D).
+#
+# Builds VC3D against the published CI builder image (Ubuntu 26.04 + all deps),
+# then packages the runtime install tree into a single relocatable .AppImage
+# via scripts/build_appimage.sh. glibc + the dynamic loader are bundled, so the
+# result runs on distros with an OLDER glibc than the 26.04 build image.
+#
+# Build from the repository root (writes
+# volume-cartographer/dist/VC3D-<version>-linux-x86_64.AppImage on the host). Pass
+# the git revision for a versioned name — .git is excluded from this build context:
+#   docker build -o type=local,dest=volume-cartographer/dist \
+#     -f volume-cartographer/scripts/Dockerfile.appimage \
+#     --build-arg VC_GIT_SHA1="$(git rev-parse HEAD)" \
+#     --build-arg VC_GIT_COMMIT_DATE="$(git log -1 --format=%cs HEAD)" .
+#
+# Against the local dev builder image instead of ghcr:
+#   docker build -o type=local,dest=volume-cartographer/dist \
+#     -f volume-cartographer/scripts/Dockerfile.appimage \
+#     --build-arg BUILDER_IMAGE=vc-builder:dev .
+
+# Published builder with deps recipe hash 675836fc3d478d17 (also used by PR CI).
+ARG BUILDER_IMAGE=ghcr.io/scrollprize/villa/volume-cartographer@sha256:1bebf104edbd6c290ddbaf8036c919635259f3722e8eddb31340b240baf1ed68
+
+FROM ${BUILDER_IMAGE} AS build
+ARG DEBIAN_FRONTEND=noninteractive
+
+# Git revision injected by the caller: .git is excluded from the build context,
+# so CMake can't derive the version itself. vc3d-linux.yml passes the checked-out
+# commit; empty for ad-hoc builds yields an "Untracked" version.
+ARG VC_GIT_SHA1=
+ARG VC_GIT_COMMIT_DATE=
+
+# patchelf: rewrites RPATHs during bundling. file/desktop-file-utils: used by
+# linuxdeploy for ELF/desktop validation. zstd: compresses the debug-symbols
+# companion (build_appimage.sh falls back to gzip without it).
+RUN apt-get update \
+ && apt-get install -y --no-install-recommends patchelf file desktop-file-utils zstd \
+ && rm -rf /var/lib/apt/lists/*
+
+# Preserve the monorepo sibling layout used by VC3D's runtime service install
+# and by cmake/ObjectStore.cmake, which builds ../vc_object_store from source
+# (and, through it, the sibling ../vc_reader).
+# Dockerfile.appimage.dockerignore limits the repository-root context to these
+# inputs, keeping unrelated subprojects and local build products out of it.
+COPY volume-cartographer/ /src/volume-cartographer/
+COPY spiral-fitting/ /src/spiral-fitting/
+COPY vc_object_store/ /src/vc_object_store/
+COPY vc_reader/ /src/vc_reader/
+COPY vesuvius/src/vc3d_fiber_format/ /src/vesuvius/src/vc3d_fiber_format/
+WORKDIR /src/volume-cartographer
+
+# The workflow restores/saves this mount separately from Docker's layer cache,
+# so changed sources can still reuse unchanged translation units.
+ENV CCACHE_DIR=/var/cache/ccache CCACHE_MAXSIZE=3G CCACHE_COMPILERCHECK=content
+RUN --mount=type=cache,target=/var/cache/ccache \
+    ccache --zero-stats \
+ && cmake --preset ci-release-gcc -DVC_USE_CCACHE=ON \
+      -DVC_GIT_SHA1="${VC_GIT_SHA1}" -DVC_GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
+ && ninja -C build/ci-release-gcc \
+ && ccache --show-stats
+
+ENV QMAKE=/usr/bin/qmake6
+RUN GIT_SHA1="${VC_GIT_SHA1}" GIT_COMMIT_DATE="${VC_GIT_COMMIT_DATE}" \
+    OUT_DIR=/out BUILD_DIR=/src/volume-cartographer/build/ci-release-gcc \
+    bash scripts/build_appimage.sh
+
+# Export the artifacts via `-o type=local,dest=dist`: the minified .AppImage
+# plus the split-out debug-symbols companion (VC3D-<version>-linux-<arch>-debug.tar.zst).
+FROM scratch AS export
+COPY --from=build /out/ /

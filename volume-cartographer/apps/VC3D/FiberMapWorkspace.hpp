@@ -1,0 +1,642 @@
+#pragma once
+
+#include <QFutureWatcher>
+#include <QGraphicsView>
+#include <QHash>
+#include <QImage>
+#include <QMainWindow>
+#include <QThreadPool>
+#include <QPointer>
+#include <QPoint>
+#include <QPointF>
+#include <QRectF>
+#include <QString>
+#include <QStringList>
+
+#include <cstdint>
+#include <memory>
+#include <optional>
+#include <string>
+#include <unordered_map>
+#include <vector>
+
+
+#include "FiberMapGapField.hpp"
+#include "FiberMapKollesis.hpp"
+#include "FiberMapRebuildQueue.hpp"
+#include "FiberMapRuler.hpp"
+#include "FiberMapStaleness.hpp"
+#include "FiberNetworkLayout.hpp"
+#include "vc/core/util/Rect3D.hpp"
+#include "OpenDataVolumeOrientation.hpp"
+
+class CState;
+class LineAnnotationController;
+class QCheckBox;
+class QDockWidget;
+class QDoubleSpinBox;
+class QSpinBox;
+class QEvent;
+class QGraphicsItem;
+class QGraphicsPathItem;
+class QGraphicsScene;
+class QLabel;
+class QLineEdit;
+class QMouseEvent;
+class QPainter;
+class QHideEvent;
+class QPushButton;
+class QShowEvent;
+class QTimer;
+class QTreeWidget;
+class QWheelEvent;
+
+// Pan/zoom view of the fiber map, with the same gestures as the volume viewers:
+// right-drag pans, the wheel zooms. Left clicks are reported as selection
+// requests; ctrl+right-click without a drag asks for the control-point menu.
+// Three axes are painted over the viewport in the foreground pass - windings
+// above the scroll ceiling, sheet distance below the floor, height left of
+// the map - each floating at its extent edge while that is on screen and
+// clamped to the viewport edge once it is not, so whatever is in view is
+// labelled.
+class FiberMapView : public QGraphicsView
+{
+    Q_OBJECT
+
+public:
+    explicit FiberMapView(QWidget* parent = nullptr);
+    ~FiberMapView() override;
+
+    void setRulerModel(const FiberMapRulerModel& model);
+    void setRulerStyle(const FiberMapRulerStyle& style);
+
+signals:
+    // A left click without a drag, with the keyboard modifiers held (Shift
+    // extends the selection to a second fiber).
+    void clicked(QPointF scenePos, Qt::KeyboardModifiers modifiers);
+    void controlPointMenuRequested(QPointF scenePos, QPoint globalPos);
+    // The view scale changed (wheel zoom); fitInView callers refresh
+    // scale-dependent state themselves.
+    void zoomed();
+
+protected:
+    void wheelEvent(QWheelEvent* event) override;
+    void mousePressEvent(QMouseEvent* event) override;
+    void mouseMoveEvent(QMouseEvent* event) override;
+    void mouseReleaseEvent(QMouseEvent* event) override;
+    // The axes, drawn in viewport coordinates over everything in the scene.
+    void drawForeground(QPainter* painter, const QRectF& rect) override;
+    // Tooltips over an axis band explain the axis.
+    bool viewportEvent(QEvent* event) override;
+
+private:
+    // Owned; plain painter objects, not widgets.
+    std::vector<std::unique_ptr<FiberMapRuler>> _rulers;
+    // Right-button press position, against which the pan is called a drag (and
+    // the ctrl+right menu suppressed), plus the running pan reference.
+    QPoint _pressPosition;
+    QPoint _panPosition;
+    bool _pressed = false;
+    bool _panning = false;
+    bool _panDragged = false;
+    bool _menuPending = false;
+};
+
+// Interactive 2D map of every fiber, unrolled about the scroll umbilicus onto
+// one plane at the winding the solver inferred for it. The layout rebuilds on
+// request, and - being cheap through the memoized Update path - automatically
+// for staleness a rebuild genuinely fixes (fiber or umbilicus changes) while
+// the workspace is visible; a light visible-only poll notices such changes
+// even when the user is not interacting with the map. Frame and voxel-size
+// staleness never rebuilds automatically: it is commonly a transiently
+// displayed volume, and it heals itself when the volume switches back.
+class FiberMapWorkspace : public QMainWindow
+{
+    Q_OBJECT
+
+public:
+    FiberMapWorkspace(CState* state, LineAnnotationController* controller,
+                      QWidget* parent = nullptr);
+    // Shuts the rebuild queue down (pending dropped, in-flight publication
+    // refused) and waits out the private worker pool; the worker owns its
+    // own data, so the wait is for clean pool teardown, not for safety of
+    // any shared state.
+    ~FiberMapWorkspace() override;
+    // Bounds expressed in the annotation frame, not flattened map coordinates.
+    void setFocusBounds(std::optional<Rect3D> bounds);
+
+signals:
+    void openFiberAtControlPointRequested(uint64_t fiberId, int controlPointIndex);
+
+public:
+    // Everything the rebuild worker consumes and produces, owned BY the job
+    // so the two threads share no mutable state (public so the worker's free
+    // function can see it; construction and use stay private to this class).
+    struct RebuildJobResult;
+
+protected:
+    // The map's colours follow the application theme, and a switch is only
+    // announced by a palette change.
+    void changeEvent(QEvent* event) override;
+    // Catches a layout built from fiber data that has since changed, and
+    // starts/stops the visible-only staleness poll.
+    void showEvent(QShowEvent* event) override;
+    void hideEvent(QHideEvent* event) override;
+
+private:
+    void updateFocusBounds();
+    std::optional<Rect3D> _focusBounds;
+    bool _focusBoundsDirty = false;
+    // Scene-space copy of the placed fiber (y negated once, so scroll z reads
+    // upward) alongside the two path items carrying its geometry.
+    struct FiberEntry {
+        vc3d::fiber_map::PlacedFiber fiber;
+        // Linked-network id from the layout (-1: unlinked), for the dock
+        // grouping and the selection's network co-highlight.
+        int networkId = -1;
+        QGraphicsPathItem* tracedItem = nullptr;
+        QGraphicsPathItem* interpolatedItem = nullptr;
+        // Gap spans (both endpoint controls tagged break): dotted amber.
+        QGraphicsPathItem* gapItem = nullptr;
+        // Damaged spans: the gap's dots in the pastel pink.
+        QGraphicsPathItem* damagedItem = nullptr;
+        // The network emphasis: a soft semi-transparent halo behind the
+        // fiber's whole geometry, created only while its network is
+        // selected.
+        QGraphicsPathItem* glowItem = nullptr;
+    };
+
+    // The sole rebuild entry point, for the buttons, the automatic update,
+    // and pending-request dispatch alike. full = drop every cache and
+    // recompute from scratch (the escape hatch for cache bugs; when the
+    // inputs match the last memoized Update it verifies the output digest,
+    // and a mismatch disables memoization for the session). The build runs
+    // asynchronously: the snapshot is taken on the GUI thread (the
+    // controller is GUI-only), everything from input conversion through the
+    // solve runs on a dedicated worker, and the result is validated against
+    // the world it was started in before it may publish. Requests while a
+    // build is in flight coalesce through FiberMapRebuildQueue. automatic
+    // = armed by a staleness gate rather than asked for: such a request,
+    // pending behind a build, is dropped when the volume moved on
+    // meanwhile (finishRebuild), where an asked-for one is honoured.
+    void requestRebuild(bool fullRebuild = false, bool automatic = false);
+    void rebuildScene(const QString& emptyMessage);
+    void rebuildTree();
+    // The dock tree's columns, in order; the len column's header names the
+    // unit its cells are in (cm with a voxel size, else vx).
+    enum TreeColumn {
+        kTreeFiberColumn = 0,
+        kTreeHvColumn,
+        kTreeWindingColumn,
+        kTreeLengthColumn,
+        kTreeAnchorColumn,
+        kTreeAnnotationColumn,
+        kTreeColumnCount,
+    };
+    [[nodiscard]] QStringList treeHeaderLabels() const;
+    // Hides every fiber row the search box does not match, and every group
+    // (error, network) left without a visible row; an empty box shows all.
+    void applyTreeFilter();
+    // Puts a stale reason on the status line and records it, without latching:
+    // this is how applyStaleVerdict() surfaces staleness *derived* from the
+    // dependency comparison, which clears itself when its cause reverts.
+    void showStale(const QString& reason);
+    // The status line composed from its current floor (stale reason, build
+    // summary with the selection, or resting prompt) with the operation
+    // message in front of it. Every write of the label goes through
+    // composeStatus() so no floor change can erase the message.
+    [[nodiscard]] QString composeStatus(const QString& floor) const;
+    void redrawStatus();
+    // The outcome of the last user-started operation (an auto-link refusal,
+    // its retained-control explanation, "choose Link again"). It stays on
+    // the line through staleness polling and the automatic rebuild's
+    // publication, until the next user action on the map.
+    void setOperationStatus(const QString& message);
+    void clearOperationStatus();
+    // The latching form, for staleness asserted rather than derived — the
+    // invariant-violation defenses. Nothing in the dependency sets can prove a
+    // latched reason wrong, so it survives every comparison until the layout it
+    // describes is rebuilt or cleared. The reason names what actually changed
+    // either way.
+    void markStale(const QString& reason);
+    // Drops the layout entirely, for the one change that leaves it not merely
+    // out of date but meaningless: a different package has different fibers.
+    // Grid and voxel-size differences are derived staleness instead — they
+    // commonly mean a transiently displayed volume and heal on revert — see
+    // FiberMapStaleness.hpp.
+    void clearLayout(const QString& reason);
+    // The decision itself lives in FiberMapStaleness.hpp as a function of two
+    // dependency sets, so every arm of it is testable without a widget. Splitting
+    // evaluation from application matters for one caller in particular: the fiber
+    // tree's currentItemChanged handler cannot afford a synchronous clearLayout(),
+    // which clears the tree and so deletes the QTreeWidgetItem the signal is still
+    // being delivered with.
+    using StaleVerdict = vc3d::fiber_map::StaleVerdict;
+    [[nodiscard]] vc3d::fiber_map::FiberMapDependencies currentDependencies() const;
+    [[nodiscard]] vc3d::fiber_map::FiberMapDependencies layoutDependencies() const;
+    // Cheap enough to guard interaction — integer compares, a few volume metadata
+    // reads, and stats of the umbilicus candidates. Mutates nothing.
+    [[nodiscard]] StaleVerdict evaluateDependencies() const;
+    // Acts on a verdict. Returns true when interaction with the map must be
+    // refused — the layout was cleared or marked stale — and false when the
+    // map is current (restoring the resting status if a derived stale reason
+    // just reverted).
+    bool applyStaleVerdict(const StaleVerdict& verdict);
+    // Update is cheap (memoized), so staleness a rebuild genuinely fixes -
+    // changed fibers or a changed umbilicus - triggers one automatically:
+    // queued and debounced, only while the workspace is visible, never
+    // re-entrantly. Frame/voxel-size/latched staleness never auto-rebuilds
+    // (commonly a transiently displayed volume; see FiberMapStaleness.hpp).
+    void scheduleAutoUpdate();
+    // A translucent blue bar sweeping across the triggering button as the
+    // rebuild's phases complete. The rebuild blocks the event loop, so the
+    // sweep advances by forced synchronous repaints at phase boundaries
+    // rather than by animation.
+    // Launches the worker for an already-granted queue Start. The job (see
+    // RebuildJobResult above) carries the snapshot, params, and the
+    // memoization cache - moved out of the workspace at start, moved back
+    // only on a validated publish.
+    void startRebuild(bool fullRebuild, bool automatic);
+    // Watcher-delivered completion: validate against the current world,
+    // publish or discard, then run the one epilogue.
+    void applyRebuild(const std::shared_ptr<RebuildJobResult>& job);
+    // The validated-success half of applyRebuild: watermarks, digests,
+    // scene, tree, status.
+    void publishRebuild(RebuildJobResult& job);
+    // The single terminal path: progress cleared, buttons restored, queue
+    // returned to Idle, pending request dispatched.
+    void finishRebuild();
+    // A translucent blue marquee sweeping the triggering button while the
+    // build runs (the event loop is live now, so it really animates).
+    void startRebuildProgress(QPushButton* button);
+    void tickRebuildProgress();
+    void clearRebuildProgress();
+    // The two together, for callers that can absorb a scene rebuild inline.
+    bool refreshStaleState();
+    // Appends the package's umbilicus state to a status line, resolving it at
+    // most once per umbilicus fingerprint: it is filesystem work, and keying it
+    // to the fibers instead threw the answer away on every save.
+    [[nodiscard]] QString withCachedUmbilicusStatus(const QString& status);
+    // Scene units (voxels) per centimetre, from the package's voxel size when it
+    // has one and from the documented assumption otherwise. This is the only
+    // route from the map's cm-valued styling constants into the voxel-space
+    // scene; it is never allowed to produce displayed text, because when the
+    // voxel size is unknown it is a guess.
+    [[nodiscard]] double sceneVxPerCm() const;
+    // Scene x for a layout x: the layout's x is arclength at one reference
+    // radius (winding-linear); the scene stretches it by the fitted sheet
+    // model so that a centimetre of sheet is the same width on every winding
+    // and the distance ruler reads scene x directly. Every placed coordinate
+    // goes through it, and nothing converts back: clicks resolve against the
+    // placed entries.
+    [[nodiscard]] double sceneXOf(double layoutXVx) const;
+    // A layout length (voxels) as display text: centimetres when the voxel size
+    // is known, otherwise the voxel count itself, which is the one figure still
+    // true when the package cannot say how big a voxel is.
+    [[nodiscard]] QString formatMapLength(double valueVx) const;
+    // The dock's total: every fiber of the published snapshot summed, in the
+    // same unit as the tree's len column; a dash without a layout.
+    void updateTotalLengthLabel();
+    // The kollesis seams (FiberMapKollesis.hpp) read off the published
+    // layout's H fibers with the toolbar's grouping gap: the terminations,
+    // in map x for grouping and scene x for fitting, over the scroll's z
+    // extent.
+    [[nodiscard]] vc3d::fiber_map::kollesis::Model buildKollesisModel() const;
+    // Redraws the seams - the translucent overlap bands, their bound lines
+    // and midlines in the scene, and the ruler's kollesis marks - from the
+    // layout as it stands. Cheap (no solve), so the toolbar's kollesis
+    // controls call it directly; rebuildScene() calls it as part of every
+    // scene build.
+    void rebuildKollesisOverlay();
+    // The content rect plus whatever the kollesis overlay reaches beyond it:
+    // what the first-build fit frames and the scene rect wraps.
+    [[nodiscard]] QRectF framedRect() const;
+    void applySceneRect();
+    void setHighlightedFiber(uint64_t fiberId);
+    // The selection: at most two fibers, most recent last. A plain click
+    // selects one (or none); Shift+click keeps the last two clicked. Both
+    // paint as selected with their control dots; the network glow and the
+    // dock row follow the most recent (_highlightedFiber).
+    void setSelectedFibers(std::vector<uint64_t> fibers);
+    void drawControlPointDots(uint64_t fiberId);
+    void updateSelectionStatus();
+    // "Link <A> and <B>": the deferred three-phase trigger (see the plan in
+    // the header comment of startAutoLink).
+    void startAutoLink(uint64_t subjectId, uint64_t otherId, QPointF scenePos,
+                       const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // The shared marker rule for one link endpoint of the published layout:
+    // true when the control point has at least one pending link and every
+    // pending link on it is an unreviewed automatic link
+    // (line_annotation::autoPendingMarker): its markers take the automatic
+    // palette.
+    [[nodiscard]] bool endpointAutoPending(uint64_t fiberId, int controlIndex) const;
+    // The one look of a link endpoint, from the endpoint's AGGREGATED review
+    // state (every link at that control point): pending outranks approved
+    // for the palette (as the annotation views' marker precedence), the
+    // automatic palette follows endpointAutoPending. Every dot drawer uses it.
+    struct EndpointLook {
+        QColor fill;
+        QColor pen;
+        bool pending = false;
+        // The automatic palette: every pending link on the point is automatic.
+        bool automatic = false;
+        // Any automatic link on the point (a mixed point keeps the pending
+        // palette solid; without one the pre-existing looks are untouched).
+        bool anyAuto = false;
+        // Any adjacent link on the point: triangle instead of circle.
+        bool adjacent = false;
+    };
+    [[nodiscard]] std::optional<EndpointLook> endpointLook(uint64_t fiberId, int controlIndex) const;
+    // The gap heat map (FiberMapGapField.hpp). The field is a pure function of
+    // the published layout and the toolbar's settings: it is built on the
+    // rebuild worker alongside the layout, with the settings captured at job
+    // start, published with it, and dropped with it. It takes part in no
+    // digest. Its tiles are ordinary scene items, recreated from the retained
+    // field by rebuildScene() and forgotten before every scene clear.
+    [[nodiscard]] vc3d::fiber_map::gaps::GapFieldParams gapFieldParams(
+        std::optional<double> voxelSizeUm) const;
+    void addGapTiles();
+    void setGapTilesVisible(bool visible);
+    void handleGapsToggled(bool checked);
+    void handleGapParamsChanged();
+    void updateGapLegend();
+    // The status line's heat-map suffix for the published build as the
+    // toolbar stands now (empty with Gaps off), and the status text it
+    // composes with the layout's own summary.
+    [[nodiscard]] QString gapStatusSuffix() const;
+    void refreshGapStatus();
+    // Whether the published build's heat-map settings (on/off and
+    // parameters, captured at its job start) are what the toolbar asks for
+    // now. False before any build has published.
+    [[nodiscard]] bool gapSettingsMatchPublished() const;
+    // A build is running or being applied: whatever it captured of the
+    // toolbar is not yet published, so no reuse decision can be made from
+    // the published settings until its epilogue.
+    [[nodiscard]] bool rebuildInFlight() const;
+    // Tiles follow the checkbox against the published field: shown (created
+    // if need be) when on and the published settings match, hidden
+    // otherwise. The rebuild epilogue's last word on the heat map.
+    void reconcileGapTiles();
+    // A settings change that the published build does not cover: queues an
+    // Update when a layout exists or a build is running (the epilogue keeps
+    // a pending Update alive while the settings mismatch, see
+    // finishRebuild()); before a first build with nothing running, that
+    // build captures the settings itself.
+    void requestGapRebuild();
+    // Label chips are fixed pixel size, so zoomed far enough out they bury
+    // the geometry; below the scale where one winding spans fewer screen
+    // pixels than a couple of chips, they all hide.
+    void updateLabelChipVisibility();
+    // (Re)paints one fiber's items for its current role: the selected fiber
+    // (thicker lines, raised), a member of its linked network (a gentle glow
+    // behind unchanged lines), or plain.
+    enum class FiberEmphasis { Plain, Network, Selected };
+    void paintFiberEmphasis(FiberEntry& entry, FiberEmphasis emphasis);
+    void clearControlPointDots();
+    void handleSceneClick(const QPointF& scenePos, Qt::KeyboardModifiers modifiers);
+    // Ctrl+right-click on the map: acts on the selected fiber, and only when
+    // the click lands on it. "Go to control point" when a dot was hit, and
+    // "Delete" always.
+    void handleControlPointMenu(const QPointF& scenePos, const QPoint& globalPos);
+    // Right-click on a fiber row of the dock: selects the row, then offers
+    // the same Delete.
+    void handleTreeContextMenu(const QPoint& pos);
+    // The confirmed delete both menus end in. Runs outside the menus' nested
+    // event loops; the fiber must still be loaded under the same id and file
+    // name after the confirmation dialog, and nothing happens if the map's
+    // dependencies moved since the menu was built.
+    void confirmAndDeleteFiber(uint64_t fiberId,
+                               const std::string& fileName,
+                               const QString& displayName,
+                               const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // The delete itself, queued out of the confirmation dialog's signal:
+    // dependencies re-checked, the fiber re-checked by id and name, then the
+    // controller's deleteFibers behind a lifetime guard.
+    void deleteConfirmedFiber(uint64_t fiberId,
+                              const std::string& fileName,
+                              const vc3d::fiber_map::FiberMapDependencies& menuDependencies);
+    // Lands the tree on the fiber's row. revealHidden: a search that hides
+    // the row is cleared first - for the user's own click on the map, which
+    // outranks the filter; a programmatic restore (theme change) leaves the
+    // search as typed.
+    void selectFiberRow(uint64_t fiberId, bool revealHidden = false);
+    [[nodiscard]] uint64_t fiberAt(const QPointF& scenePos) const;
+    [[nodiscard]] double sceneTolerance(double viewPixels) const;
+
+    // QPointer: the controller is owned elsewhere and dies before this widget
+    // during CWindow teardown; guards keep late signals harmless.
+    CState* _state;
+    QPointer<LineAnnotationController> _controller;
+    FiberMapView* _view = nullptr;
+    QGraphicsScene* _scene = nullptr;
+    QTreeWidget* _tree = nullptr;
+    QDockWidget* _fiberDock = nullptr;
+    QPushButton* _updateButton = nullptr;
+    // The dock's search box: a case-insensitive substring filter over each
+    // fiber row's label and annotation name, re-applied after every tree
+    // rebuild.
+    QLineEdit* _searchEdit = nullptr;
+    // Above the search box: the summed line length of every fiber the
+    // published layout was built from, placed or not.
+    QLabel* _totalLengthLabel = nullptr;
+    // Line length in annotation-frame voxels by runtime fiber id, for every
+    // fiber of the published layout's snapshot (the layout itself keeps only
+    // the smoothed, unrolled geometry, which is not what a length is read
+    // from). Cleared with the layout.
+    std::unordered_map<uint64_t, double> _fiberLengthVx;
+    QLabel* _statusLabel = nullptr;
+    QCheckBox* _gapsCheck = nullptr;
+    // The colour scale reads "0 [ramp] [saturation]": the spinbox IS the
+    // scale's top end.
+    QLabel* _gapLegendZero = nullptr;
+    QLabel* _gapLegend = nullptr;
+    QDoubleSpinBox* _gapSaturationSpin = nullptr;
+    QCheckBox* _gapFadeCheck = nullptr;
+    QSpinBox* _gapFadeWindingsSpin = nullptr;
+    // The kollesis seams: on/off (the whole feature, scene and bar), the
+    // grouping gap in windings, and how many seams to predict ahead.
+    QCheckBox* _kollesisCheck = nullptr;
+    QDoubleSpinBox* _kollesisGapSpin = nullptr;
+    QSpinBox* _kollesisAheadSpin = nullptr;
+    // Scene-owned seam items (bands, bounds, midlines); cleared with the
+    // scene, or removed and deleted by rebuildKollesisOverlay().
+    std::vector<QGraphicsItem*> _kollesisItems;
+    vc3d::fiber_map::kollesis::Model _kollesisModel;
+    // What the view's axes read, as last handed over: the layout's extent
+    // and windings, plus the kollesis marks the overlay rebuild fills in.
+    FiberMapRulerModel _rulerModel;
+    // The published layout's gap field (null before a build that carried
+    // one) and the settings it was built with, so a toggle can tell a field
+    // it may show from one that needs a rebuild.
+    std::shared_ptr<const vc3d::fiber_map::gaps::GapField> _gapField;
+    // What the published build was asked for (the field is null when this
+    // is false, and also when the build failed with it true), and why it
+    // has no field if it failed.
+    bool _gapPublishedWanted = false;
+    QString _gapPublishedError;
+    vc3d::fiber_map::gaps::GapFieldParams _gapFieldParams;
+    // Scene-owned; cleared (not deleted) whenever the scene is.
+    std::vector<QGraphicsItem*> _gapTiles;
+    // Tile images the worker coloured for the published field, in the theme
+    // it was told (dark or light), waiting for the next addGapTiles() to
+    // wrap them in pixmaps; empty once used, or when the theme has moved on
+    // and they are coloured again from the field.
+    std::vector<QImage> _pendingGapTiles;
+    bool _pendingGapTilesDark = false;
+    vc3d::fiber_map::GlobalResult _layout;
+    // The umbilicus centres _layout was built with (a copy of the job's
+    // snapshot), for unrolledLineArclengths when a drawn point is mapped back
+    // to a source line position (the auto-link locator).
+    std::vector<cv::Vec3f> _layoutUmbilicusCenters;
+    // Per link endpoint, the review state aggregated from EVERY link of the
+    // snapshot (the layout keeps only the links it could place): what the
+    // dot drawers and endpointLook decide from.
+    std::map<vc3d::fiber_map::EndpointKey, vc3d::fiber_map::EndpointReview> _endpointReviews;
+    // Memoized rebuild state: the cache, whether a verification failure
+    // benched it, and the last build's input/output digests for Full
+    // rebuild's check.
+    vc3d::fiber_map::GlobalLayoutCache _layoutCache;
+    bool _memoizationDisabled = false;
+    // The catalog's say on the scroll's winding sense, consulted by the
+    // worker of every rebuild (the lookup memoizes its one manifest parse
+    // and locks internally; the job holds it by shared pointer so a
+    // workspace torn down mid-flight cannot pull it from under the worker).
+    bool _haveLastDigests = false;
+    vc3d::fiber_map::ContentDigest _lastInputsDigest;
+    vc3d::fiber_map::ContentDigest _lastOutputDigest;
+    QHash<uint64_t, FiberEntry> _entries;
+    std::vector<QGraphicsItem*> _controlPointDots;
+    // Every fiber label chip of the current scene, for the zoom-threshold
+    // visibility toggle; the scale below which they hide (0: never hide).
+    std::vector<QGraphicsItem*> _labelChips;
+    double _chipHideScale = 0.0;
+    // Annotation voxel size of the snapshot the current layout came from, in µm;
+    // unset when the package could not say, in which case no measured length
+    // is displayed as physical (the gap scale's top stays a cm intent and its
+    // tooltip names the assumption it is converted with).
+    std::optional<double> _voxelSizeUm;
+    // Scroll top in scene z, i.e. voxels; 0 when the volume's extent is unknown.
+    double _scrollZMaxVx = 0.0;
+    // The scene rect keeps slack on either side so a zoomed-in view can pan
+    // past the outer panels; this is the tight rect around the content, which
+    // is what the first-build fit frames.
+    QRectF _contentRect;
+    // The x range the kollesis seams and predictions cover beyond the content
+    // rect (same y as the content rect); null while they stay inside it.
+    QRectF _kollesisReach;
+    // What the empty scene last said, so a theme change can rebuild the scene as
+    // it stands rather than take a fresh snapshot to work out the message again.
+    QString _emptyMessage;
+    uint64_t _highlightedFiber = 0;
+    // The ordered selection (<= 2, back = most recent = _highlightedFiber).
+    std::vector<uint64_t> _selectedFibers;
+    // "Link A and B" in flight: the menu entry is disabled and a delete
+    // refuses, like _deleteInFlight the other way round.
+    bool _autoLinkInFlight = false;
+    // A "Link A and B" that had to save an open annotation of one of its
+    // fibers first (phase B moved the fiber generation, so the map it was
+    // clicked on is stale): the request waits for the automatic Update and
+    // runs again by itself from publishRebuild when the rebuilt map draws
+    // both fibers exactly as the click saw them; a rebuilt map that draws
+    // them differently asks for Link again instead, because the click
+    // would then name geometry that no longer exists. Dropped by any other
+    // user action on the map (a click, a tree row, a new Link, a delete, a
+    // layout clear); a pressed Update keeps it, it is the rebuild it waits
+    // for.
+    struct AutoLinkResume {
+        uint64_t subjectId = 0;
+        uint64_t otherId = 0;
+        QPointF scenePos;
+        vc3d::fiber_map::PlacedFiber subject;
+        vc3d::fiber_map::PlacedFiber other;
+    };
+    std::optional<AutoLinkResume> _autoLinkResume;
+    // Bumped by every cancellation: the queued callback a publication hands
+    // the request to carries the token it was queued under and starts
+    // nothing when the token moved (a click between the publication and
+    // the callback must cancel the resume, not only the waiting request).
+    uint64_t _autoLinkResumeToken = 0;
+    // True from the moment a publication hands the request to its queued
+    // callback until that callback runs: a cancellation in between must
+    // clear the promise on the status line exactly like one of a waiting
+    // request.
+    bool _autoLinkResumeQueued = false;
+    void cancelAutoLinkResume();
+    void resumeAutoLinkAfterPublish();
+    // Same drawn geometry: the runs (flags, points, arclengths) and the
+    // control-point positions the locator reads.
+    [[nodiscard]] static bool sameDrawnFiber(const vc3d::fiber_map::PlacedFiber& a,
+                                             const vc3d::fiber_map::PlacedFiber& b);
+    // Fibers currently carrying the subtle network emphasis, so the next
+    // selection change can restore exactly them.
+    std::vector<uint64_t> _networkEmphasized;
+    bool _syncingSelection = false;
+    bool _viewFitted = false;
+    bool _autoUpdateScheduled = false;
+    // The rebuild lifecycle decision object (single-flight, coalescing,
+    // publication epochs); the Qt glue delegates every transition to it.
+    vc3d::fiber_map::FiberMapRebuildQueue _rebuildQueue;
+    // Dedicated one-thread pool: no starvation from the global pool's other
+    // users, and a bounded, private teardown in the destructor.
+    QThreadPool _rebuildPool;
+    QFutureWatcher<std::shared_ptr<RebuildJobResult>>* _rebuildWatcher = nullptr;
+    QTimer* _progressMarquee = nullptr;
+    QPushButton* _progressButton = nullptr;
+    qint64 _progressPhase = 0;
+    // Visible-only staleness poll: integer compares, one frame derivation and
+    // one umbilicus-file stat per tick — the workspace still costs annotation
+    // work nothing (no controller signal connections), and a hidden tab costs
+    // literally nothing.
+    QTimer* _stalePollTimer = nullptr;
+    bool _fiberDockSized = false;
+    bool _retheming = false;
+    // A delete is confirmed-or-pending: from the confirmation dialog opening
+    // until the queued delete has run (or the dialog was dismissed). One at a
+    // time, because the controller's delete yields to the event loop while it
+    // drains saves.
+    bool _deleteInFlight = false;
+    // What the current layout was built from, and whether a change has been seen
+    // since; a fresh workspace is stale until its first rebuild.
+    uint64_t _layoutGeneration = 0;
+    QString _layoutAnnotationVolume;
+    QString _layoutUmbilicusFingerprint;
+    QString _layoutCatalogOrientation;
+    // Controller counters as of the build. Compared rather than observed, so that
+    // this workspace existing costs annotation work nothing.
+    uint64_t _layoutPackageGeneration = 0;
+    uint64_t _layoutUmbilicusGeneration = 0;
+    // Whether a layout has ever been built. Distinct from "the layout has no
+    // fibers": an empty result is still a result, built from dependencies that
+    // can go out of date, and conflating the two left a map that had found no
+    // umbilicus saying so forever. Also what keeps the dependency comparison from
+    // firing against a default-constructed frame before the first build.
+    bool _layoutBuilt = false;
+    // The stale reason currently on the status line (empty when the map is
+    // current). Lives here, not in the label's text: the label also carries
+    // build summaries, and reading state back out of a widget is how a summary
+    // once overwrote a warning while the map stayed stale.
+    QString _staleReason;
+    // The latched reason, kept apart from the displayed one: a higher-priority
+    // derived reason can be displayed over a latch and then revert, and the
+    // latch must resurface with its own wording. Empty when nothing is
+    // latched; derived reasons clear when their cause reverts, this one only
+    // on rebuild or clear.
+    QString _latchedReason;
+    // What the status line says when nothing is stale: the last build summary,
+    // or the clear reason. Restored when a derived stale reason reverts.
+    QString _freshStatus;
+    // _freshStatus without the heat-map suffix, so the suffix can follow the
+    // Gaps checkbox after publication.
+    QString _freshStatusBase;
+    // The stylesheet that goes with _freshStatus (red while errors are ringed).
+    QString _freshStatusStyle;
+    // The clear reason alone, without the umbilicus suffix _freshStatus
+    // froze into itself: showEvent() recomposes the suffix from the live
+    // package, which can change while nothing is built.
+    QString _restingReason;
+    // See setOperationStatus(). Empty when the line shows only its floor.
+    QString _operationStatus;
+    QString _umbilicusStatusText;
+    QString _umbilicusStatusFingerprint;
+    bool _umbilicusStatusValid = false;
+};

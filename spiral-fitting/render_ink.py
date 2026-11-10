@@ -1,0 +1,670 @@
+#!/usr/bin/env python3
+"""Concatenate the `_spliced` winding meshes written by fit_spiral's save_mesh into
+winding-range chunks, then render each chunk's ink prediction into a horizontal strip.
+
+Mesh folders are named `wXXX[_suffix]` (e.g. `w020_spliced_erode_r2`). Only the
+`_spliced` variants are processed. They are first grouped into winding-range chunks by
+a fixed schedule (WINDINGS_PER_IMAGE below) and each chunk's meshes are concatenated
+(along the theta/width axis, whole meshes, never chopped) into a single tifxyz mesh,
+written to a `concat/` folder alongside the meshes and named after its winding range,
+e.g. `w010-027`. These let you load the geometry behind each ink strip as a single mesh.
+
+Each concatenated mesh is then rendered with vc_render_tifxyz, which writes --num-slices
+layer tifs into the chunk mesh's `ink/` subfolder. Those are max-composited, renormalised
+to their 95th-percentile intensity, and written as an 8-bit jpg to an `ink/` folder
+alongside the meshes, named after the same winding range, e.g. `w010-027.jpg`.
+
+How many windings land in each chunk is a fixed function of the absolute winding number
+(WINDINGS_PER_IMAGE below), not the rendered image widths, so the tiling is reproducible
+run-to-run.
+
+The winding-range strip chunks described above are only built and rendered when --strips
+is passed; by default they are skipped.
+
+By default (unless --no-full-scroll), *all* windings are concatenated into a single
+full-scroll tifxyz (concat/wLLL-HHH), which is then flattened with the lasagna forward
+flattener (../lasagna/fit.py, config flatten_fast_nofilter.json plus a generated
+overlay that points external_surfaces at the concat) rather than flatboi. The flattened
+tifxyz is written as a top-level mesh at concat/wLLL-HHH_flat (meta.json + x/y/z.tif),
+trimmed in place to its valid-cell bounding box (dropping the flatten's invalid
+output-margin border, unless --no-full-scroll-trim), and ink-rendered. The rendered ink
+strip is chopped (no downsampling) into fixed-width jpg tiles ink/wLLL-HHH_flat.NNN.jpg of
+at most --max-strip-width px each.
+"""
+
+import os
+import re
+import sys
+import json
+import glob
+import shutil
+import subprocess
+import uuid
+import tempfile
+from concurrent.futures import ThreadPoolExecutor, as_completed
+
+import click
+import numpy as np
+import scipy.ndimage
+from PIL import Image
+
+# Full-scroll strips are legitimately enormous (hundreds of megapixels); disable PIL's
+# decompression-bomb guard so max_composite can open them.
+Image.MAX_IMAGE_PIXELS = None
+
+from surface_orientation import METADATA_KEY as LAYOUT_METADATA_KEY
+from tifxyz import load_tifxyz, save_tifxyz
+
+
+def default_lasagna_dir(script_path=__file__):
+    """Return the sibling Lasagna checkout for a render_ink script path."""
+    script_dir = os.path.dirname(os.path.abspath(script_path))
+    return os.path.abspath(os.path.join(script_dir, '..', 'lasagna'))
+
+
+def is_tifxyz(path):
+    meta_path = os.path.join(path, 'meta.json')
+    if not os.path.isdir(path) or not os.path.exists(meta_path):
+        return False
+    try:
+        with open(meta_path, 'r') as f:
+            return json.load(f).get('format') == 'tifxyz'
+    except Exception:
+        return False
+
+
+def winding_idx(name):
+    """Parse the leading wXXX winding index from a mesh folder name, or None."""
+    m = re.match(r'^w(\d+)', name)
+    return int(m.group(1)) if m else None
+
+
+# Number of windings packed into each successive image, starting from winding 0.
+# After this fixed schedule is exhausted, every further winding gets its own image.
+WINDINGS_PER_IMAGE = (18, 10, 8, 7, 6) + (5,) * 2 + (4,) * 5 + (3,) * 9 + (2,) * 20
+
+
+def image_bin(widx, base):
+    """Map a winding number to an image-tile index using WINDINGS_PER_IMAGE (then 1
+    winding per image thereafter), counting from `base` (the first winding present
+    in the data). Keying off the winding number keeps the tiling reproducible
+    regardless of per-winding image widths."""
+    offset = widx - base
+    start = 0
+    for bin_idx, size in enumerate(WINDINGS_PER_IMAGE):
+        if offset < start + size:
+            return bin_idx
+        start += size
+    return len(WINDINGS_PER_IMAGE) + (offset - start)
+
+
+def read_step_and_voxel(meta_path):
+    """Recover the step_size and voxel_size_um that save_tifxyz encoded into a mesh's
+    meta.json, so a concatenated mesh can be written with matching metadata."""
+    with open(meta_path, 'r') as f:
+        meta = json.load(f)
+    step_size = 1.0 / meta['scale'][0]
+    voxel_size_um = (meta['area_cm2'] / meta['area_vx2'] * 1.e8) ** 0.5
+    return step_size, voxel_size_um
+
+
+def mesh_layout_metadata(mesh_path):
+    """The mesh's export-layout record, or None for a spiral-order mesh."""
+    with open(os.path.join(mesh_path, 'meta.json'), 'r') as f:
+        return json.load(f).get(LAYOUT_METADATA_KEY)
+
+
+def concat_meshes(mesh_paths):
+    """Load the given tifxyz meshes, in ascending winding order, and concatenate
+    their zyxs grids along the theta/width axis (axis=1), padding shorter grids with
+    the -1 invalid sentinel so heights match. Meshes written outermost wrap first are
+    concatenated outermost winding first, so the result keeps their layout. Returns
+    the combined zyxs array in zyx order and their layout record."""
+    layout = mesh_layout_metadata(mesh_paths[0])
+    mixed = [p for p in mesh_paths if mesh_layout_metadata(p) != layout]
+    if mixed:
+        raise click.ClickException(
+            f'Cannot concatenate meshes written in different layouts: {mesh_paths[0]} vs {mixed[0]}')
+    if layout is not None:
+        mesh_paths = list(reversed(mesh_paths))
+    grids = [load_tifxyz(p).zyxs.cpu().numpy() for p in mesh_paths]
+    max_h = max(g.shape[0] for g in grids)
+    padded = [
+        g if g.shape[0] == max_h
+        else np.pad(g, ((0, max_h - g.shape[0]), (0, 0), (0, 0)), constant_values=-1.0)
+        for g in grids
+    ]
+    return np.concatenate(padded, axis=1).astype(np.float32), layout
+
+
+def clean_concat_zyxs(zyxs, erode_cells, keep_largest):
+    """Clean a concatenated mesh grid before flattening: erode the valid mask by
+    ``erode_cells`` grid cells (same semantics as erode_patch_valid_region:
+    border cells erode too) and keep only the largest 4-connected valid
+    component. Ragged edges and disconnected fragments/dust are what make SLIM
+    diverge; trimming them replaces the old --inpaint workaround (which instead
+    FILLED holes with interpolated geometry that then rendered as real surface).
+    Invalid cells are set to the -1 sentinel. Returns the number of cells
+    removed; mutates zyxs in place. If cleaning would remove everything, the
+    grid is left untouched (caller-visible via the returned -1)."""
+    valid = zyxs[..., 0] >= 0
+    cleaned = valid.copy()
+    if erode_cells > 0:
+        cleaned = scipy.ndimage.binary_erosion(
+            cleaned, iterations=int(erode_cells), border_value=0)
+    if keep_largest and cleaned.any():
+        labels, num = scipy.ndimage.label(cleaned)
+        if num > 1:
+            sizes = np.bincount(labels.ravel())
+            sizes[0] = 0
+            cleaned = labels == int(np.argmax(sizes))
+    if not cleaned.any():
+        return -1
+    removed = valid & ~cleaned
+    zyxs[removed] = -1.0
+    return int(removed.sum())
+
+
+def flatten_mesh(concat_path, flatboi_bin, iters, energy, tol, inpaint, keep, flatboi_env):
+    """SLIM-flatten a concatenated tifxyz mesh and return the path to a new
+    flattened tifxyz mesh (a sibling `<name>_flat` folder).
+
+    flatboi flattens the tifxyz directly (the same pipeline as VC3D's SLIM flatten):
+    it meshes the grid, runs SLIM and rasterizes the flattened mesh at the input's
+    sampling density. With keep < 100 SLIM runs on a decimated grid — smaller meshes
+    are less likely to diverge (NaN energy) — and the UVs are lifted back onto the
+    full-resolution grid. --inpaint fills isolated invalid cells so the concat's
+    padding/holes don't break SLIM's boundary loop.
+
+    flatboi_env is a dict of env overrides (PASTIX/OPENBLAS threads, coretype) that
+    is layered onto the current environment for the flatboi step only.
+    """
+    concat_dir = os.path.dirname(concat_path)
+    name = os.path.basename(concat_path)
+    flat_path = os.path.join(concat_dir, name + '_flat')
+
+    # flatboi refuses to overwrite its output.
+    if os.path.exists(flat_path):
+        shutil.rmtree(flat_path)
+    flatboi_args = [flatboi_bin, concat_path, f'--output={flat_path}', str(iters), energy]
+    if keep < 100.0:
+        flatboi_args.append(f'--keep={keep:.4f}')
+    if inpaint:
+        flatboi_args.append('--inpaint')
+    if tol and tol > 0:
+        flatboi_args.append(f'--tol={tol:g}')
+    env = os.environ.copy()
+    env.update(flatboi_env)
+    subprocess.run(flatboi_args, check=True, capture_output=True, text=True, env=env)
+    return flat_path
+
+
+def set_tifxyz_id(tifxyz_path, new_id):
+    """Stamp a freshly produced tifxyz as a new surface: meta.json `name` becomes new_id
+    (the winding-range folder name, replacing lasagna's scratch `flatten.tifxyz`) and
+    `uuid` a fresh random identity, never derived from the name."""
+    meta_path = os.path.join(tifxyz_path, 'meta.json')
+    with open(meta_path, 'r') as f:
+        meta = json.load(f)
+    meta['uuid'] = str(uuid.uuid4())
+    meta['name'] = new_id
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=2)
+
+
+def build_full_concat(meshes_dir, meshes, concat_dir, step_size, voxel_size_um):
+    """Concatenate *every* _spliced winding mesh (see concat_meshes for the order) into a
+    single full-scroll tifxyz written to concat/, named `wLLL-HHH`. Returns
+    (name, concat_path, width_px)."""
+    ordered = sorted(meshes, key=lambda wc: wc[0])
+    lo, hi = ordered[0][0], ordered[-1][0]
+    name = f'w{lo:03d}-{hi:03d}'
+    mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in ordered]
+    concat_zyxs, layout = concat_meshes(mesh_paths)
+    save_tifxyz(
+        concat_zyxs,
+        concat_dir,
+        uuid=name,
+        step_size=step_size,
+        voxel_size_um=voxel_size_um,
+        source=f'render_ink full-scroll concat {os.path.basename(meshes_dir.rstrip("/"))}',
+        layout_metadata=layout,
+    )
+    return name, os.path.join(concat_dir, name), int(concat_zyxs.shape[1])
+
+
+def lasagna_flatten(concat_path, flat_path, lasagna_dir, lasagna_config, lasagna_fit_script, device):
+    """Flatten a (large, all-windings) concat tifxyz with the lasagna forward flattener and
+    write the result as a top-level tifxyz at `flat_path` (meta.json + x/y/z.tif directly).
+
+    Writes an overlay JSON alongside the concat that points `external_surfaces` at the
+    concat, then runs `<lasagna_fit_script> <lasagna_config> <overlay> --out-dir <scratch>`
+    from `lasagna_dir` (so fit.py's flat local imports resolve). fit.py's
+    model-init=flatten path writes `<scratch>/tifxyz/flatten.tifxyz` (plus model
+    checkpoints); we move that tifxyz up to `flat_path`, rewrite its meta id to the folder
+    name, and drop the scratch dir. Returns `flat_path`.
+
+    Config paths are passed as absolute .json positionals (cli_json treats any non-flag
+    *.json arg as a config, merged left-to-right, so the overlay's external_surfaces is
+    layered onto flatten_fast_nofilter.json). The external_surfaces path must be absolute
+    because fit runs with cwd=lasagna_dir.
+    """
+    concat_abs = os.path.abspath(concat_path)
+    flat_abs = os.path.abspath(flat_path)
+    scratch = concat_abs + '_lasagna'
+    overlay_path = concat_abs + '_lasagna_overlay.json'
+    overlay = {'external_surfaces': [{'path': concat_abs}]}
+    with open(overlay_path, 'w') as f:
+        json.dump(overlay, f, indent=2)
+
+    # fit2tifxyz writes into <scratch>/tifxyz/flatten.tifxyz; clear any stale run first.
+    if os.path.exists(scratch):
+        shutil.rmtree(scratch)
+
+    # expandable_segments reduces CUDA fragmentation/reserved-but-unallocated waste, which
+    # matters for the large full-scroll flatten on a memory-contended GPU.
+    env = os.environ.copy()
+    env.setdefault('PYTORCH_CUDA_ALLOC_CONF', 'expandable_segments:True')
+    subprocess.run(
+        [sys.executable, lasagna_fit_script,
+         os.path.abspath(lasagna_config), overlay_path,
+         '--out-dir', scratch, '--device', device],
+        check=True, cwd=lasagna_dir, env=env,
+    )
+    produced = os.path.join(scratch, 'tifxyz', 'flatten.tifxyz')
+    if not is_tifxyz(produced):
+        raise RuntimeError(f'lasagna flatten did not produce a tifxyz at {produced}')
+
+    # Promote the flattened tifxyz to the top-level flat_path folder, stamp its id with the
+    # folder name, and discard lasagna's scratch dir (model checkpoints, snapshots, overlay).
+    if os.path.exists(flat_abs):
+        shutil.rmtree(flat_abs)
+    shutil.move(produced, flat_abs)
+    set_tifxyz_id(flat_abs, os.path.basename(flat_abs))
+    shutil.rmtree(scratch, ignore_errors=True)
+    if os.path.exists(overlay_path):
+        os.remove(overlay_path)
+    return flat_abs
+
+
+def trim_tifxyz_to_valid(tifxyz_path):
+    """Crop a tifxyz in place to the bounding box of its valid cells (x != -1).
+
+    x/y/z.tif and every sibling .tif channel whose size is an integer multiple
+    of the grid are cropped in lockstep (other channels are left as they are);
+    meta.json keeps its identity and gets a recomputed bbox. Returns the
+    (old_hw, new_hw) grid shapes, or None when there is nothing to keep.
+    """
+    axes = {a: np.array(Image.open(os.path.join(tifxyz_path, f'{a}.tif')), dtype=np.float32)
+            for a in 'xyz'}
+    valid = axes['x'] != -1
+    if not valid.any():
+        return None
+    rows = np.flatnonzero(valid.any(axis=1))
+    cols = np.flatnonzero(valid.any(axis=0))
+    r0, r1, c0, c1 = rows[0], rows[-1] + 1, cols[0], cols[-1] + 1
+    h, w = valid.shape
+    if (r0, r1, c0, c1) == (0, h, 0, w):
+        return (h, w), (h, w)
+
+    for name in sorted(os.listdir(tifxyz_path)):
+        stem, ext = os.path.splitext(name)
+        if ext != '.tif':
+            continue
+        path = os.path.join(tifxyz_path, name)
+        data = axes[stem] if stem in axes else np.array(Image.open(path))
+        ch, cw = data.shape[:2]
+        if ch % h or cw % w:
+            print(f'{name}: {cw}x{ch} is not a multiple of the {w}x{h} grid, left untrimmed')
+            continue
+        sy, sx = ch // h, cw // w
+        Image.fromarray(np.ascontiguousarray(data[r0 * sy:r1 * sy, c0 * sx:c1 * sx])).save(path)
+
+    meta_path = os.path.join(tifxyz_path, 'meta.json')
+    with open(meta_path) as f:
+        meta = json.load(f)
+    xyz = np.stack([axes[a][r0:r1, c0:c1] for a in 'xyz'], axis=-1)[valid[r0:r1, c0:c1]]
+    meta['bbox'] = [xyz.min(axis=0).tolist(), xyz.max(axis=0).tolist()]
+    with open(meta_path, 'w') as f:
+        json.dump(meta, f, indent=4)
+    return (h, w), (int(r1 - r0), int(c1 - c0))
+
+
+def max_composite(tif_paths):
+    composite = None
+    for tif_path in tif_paths:
+        layer = np.asarray(Image.open(tif_path))
+        if composite is None:
+            composite = layer
+        else:
+            composite = np.maximum(composite, layer)
+    return composite
+
+
+def strip_jpg_paths(collect_dir, name):
+    """Return the primary image and numbered tiles currently belonging to a strip."""
+    tile_prefix = f'{name}.'
+    paths = []
+    for entry in os.scandir(collect_dir):
+        if not entry.is_file():
+            continue
+        filename = entry.name
+        if filename == f'{name}.jpg':
+            paths.append(entry.path)
+            continue
+        tile_index = (
+            filename[len(tile_prefix):-4]
+            if filename.startswith(tile_prefix) and filename.endswith('.jpg')
+            else ''
+        )
+        if tile_index.isdigit():
+            paths.append(entry.path)
+    return paths
+
+
+def remove_strip_jpgs(collect_dir, name):
+    for path in strip_jpg_paths(collect_dir, name):
+        os.remove(path)
+
+
+def write_strip_jpgs(strip8, name, collect_dir, max_strip_width):
+    """Stage all JPEG tiles before replacing this strip's previous outputs."""
+    width = strip8.shape[1]
+    with tempfile.TemporaryDirectory(prefix='.render-', dir=collect_dir) as staging_dir:
+        if width <= max_strip_width:
+            staged = os.path.join(staging_dir, f'{name}.jpg')
+            Image.fromarray(strip8).save(staged, quality=95)
+        else:
+            n_tiles = (width + max_strip_width - 1) // max_strip_width
+            for tile_idx in range(n_tiles):
+                x0 = tile_idx * max_strip_width
+                x1 = min(width, x0 + max_strip_width)
+                staged = os.path.join(staging_dir, f'{name}.{tile_idx:03d}.jpg')
+                Image.fromarray(strip8[:, x0:x1]).save(staged, quality=95)
+
+        # Don't discard a previous usable render until every replacement image is ready.
+        remove_strip_jpgs(collect_dir, name)
+        for filename in sorted(os.listdir(staging_dir)):
+            os.replace(
+                os.path.join(staging_dir, filename),
+                os.path.join(collect_dir, filename),
+            )
+    return width
+
+
+def publish_render_tifs(per_mesh_ink, tif_paths):
+    """Replace cached slice TIFFs only after vc_render_tifxyz completed successfully."""
+    for filename in os.listdir(per_mesh_ink):
+        if filename.lower().endswith('.tif'):
+            path = os.path.join(per_mesh_ink, filename)
+            if os.path.isfile(path):
+                os.remove(path)
+    for tif_path in tif_paths:
+        shutil.move(tif_path, os.path.join(per_mesh_ink, os.path.basename(tif_path)))
+
+
+@click.command(help=__doc__)
+@click.argument('meshes_dir', type=click.Path(exists=True, file_okay=False))
+@click.option('--volume', required=True, help='Ink volume zarr path, or a remote OME-Zarr URL that vc_render_tifxyz streams')
+@click.option('--remote-url', default='', help='[DEPRECATED] Passed through to vc_render_tifxyz as --remote-url; pass the remote OME-Zarr URL as --volume instead')
+@click.option('--vc-render-bin', default='vc_render_tifxyz', show_default=True, help='Path to the vc_render_tifxyz binary')
+@click.option('--scale', type=float, default=0.25, show_default=True)
+@click.option('--scale-segmentation', type=float, default=1.0, show_default=True, help='Passed through to vc_render_tifxyz as --scale-segmentation: multiply mesh coordinates by this factor before sampling, for meshes traced in a different-resolution frame than --volume (e.g. 4 for a mesh in a 4x downsampled frame)')
+@click.option('--group-idx', type=int, default=1, show_default=True)
+@click.option('--num-slices', type=int, default=5, show_default=True)
+@click.option('--num-processes', '-j', type=int, default=1, show_default=True, help='Number of meshes to render (and flatten) concurrently')
+@click.option('--flatten/--no-flatten', default=True, show_default=True, help='SLIM-flatten each concatenated mesh before rendering')
+@click.option('--flatboi-bin', default='flatboi', show_default=True, help='Path to the flatboi binary')
+@click.option('--flatten-keep', type=float, default=6.25, show_default=True, help='Percent of points to keep when decimating the mesh flatboi flattens; <100 decimates (smaller mesh is less prone to SLIM divergence). Quantized to a per-axis stride, so kept fraction ~= 1/round(1/sqrt(keep/100))^2 (e.g. any keep<100 => stride>=2 => <=25%)')
+@click.option('--flatten-iters', type=int, default=50, show_default=True, help='flatboi SLIM iterations')
+@click.option('--flatten-energy', default='symmetric_dirichlet', show_default=True, help='flatboi energy (symmetric_dirichlet or conformal)')
+@click.option('--flatten-tol', type=float, default=0.0, show_default=True, help='flatboi relative-energy early-stop tolerance (0 disables)')
+@click.option('--flatten-inpaint/--no-flatten-inpaint', default=False, show_default=True, help='Inpaint invalid cells before flatboi flattens. OFF by default (2026-07-18): inpainted cells render as real surface and inflate ink area; the erode+largest-component cleanup below is the SLIM-safety mechanism instead')
+@click.option('--pre-erode', type=int, default=3, show_default=True, help='Erode each per-strip (--strips) concat valid mask by this many grid cells before flatboi flattening (0 disables). Not applied to the full-scroll lasagna concat')
+@click.option('--keep-largest/--no-keep-largest', default=True, show_default=True, help='Keep only the largest 4-connected valid component of each per-strip (--strips) concat before flatboi flattening (removes dust/fragments). Not applied to the full-scroll lasagna concat')
+@click.option('--flatboi-threads', type=int, default=32, show_default=True, help='Shared value for PASTIX_NUM_THREADS and OPENBLAS_NUM_THREADS passed to flatboi')
+@click.option('--openblas-coretype', default='Haswell', show_default=True, help='Value for OPENBLAS_CORETYPE passed to flatboi')
+@click.option('--strips/--no-strips', default=False, show_default=True, help='Build the per-winding-range strip concats (concat/wLLL-HHH), flatboi-flatten them (per --flatten), and ink-render them. Off by default: only the full-scroll concat is rendered')
+@click.option('--full-scroll/--no-full-scroll', default=True, show_default=True, help='Concatenate ALL windings into one full-scroll mesh, flatten it with the lasagna forward flattener (not flatboi), and ink-render it')
+@click.option('--max-strip-width', type=int, default=16384, show_default=True, help='Max width (px) of each saved ink jpg. Strips wider than this are chopped into <name>.NNN.jpg tiles of this width (no downsampling); narrower strips stay a single <name>.jpg')
+@click.option('--full-scroll-trim/--no-full-scroll-trim', default=True, show_default=True, help='After the lasagna flatten, trim the flattened tifxyz to its valid-cell bounding box (removes the flatten output-margin border that renders as black bands)')
+@click.option('--fail-on-empty/--no-fail-on-empty', default=True, show_default=True, help='Fail (exit 1) if any rendered strip is entirely zero, which almost always means the mesh does not intersect --volume (wrong frame/resolution; see --scale-segmentation, --scale, --group-idx). --no-fail-on-empty restores writing the black strip with a warning')
+@click.option('--lasagna-dir', default='', help='Path to the lasagna repo dir (holds fit.py). Default: <this script>/../lasagna')
+@click.option('--lasagna-config', default='', help='Base lasagna flatten config json. Default: <lasagna-dir>/configs/flatten_fast_nofilter.json')
+@click.option('--lasagna-fit-script', default='', help='Lasagna fit entrypoint run for the full-scroll flatten. Default: _run_flatten_threaded.py if present, else fit.py')
+@click.option('--lasagna-device', default='cuda', show_default=True, help='--device passed to the lasagna flattener for the full-scroll flatten')
+def main(meshes_dir, volume, remote_url, vc_render_bin, scale, scale_segmentation, group_idx, num_slices, num_processes,
+         flatten, flatboi_bin, flatten_keep,
+         flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, pre_erode,
+         keep_largest, flatboi_threads,
+         openblas_coretype, strips, full_scroll, max_strip_width, full_scroll_trim,
+         fail_on_empty, lasagna_dir, lasagna_config, lasagna_fit_script, lasagna_device):
+    meshes = sorted(
+        (winding_idx(name), name)
+        for name in os.listdir(meshes_dir)
+        if '_spliced' in name
+        and winding_idx(name) is not None
+        and is_tifxyz(os.path.join(meshes_dir, name))
+    )
+    if not meshes:
+        raise click.ClickException(f'No _spliced tifxyz meshes found in {meshes_dir}')
+
+    collect_dir = os.path.join(meshes_dir, 'ink')
+    os.makedirs(collect_dir, exist_ok=True)
+
+    concat_dir = os.path.join(meshes_dir, 'concat')
+    os.makedirs(concat_dir, exist_ok=True)
+    step_size, voxel_size_um = read_step_and_voxel(
+        os.path.join(meshes_dir, meshes[0][1], 'meta.json')
+    )
+
+    print(f'Found {len(meshes)} _spliced mesh(es) in {meshes_dir}')
+
+    # Group the meshes into winding-range chunks by their fixed schedule bin, counted
+    # from the first winding present, so the tiling is reproducible run-to-run. Skipped
+    # unless --strips: by default only the full-scroll concat below is rendered.
+    chunks = []  # (name, concat_mesh_path)
+    if strips:
+        base = min(widx for widx, _ in meshes)
+        bins = {}  # image_bin -> [(winding_idx, name)]
+        for widx, name in meshes:
+            bins.setdefault(image_bin(widx, base), []).append((widx, name))
+
+        # Concatenate the _spliced meshes in each chunk into a single tifxyz mesh covering
+        # that winding range, written to concat/ and named after the range.
+        for bin_idx in sorted(bins):
+            chunk = sorted(bins[bin_idx], key=lambda wc: wc[0])
+            lo, hi = chunk[0][0], chunk[-1][0]
+            name = f'w{lo:03d}-{hi:03d}'
+            mesh_paths = [os.path.join(meshes_dir, nm) for _, nm in chunk]
+            concat_zyxs, layout = concat_meshes(mesh_paths)
+            # Clean the per-strip concat before it is flatboi-flattened: erode ragged
+            # edges and drop dust/fragments that make SLIM diverge. Strips only — the
+            # full-scroll concat below goes to the lasagna flattener, which handles
+            # holes/ragged edges itself, so it is left uncleaned.
+            if pre_erode > 0 or keep_largest:
+                removed = clean_concat_zyxs(concat_zyxs, pre_erode, keep_largest)
+                if removed < 0:
+                    print(f'{name}: WARNING cleanup would remove every valid cell; '
+                          f'left uncleaned')
+                elif removed:
+                    print(f'{name}: cleanup removed {removed} cells '
+                          f'(erode {pre_erode}, largest component)')
+            save_tifxyz(
+                concat_zyxs,
+                concat_dir,
+                uuid=name,
+                step_size=step_size,
+                voxel_size_um=voxel_size_um,
+                source=f'render_ink concat {os.path.basename(meshes_dir.rstrip("/"))}',
+                layout_metadata=layout,
+            )
+            concat_path = os.path.join(concat_dir, name)
+            chunks.append((name, concat_path))
+            print(f'wrote {concat_path} '
+                  f'({len(chunk)} windings, {concat_zyxs.shape[1]}px wide tifxyz mesh)')
+
+    # Optionally SLIM-flatten each strip concat (concurrently) and render the flattened
+    # mesh instead. A chunk whose flattening fails falls back to rendering its unflattened
+    # concat so the run still completes. Only relevant when --strips built chunks.
+    if flatten and chunks:
+        flatboi_env = {}
+        if flatboi_threads is not None:
+            flatboi_env['PASTIX_NUM_THREADS'] = str(flatboi_threads)
+            flatboi_env['OPENBLAS_NUM_THREADS'] = str(flatboi_threads)
+        if openblas_coretype:
+            flatboi_env['OPENBLAS_CORETYPE'] = openblas_coretype
+
+        def flatten_one(name, concat_path):
+            return name, flatten_mesh(
+                concat_path, flatboi_bin,
+                flatten_iters, flatten_energy, flatten_tol, flatten_inpaint, flatten_keep,
+                flatboi_env,
+            )
+
+        print(f'Flattening {len(chunks)} mesh(es) with flatboi (iters={flatten_iters}, '
+              f'energy={flatten_energy}, j={num_processes})')
+        cp_by_name = dict(chunks)
+        flattened = {}
+        with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
+            futures = {pool.submit(flatten_one, name, cp): name for name, cp in chunks}
+            for n, future in enumerate(as_completed(futures)):
+                name = futures[future]
+                try:
+                    _, flat_path = future.result()
+                    flattened[name] = flat_path
+                    print(f'[{n + 1}/{len(chunks)}] flattened {name} -> {flat_path}')
+                except subprocess.CalledProcessError as e:
+                    print(f'[{n + 1}/{len(chunks)}] {name}: WARNING flatten failed '
+                          f'({e.cmd[0]} exit {e.returncode}), rendering unflattened concat')
+                    if e.stderr:
+                        print(e.stderr.strip())
+        # Swap in flattened paths where available; keep concat for any that failed.
+        chunks = [(name, flattened.get(name, cp_by_name[name])) for name, _ in chunks]
+
+    # Optionally build a single full-scroll concat over ALL windings and flatten it with
+    # the lasagna forward flattener (a large mesh that flatboi does not handle well), then
+    # render it alongside the per-chunk strips. Runs serially (one big GPU job) before the
+    # render pool. If the flatten fails, the full-scroll render is skipped (not rendered
+    # unflattened).
+    full_items = []  # (name, mesh_path) rendered in addition to `chunks`
+    if full_scroll:
+        l_dir = os.path.abspath(lasagna_dir) if lasagna_dir else default_lasagna_dir()
+        l_cfg = lasagna_config or os.path.join(l_dir, 'configs', 'flatten_fast_nofilter.json')
+        if lasagna_fit_script:
+            l_fit = lasagna_fit_script
+        else:
+            threaded = os.path.join(l_dir, '_run_flatten_threaded.py')
+            l_fit = threaded if os.path.exists(threaded) else os.path.join(l_dir, 'fit.py')
+
+        full_name, full_concat, width = build_full_concat(
+            meshes_dir, meshes, concat_dir, step_size, voxel_size_um)
+        print(f'wrote {full_concat} full-scroll concat '
+              f'({len(meshes)} windings, {width}px wide tifxyz mesh)')
+        print(f'Lasagna-flattening full-scroll concat via {l_fit} (config {l_cfg})')
+        flat_name = full_name + '_flat'
+        flat_dest = os.path.join(concat_dir, flat_name)
+        try:
+            flat_path = lasagna_flatten(full_concat, flat_dest, l_dir, l_cfg, l_fit, lasagna_device)
+            print(f'lasagna-flattened {full_name} -> {flat_path}')
+        except subprocess.CalledProcessError as e:
+            print(f'{full_name}: WARNING lasagna flatten failed ({e.cmd[0]} exit '
+                  f'{e.returncode}), skipping full-scroll render')
+            flat_path = None
+        if flat_path is not None:
+            # The flatten pads its output with an invalid-cell margin that renders as black
+            # bands; trim the flattened tifxyz to its valid-cell bbox in place.
+            if full_scroll_trim:
+                shapes = trim_tifxyz_to_valid(flat_path)
+                if shapes is None:
+                    print(f'{flat_name}: WARNING no valid cells, rendering untrimmed')
+                else:
+                    print(f'trimmed {flat_name} to valid bbox {shapes[0]} -> {shapes[1]}')
+            full_items.append((flat_name, flat_path))
+
+    render_items = chunks + full_items
+
+    # Render ink from each (flattened, if enabled) mesh and max-composite it into a strip jpg.
+    def render(name, concat_path):
+        per_mesh_ink = os.path.join(concat_path, 'ink')
+        os.makedirs(per_mesh_ink, exist_ok=True)
+        # Render to a private staging directory. If vc_render_tifxyz fails, retain the
+        # previous TIFFs/JPGs; a successful empty render replaces the old TIFFs below,
+        # so stale nonzero slices cannot make the max-composite look valid.
+        with tempfile.TemporaryDirectory(prefix='.render-', dir=per_mesh_ink) as staging_dir:
+            render_cmd = [
+                vc_render_bin,
+                '--segmentation', concat_path,
+                '--scale', str(scale),
+                '--group-idx', str(group_idx),
+                '--volume', volume,
+                '--tif-output', staging_dir,
+                '--num-slices', str(num_slices),
+            ]
+            if scale_segmentation != 1.0:
+                render_cmd += ['--scale-segmentation', str(scale_segmentation)]
+            if remote_url:
+                render_cmd += ['--remote-url', remote_url]
+            subprocess.run(render_cmd, check=True)
+            tif_paths = sorted(glob.glob(os.path.join(staging_dir, '*.tif')))
+            comp = max_composite(tif_paths) if tif_paths else None
+            publish_render_tifs(per_mesh_ink, tif_paths)
+        return comp
+
+    rendered_strips = 0
+    empty_strips = []
+    with ThreadPoolExecutor(max_workers=max(1, num_processes)) as pool:
+        futures = {pool.submit(render, name, cp): name for name, cp in render_items}
+        for n, future in enumerate(as_completed(futures)):
+            name = futures[future]
+            comp = future.result()
+            if comp is None:
+                remove_strip_jpgs(collect_dir, name)
+                print(f'[{n + 1}/{len(render_items)}] {name}: WARNING no tifs produced, skipping')
+                continue
+            empty = not np.any(comp)
+            if empty:
+                severity = 'ERROR' if fail_on_empty else 'WARNING'
+                print(f'[{n + 1}/{len(render_items)}] {name}: {severity} rendered strip is entirely zero '
+                      f'({comp.shape[1]}px wide): the mesh does not appear to intersect {volume}. '
+                      'Check the mesh/volume frames (--scale-segmentation, --scale, --group-idx)')
+                empty_strips.append(name)
+                if fail_on_empty:
+                    # This render completed, so any prior image no longer represents its
+                    # current output. Remove it rather than leave a stale success artifact.
+                    remove_strip_jpgs(collect_dir, name)
+                    continue
+            strip = comp.astype(np.float32)
+            p95 = np.percentile(strip, 95)
+            strip = np.clip(strip / p95, 0, 1) * 255 if p95 > 0 else strip
+            strip8 = strip.astype(np.uint8)
+            # Stage all JPGs before replacing old outputs. This keeps the last usable
+            # strip if image encoding fails midway through writing a tiled result.
+            width = write_strip_jpgs(strip8, name, collect_dir, max_strip_width)
+            if width <= max_strip_width:
+                out_path = os.path.join(collect_dir, f'{name}.jpg')
+                print(f'[{n + 1}/{len(render_items)}] wrote {out_path} '
+                      f'({width}px wide, p95={p95:.1f})')
+            else:
+                n_tiles = (width + max_strip_width - 1) // max_strip_width
+                print(f'[{n + 1}/{len(render_items)}] wrote {n_tiles} tiles '
+                      f'{name}.000-{n_tiles - 1:03d}.jpg ({width}px wide total, '
+                      f'p95={p95:.1f})')
+            rendered_strips += 1
+
+    if empty_strips and fail_on_empty:
+        raise click.ClickException(
+            f'{len(empty_strips)} of {len(render_items)} ink strip(s) rendered entirely zero: '
+            f'{", ".join(sorted(empty_strips))}. The mesh does not appear to intersect {volume}; '
+            'check the mesh/volume frames (--scale-segmentation, --scale, --group-idx) or '
+            'pass --no-fail-on-empty to keep black strips')
+
+    if rendered_strips == 0:
+        raise click.ClickException(
+            f'render produced no ink strip images in {collect_dir}')
+
+    print(f'Done. Strips in {collect_dir}')
+
+
+if __name__ == '__main__':
+    main()

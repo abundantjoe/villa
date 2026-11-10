@@ -22,14 +22,17 @@ class AxisAlignedSliceController : public QObject
 public:
     explicit AxisAlignedSliceController(CState* state, QObject* parent = nullptr);
 
-    void setViewerManager(ViewerManager* mgr) { _viewerManager = mgr; }
+    void setViewerManager(ViewerManager* mgr);
     void setPlaneSlicingOverlay(PlaneSlicingOverlayController* overlay) { _planeSlicingOverlay = overlay; }
 
     bool isEnabled() const { return _enabled; }
 
     // Called when user toggles the checkbox
-    // overlayCheckbox and overlayOpacitySpin are passed for UI state management
-    void setEnabled(bool enabled, QCheckBox* overlayCheckbox = nullptr, QSpinBox* overlayOpacitySpin = nullptr);
+    // overlayCheckbox and overlayOpacitySpin are passed for UI state management.
+    // persistSetting=false applies the mode without writing the global setting
+    // (for workspaces that force a mode rather than reflect the user's choice).
+    void setEnabled(bool enabled, QCheckBox* overlayCheckbox = nullptr, QSpinBox* overlayOpacitySpin = nullptr,
+                    bool persistSetting = true);
 
     void resetRotations();
     void resetTilt();
@@ -56,6 +59,22 @@ public:
     float currentRotationDegrees(const std::string& surfaceName) const;
     void setRotationDegrees(const std::string& surfaceName, float degrees);
 
+    // Volumetric-camera azimuth for a slice plane, read from the owning
+    // viewer's per-view camera (0 when that viewer's volumetric mode is
+    // inactive). applyOrientation folds it into the plane's in-plane
+    // rotation, so the volumetric compositor only applies the tilt and every
+    // plane-derived overlay/interaction sees the rotated view.
+    float volumetricAzimuthDeg(const std::string& surfaceName) const;
+    // Reconfigure the slice planes iff some view's volumetric azimuth differs
+    // from what applyOrientation last folded in. Cheap no-op otherwise, so
+    // it can hang off every per-view camera change.
+    void syncVolumetricAzimuths();
+    // Rotation-about-normal term that spins the plane's basis by azimuthDeg
+    // in *screen* space (vx -> cos·vx − sin·vy), correcting for the basis
+    // handedness so azimuth turns the same way on every plane — matching the
+    // spin the volumetric compositor applies when it handles azimuth itself.
+    static float azimuthInPlaneRotation(class PlaneSurface& plane, float azimuthDeg);
+
     static float normalizeDegrees(float degrees);
 
 private:
@@ -79,9 +98,12 @@ private:
 
     QTimer* _rotationTimer{nullptr};
     bool _orientationDirty{false};
-    double _pendingOrientationMotionPx{0.0};
+    // Azimuth last folded into each plane by applyOrientation, keyed by
+    // surface name; lets syncVolumetricAzimuths skip no-op reconfigures.
+    std::unordered_map<std::string, float> _appliedVolumetricAzimuthDeg;
 
     void processOrientationUpdate();
-    void notifyInteractiveOrientationViewers(double motionPx);
+    void notifyInteractiveOrientationViewers();
     void updateTiltHandles();
+    void attachViewer(VolumeViewerBase* baseViewer);
 };

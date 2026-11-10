@@ -6,12 +6,16 @@
 #include <QPointer>
 
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
+
+#include "vc/core/util/Compositing.hpp"
 
 class ViewerManager;
 class VolumePkg;
 class Volume;
+class QCheckBox;
 class QComboBox;
 class QSpinBox;
 class QString;
@@ -24,16 +28,61 @@ public:
     struct UiRefs {
         QPointer<QComboBox> volumeSelect;
         QPointer<QComboBox> colormapSelect;
+        QPointer<QComboBox> samplingMethodSelect;
         QPointer<QSpinBox> opacitySpin;
-        QPointer<QSpinBox> thresholdSpin;
+        QPointer<QCheckBox> intensityAsAlphaCheck;
+        QPointer<QSpinBox> maxDisplayedResolutionSpin;
+        QPointer<QCheckBox> compositeEnabledCheck;
+        QPointer<QComboBox> compositeMethodSelect;
+        QPointer<QSpinBox> compositeLayersFrontSpin;
+        QPointer<QSpinBox> compositeLayersBehindSpin;
+    };
+
+    struct Window {
+        float low{0.0f};
+        float high{255.0f};
+    };
+
+    struct State {
+        std::string currentVolumeId;
+        std::string volumeId;
+        std::string colormap;
+        float opacity{0.5f};
+        Window window;
+        bool intensityAsAlpha{false};
+        int maxDisplayedResolution{0};
+        OverlayCompositeSettings composite;
+    };
+
+    struct Update {
+        // A present empty id clears the selection; nullopt leaves it unchanged.
+        std::optional<std::string> volumeId;
+        std::optional<std::string> colormap;
+        std::optional<float> opacity;
+        std::optional<Window> window;
+        std::optional<bool> intensityAsAlpha;
+        std::optional<int> maxDisplayedResolution;
+        std::optional<OverlayCompositeSettings> composite;
+    };
+
+    enum class ApplyResult {
+        Applied,
+        NoVolumePackage,
+        UnknownVolume,
     };
 
     explicit VolumeOverlayController(ViewerManager* manager, QObject* parent = nullptr);
 
+    State state() const;
+    ApplyResult apply(const Update& update);
+    void setViewerManagers(const std::vector<ViewerManager*>& managers);
     void setUi(const UiRefs& ui);
     void setVolumePkg(const std::shared_ptr<VolumePkg>& pkg, const QString& path);
     void clearVolumePkg();
     void refreshVolumeOptions();
+    void refreshForCurrentVolume();
+    void beginBaseVolumeUpdate();
+    void endBaseVolumeUpdate();
     void toggleVisibility();
     bool hasOverlaySelection() const;
     void syncWindowFromManager(float low, float high);
@@ -49,17 +98,31 @@ private:
     void updateUiEnabled();
     void loadState();
     void saveState() const;
+    void setVolumeId(const std::string& id);
     void setColormap(const std::string& id);
+    void setSamplingMethod(int method);
     void setOpacity(float value);
-    void setThreshold(float value);
     void setWindowBounds(float low, float high);
+    void setIntensityAsAlpha(bool enabled);
+    void setMaxDisplayedResolution(int value);
+    void setComposite(const OverlayCompositeSettings& settings);
+    OverlayCompositeSettings currentCompositeSettings() const;
+    void syncCompositeUi();
+    void pushCompositeToManager();
 
     void handleVolumeComboChanged(int index);
     void handleColormapChanged(int index);
+    void handleSamplingMethodChanged(int index);
     void handleOpacityChanged(int value);
-    void handleThresholdChanged(int value);
+    void handleIntensityAsAlphaChanged(bool enabled);
+    void handleMaxDisplayedResolutionChanged(int value);
+    void handleCompositeEnabledChanged(bool enabled);
+    void handleCompositeMethodChanged(int index);
+    void handleCompositeLayersFrontChanged(int value);
+    void handleCompositeLayersBehindChanged(int value);
 
-    ViewerManager* _viewerManager{nullptr};
+    ViewerManager* primaryViewerManager() const;
+    std::vector<ViewerManager*> _viewerManagers;
     UiRefs _ui;
     std::shared_ptr<VolumePkg> _volumePkg;
     QString _volpkgPath;
@@ -68,12 +131,22 @@ private:
     std::string _overlayVolumeId;
     std::string _overlayVolumeIdBeforeToggle;
     std::string _overlayColormapName;
+    int _overlaySamplingMethod{0};
     float _overlayOpacity{0.5f};
     float _overlayOpacityBeforeToggle{0.5f};
     float _overlayWindowLow{0.0f};
     float _overlayWindowHigh{255.0f};
+    bool _overlayIntensityAsAlpha{false};
+    int _overlayMaxDisplayedResolution{0};
+    bool _compositeEnabled{false};
+    std::string _compositeMethod{"max"};
+    int _compositeLayersFront{8};
+    int _compositeLayersBehind{0};
     bool _overlayVisible{false};
 
+    std::vector<QMetaObject::Connection> _managerConnections;
     std::vector<QMetaObject::Connection> _connections;
     bool _suspendPersistence{false};
+    bool _broadcastingWindow{false};
+    bool _baseVolumeUpdateInProgress{false};
 };

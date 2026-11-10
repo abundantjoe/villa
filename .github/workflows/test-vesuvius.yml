@@ -4,6 +4,11 @@ on:
   pull_request:
     paths:
       - 'vesuvius/**'
+      - 'lasagna/**'
+      # Local source dependencies installed by uv sync --extra all.
+      - 'volume-cartographer/**'
+      - 'vc_object_store/**'
+      - 'vc_reader/**'
       - '.github/workflows/test-vesuvius.yml'
 
 jobs:
@@ -14,7 +19,8 @@ jobs:
             # Limit the test matrix to ubuntu-latest for now, as other platforms may not
             # support all dependencies yet.  Extend this list once the build scripts
             # for macOS and Windows are confirmed.
-            os: [ubuntu-latest]
+            os: [blacksmith-4vcpu-ubuntu-2404]
+            zarr: ['2.18.7', '3.2.1']
     defaults:
       run:
         shell: bash
@@ -24,19 +30,65 @@ jobs:
       - name: Checkout code
         uses: actions/checkout@v4
 
-      - name: Ensure curl available on Linux
+      - name: Install native build dependencies on Linux
         if: runner.os == 'Linux'
         run: |
           sudo apt-get update
-          sudo apt-get install -y curl
+          # Native dependency closure for the Python-only scikit-build
+          # configurations of volume-cartographer (apps, UI tracer, flatboi,
+          # tests: OFF) and vc_object_store (tools: OFF).
+          # qt6-base-dev: utils links Qt6::Core (SFTP remote access, #1941).
+          sudo apt-get install -y --no-install-recommends \
+            build-essential \
+            curl \
+            git \
+            libblosc-dev \
+            libboost-dev \
+            libceres-dev \
+            libcurl4-openssl-dev \
+            libeigen3-dev \
+            liblz4-dev \
+            libopencv-contrib-dev \
+            libopencv-dev \
+            libsuitesparse-dev \
+            libjpeg-dev \
+            libpng-dev \
+            libtiff-dev \
+            libzstd-dev \
+            ninja-build \
+            nlohmann-json3-dev \
+            pkg-config \
+            qt6-base-dev \
+            zlib1g-dev
 
-      - name: Install uv
-        run: |
-          curl -LsSf https://astral.sh/uv/install.sh | sh
-          echo "$HOME/.local/bin" >> "$GITHUB_PATH"
+      - name: Install uv and restore dependency cache
+        uses: astral-sh/setup-uv@v10.3.3
+        with:
+          enable-cache: true
+          # Preserve downloaded wheels as well as built wheels; the ML stack
+          # is expensive to download again. Never cache the virtualenv itself.
+          prune-cache: false
+          cache-suffix: vesuvius-zarr-${{ matrix.zarr }}
+          # Include transitive reader sources: volume-cartographer's own uv
+          # wheel cache keys do not currently cover this sibling dependency.
+          cache-dependency-glob: |
+            .github/workflows/test-vesuvius.yml
+            vesuvius/uv.lock
+            vesuvius/pyproject.toml
+            volume-cartographer/pyproject.toml
+            vc_object_store/pyproject.toml
+            vc_reader/**
+            gpu_manager/pyproject.toml
+            segmentation/models/batchgeneratorsv2/pyproject.toml
+            segmentation/models/arch/nnunet/pyproject.toml
 
       - name: Sync dependencies
         run: uv sync --extra all
 
+      - name: Select Zarr version
+        run: uv pip install "zarr==${{ matrix.zarr }}"
+
       - name: Run tests
-        run: uv run pytest tests
+        env:
+          PYTHONPATH: ${{ github.workspace }}
+        run: uv run --no-sync pytest tests -m "not slow and not network"

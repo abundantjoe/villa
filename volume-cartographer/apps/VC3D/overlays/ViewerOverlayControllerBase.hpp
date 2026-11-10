@@ -8,6 +8,8 @@
 #include <QColor>
 #include <QFont>
 #include <QImage>
+#include <QPainterPath>
+#include <QPixmap>
 #include <QPointF>
 #include <QRectF>
 #include <QString>
@@ -15,11 +17,16 @@
 
 #include <opencv2/core/mat.hpp>
 
+#include "../volume_viewers/SurfaceProjection.hpp"
+#include "vc/core/types/FiberView.hpp"
+
 #include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <limits>
 #include <optional>
 #include <string>
+#include <unordered_map>
 #include <variant>
 #include <vector>
 
@@ -28,7 +35,6 @@ class ViewerManager;
 class QGraphicsItem;
 class QGraphicsScene;
 class Surface;
-class QPainterPath;
 
 class ViewerOverlayControllerBase : public QObject
 {
@@ -71,15 +77,6 @@ public:
         OverlayStyle style{};
     };
 
-    struct RotatedEllipsePrimitive {
-        QPointF center;
-        qreal radiusX{3.0};
-        qreal radiusY{2.0};
-        qreal rotationRadians{0.0};
-        bool filled{true};
-        OverlayStyle style{};
-    };
-
     struct LineStripPrimitive {
         std::vector<QPointF> points;
         bool closed{false};
@@ -95,6 +92,11 @@ public:
     struct RectPrimitive {
         QRectF rect;
         bool filled{true};
+        OverlayStyle style{};
+    };
+
+    struct PainterPathPrimitive {
+        QPainterPath path;
         OverlayStyle style{};
     };
 
@@ -122,7 +124,6 @@ public:
         qreal lineWidth{3.0};
         qreal opacity{1.0};
         bool isEraser{false};
-        int pathId{0};
         PathBrushShape brushShape{PathBrushShape::Circle};
         PathRenderMode renderMode{PathRenderMode::LineStrip};
         qreal pointRadius{3.0};
@@ -145,6 +146,13 @@ public:
 
     struct ImagePrimitive {
         QImage image;
+        // Optional pre-converted form of `image`. Converting a preview-sized
+        // image costs milliseconds and the overlay is rebuilt on every
+        // pan/zoom tick, while the source changes only when it is
+        // republished -- so a publisher that holds the image can convert once
+        // and pass the result here. When null the image is converted per
+        // rebuild, which is what every caller used to do.
+        QPixmap pixmap;
         QPointF offset{0.0, 0.0};  // Scene-space offset (like setOffset)
         QTransform transform{};
         qreal opacity{1.0};
@@ -155,10 +163,10 @@ public:
                                           VolumePointPrimitive,
                                           SurfacePointPrimitive,
                                           CirclePrimitive,
-                                          RotatedEllipsePrimitive,
                                           LineStripPrimitive,
                                           SurfaceLineStripPrimitive,
                                           RectPrimitive,
+                                          PainterPathPrimitive,
                                           TextPrimitive,
                                           PathPrimitive,
                                           ArrowPrimitive,
@@ -181,10 +189,47 @@ public:
         std::function<bool(const QPointF&, size_t)> scenePredicate;
     };
 
+    // Point-collection-style rendering of an ordered chain of volume points:
+    // white-bordered dots connected by polylines that only ever join
+    // consecutive chain points, fading out with distance to the viewer's
+    // surface.
+    struct PointChainStyle {
+        QColor color{Qt::white};
+        QColor pointBorderColor{255, 255, 255, 200};
+        qreal pointRadius{5.0};
+        qreal pointPenWidth{1.5};
+        qreal lineWidth{5.0};
+        float lineOpacity{1.0f};
+        qreal pointZ{95.0};
+        qreal lineZ{94.0};
+        float distanceTolerance{std::numeric_limits<float>::infinity()};
+        // Break a polyline segment whose scene-space length exceeds this many
+        // multiples of its volume-space length times the viewer scale. Guards
+        // against projection discontinuities (invalid surface regions, wrap
+        // jumps) where volume-close points land far apart on screen. <= 0
+        // disables the guard.
+        float sceneJumpRatio{4.0f};
+        bool drawPoints{true};
+        bool drawLines{true};
+    };
+
+    // Inclusive volume-space AABB used to cheaply pre-cull points before any
+    // per-point surface-distance search runs.
+    struct VolumeBounds {
+        cv::Vec3f lo{0, 0, 0};
+        cv::Vec3f hi{0, 0, 0};
+        bool contains(const cv::Vec3f& point) const
+        {
+            return point[0] >= lo[0] && point[0] <= hi[0]
+                && point[1] >= lo[1] && point[1] <= hi[1]
+                && point[2] >= lo[2] && point[2] <= hi[2];
+        }
+    };
+
     explicit ViewerOverlayControllerBase(std::string overlayGroupKey, QObject* parent = nullptr);
     ~ViewerOverlayControllerBase() override;
 
-    void attachViewer(VolumeViewerBase* viewer);
+    void attachViewer(VolumeViewerBase* viewer, ViewerManager* manager = nullptr);
     virtual void detachViewer(VolumeViewerBase* viewer);
 
     void bindToViewerManager(ViewerManager* manager);
@@ -215,13 +260,6 @@ protected:
                        bool filled,
                        OverlayStyle style);
 
-        void addRotatedEllipse(const QPointF& center,
-                               qreal radiusX,
-                               qreal radiusY,
-                               qreal rotationRadians,
-                               bool filled,
-                               OverlayStyle style);
-
         void addLineStrip(const std::vector<QPointF>& points,
                           bool closed,
                           OverlayStyle style);
@@ -233,6 +271,9 @@ protected:
         void addRect(const QRectF& rect,
                      bool filled,
                      OverlayStyle style);
+
+        void addPainterPath(const QPainterPath& path,
+                            OverlayStyle style);
 
         void addText(const QPointF& position,
                      const QString& text,
@@ -261,6 +302,15 @@ protected:
                       qreal opacity,
                       qreal z);
 
+        // As above, but reusing a pixmap the caller already converted.
+        void addImage(const QImage& image,
+                      const QPixmap& pixmap,
+                      const QPointF& offset,
+                      qreal scaleX,
+                      qreal scaleY,
+                      qreal opacity,
+                      qreal z);
+
         void addImage(const QImage& image,
                       const QTransform& transform,
                       qreal opacity,
@@ -276,7 +326,13 @@ protected:
     };
 
     virtual bool isOverlayEnabledFor(VolumeViewerBase* viewer) const;
+    // Lets a controller skip the rebuild when its primitives would be unchanged.
+    virtual bool needsOverlayRebuild(VolumeViewerBase*) const { return true; }
     virtual void collectPrimitives(VolumeViewerBase* viewer, OverlayBuilder& builder) = 0;
+    FilteredPoints projectPointChainForHitTest(
+        VolumeViewerBase* viewer,
+        const std::vector<cv::Vec3f>& points,
+        float tolerance);
 
     QPointF volumeToScene(VolumeViewerBase* viewer, const cv::Vec3f& volumePoint) const;
     cv::Vec3f sceneToVolume(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
@@ -284,28 +340,183 @@ protected:
                                        const std::vector<cv::Vec3f>& volumePoints) const;
     QGraphicsScene* viewerScene(VolumeViewerBase* viewer) const;
     QRectF visibleSceneRect(VolumeViewerBase* viewer) const;
-    bool isScenePointVisible(VolumeViewerBase* viewer, const QPointF& scenePoint) const;
+    // The slab of half depth `halfDepth` around a plane viewer's visible
+    // rectangle (the region the store overlays query); nothing off a plane.
+    std::optional<vc::fibers::ViewRegion> planeViewRegion(VolumeViewerBase* viewer, double halfDepth) const;
     Surface* viewerSurface(VolumeViewerBase* viewer) const;
 
     FilteredPoints filterPoints(VolumeViewerBase* viewer,
                                 const std::vector<cv::Vec3f>& points,
                                 const PointFilterOptions& options) const;
 
-    void clearOverlay(VolumeViewerBase* viewer) const;
+    // Keeps points within `tolerance` of the viewer's plane or quad surface,
+    // fading opacity linearly with distance (binary at the surface when
+    // tolerance <= 0). `opacities`, when given, is filled aligned with the
+    // returned points. `bounds`, when given, rejects points outside the box
+    // before the (potentially expensive) surface-distance search.
+    FilteredPoints filterPointsNearViewerSurface(VolumeViewerBase* viewer,
+                                                 const std::vector<cv::Vec3f>& points,
+                                                 float tolerance,
+                                                 std::vector<float>* opacities = nullptr,
+                                                 const std::optional<VolumeBounds>& bounds = std::nullopt,
+                                                 bool requireSceneVisibility = true) const;
+
+    // Same result as filterPointsNearViewerSurface(viewer, points, tolerance,
+    // opacities) with its default requireSceneVisibility, but the per-point
+    // surface searches -- two nearest-point queries per point, one for the
+    // distance fade and one inside volumeToScene -- are cached and only the
+    // camera-dependent half re-runs. Overlays that rebuild on every pan/zoom
+    // tick should prefer this.
+    //
+    // `cacheKey` is any stable per-point-set identity (a collection id, say);
+    // it must not be reused for a different set on the same viewer.
+    // `contentRevision` must change whenever `points` changes, since the cache
+    // cannot see through the caller's storage to notice.
+    FilteredPoints filterPointsNearViewerSurfaceCached(VolumeViewerBase* viewer,
+                                                       std::uint64_t cacheKey,
+                                                       std::uint64_t contentRevision,
+                                                       const std::vector<cv::Vec3f>& points,
+                                                       float tolerance,
+                                                       std::vector<float>* opacities) const;
+
+    // Drops everything filterPointsNearViewerSurfaceCached() has retained.
+    void clearSurfacePointsCache();
+
+    // Longest volume-space distance two consecutive chain points may span and
+    // still be joined by a polyline: 4x the median inter-point distance, or
+    // infinity when the chain is too short to yield a robust median.
+    static float polylineBreakDistance(const std::vector<cv::Vec3f>& positions);
+
+    // Emits line strips joining consecutive filtered points, breaking the
+    // strip whenever a source point was filtered out in between, the
+    // volume-space gap exceeds maxSegmentDistance, or the scene-space gap
+    // exceeds maxScenePerVolume times the volume-space gap (a projection
+    // discontinuity).
+    static void addBrokenLineStrips(OverlayBuilder& builder,
+                                    const FilteredPoints& filtered,
+                                    float maxSegmentDistance,
+                                    const OverlayStyle& style,
+                                    qreal maxScenePerVolume = std::numeric_limits<qreal>::infinity());
+
+    // `outFiltered` / `outOpacities`, when given, receive the projection this
+    // call used, so a caller that needs to emit further primitives for the
+    // same chain (link markers, say) can reuse it instead of projecting twice.
+    void renderPointChain(VolumeViewerBase* viewer,
+                          OverlayBuilder& builder,
+                          const std::vector<cv::Vec3f>& points,
+                          const PointChainStyle& style,
+                          const std::optional<VolumeBounds>& bounds = std::nullopt,
+                          FilteredPoints* outFiltered = nullptr,
+                          std::vector<float>* outOpacities = nullptr) const;
+
+    // Invalidates the surface-coordinate projections retained by
+    // renderPointChain(). Controllers must call this whenever their source
+    // chain storage is replaced or mutated.
+    void clearPointChainProjectionCache() const;
+
+    // Projects a chain onto the viewer's surface with per-point opacity;
+    // cached — see clearPointChainProjectionCache(). `breakDistance`, when
+    // given, receives the chain's polylineBreakDistance() from the cache
+    // instead of recomputing its nth_element scan every rebuild.
+    FilteredPoints projectedPointChain(VolumeViewerBase* viewer,
+                                       const std::vector<cv::Vec3f>& points,
+                                       float tolerance,
+                                       std::vector<float>* opacities,
+                                       float* breakDistance = nullptr) const;
+
+    // The default implementation materializes primitives as QGraphicsItems.
+    // High-volume overlays may override this to retain their graphics items
+    // across refreshes while continuing to use the common primitive builder.
+    virtual void applyOverlayPrimitives(VolumeViewerBase* viewer,
+                                        std::vector<OverlayPrimitive> primitives);
+    virtual void clearOverlay(VolumeViewerBase* viewer) const;
 
     ViewerManager* manager() const { return _manager; }
+    ViewerManager* managerForViewer(VolumeViewerBase* viewer) const;
 
 private:
+    struct PointChainProjectionCacheKey {
+        VolumeViewerBase* viewer{nullptr};
+        const cv::Vec3f* pointsData{nullptr};
+        std::size_t pointCount{0};
+
+        friend bool operator==(const PointChainProjectionCacheKey& lhs,
+                               const PointChainProjectionCacheKey& rhs)
+        {
+            return lhs.viewer == rhs.viewer &&
+                   lhs.pointsData == rhs.pointsData &&
+                   lhs.pointCount == rhs.pointCount;
+        }
+    };
+
+    struct PointChainProjectionCacheKeyHash {
+        std::size_t operator()(const PointChainProjectionCacheKey& key) const;
+    };
+
+    struct PointChainProjectionCacheEntry {
+        Surface* surface{nullptr};
+        std::uint64_t surfaceGeneration{0};
+        float tolerance{0.0f};
+        float depthLo{0.0f};
+        float depthHi{0.0f};
+        cv::Vec3f planeOrigin{0.0f, 0.0f, 0.0f};
+        cv::Vec3f planeBasisX{0.0f, 0.0f, 0.0f};
+        cv::Vec3f planeBasisY{0.0f, 0.0f, 0.0f};
+        std::vector<cv::Vec3f> volumePoints;
+        std::vector<cv::Vec2f> surfacePoints;
+        std::vector<std::size_t> sourceIndices;
+        std::vector<float> opacities;
+        // polylineBreakDistance() over the source chain. A pure function of
+        // the chain's points, so it is computed once with the entry rather
+        // than re-run per rebuild.
+        float breakDistance{0.0f};
+    };
+
+    void clearPointChainProjectionCache(VolumeViewerBase* viewer);
+
+    struct SurfacePointsCacheKey {
+        VolumeViewerBase* viewer{nullptr};
+        std::uint64_t cacheKey{0};
+
+        friend bool operator==(const SurfacePointsCacheKey& lhs,
+                               const SurfacePointsCacheKey& rhs)
+        {
+            return lhs.viewer == rhs.viewer && lhs.cacheKey == rhs.cacheKey;
+        }
+    };
+
+    struct SurfacePointsCacheKeyHash {
+        std::size_t operator()(const SurfacePointsCacheKey& key) const;
+    };
+
+    // The camera-independent half of filterPointsNearViewerSurfaceCached():
+    // which points survived the distance fade, their opacity, and where they
+    // sit on the surface. Only the scene mapping and the viewport test are
+    // redone per rebuild.
+    struct SurfacePointsCacheEntry {
+        SurfaceProjectionContext context{};
+        float tolerance{0.0f};
+        std::uint64_t contentRevision{0};
+        bool valid{false};
+        std::vector<SurfaceProjection> projections;
+        std::vector<cv::Vec3f> volumePoints;
+        std::vector<std::size_t> sourceIndices;
+        std::vector<float> opacities;
+    };
+
+    void clearSurfacePointsCache(VolumeViewerBase* viewer);
+
     struct ViewerEntry {
         VolumeViewerBase* viewer{nullptr};
+        ViewerManager* manager{nullptr};
         QMetaObject::Connection overlaysUpdatedConn;
         QMetaObject::Connection destroyedConn;
         // Coalesce the rebuildOverlay fan-out onto a 16 ms single-shot
         // timer. overlaysUpdated() gets emitted on every viewport pan/zoom
-        // (post-render side-effect), and collectDirectionHints' pointTo
-        // search was measured at ~7.5% of total CPU in the live profile —
-        // debouncing drops that to one rebuild per tick window regardless
-        // of signal frequency.
+        // (post-render side-effect); overlay rebuilds that search the
+        // surface (pointTo) have measured several percent of total CPU in
+        // live profiles — debouncing drops that to one rebuild per tick
+        // window regardless of signal frequency.
         QTimer* rebuildTimer{nullptr};
         bool rebuildDirty{false};
     };
@@ -318,6 +529,14 @@ private:
     std::vector<ViewerEntry> _viewers;
 
     ViewerManager* _manager{nullptr};
+    mutable std::unordered_map<PointChainProjectionCacheKey,
+                               PointChainProjectionCacheEntry,
+                               PointChainProjectionCacheKeyHash>
+        _pointChainProjectionCache;
+    mutable std::unordered_map<SurfacePointsCacheKey,
+                               SurfacePointsCacheEntry,
+                               SurfacePointsCacheKeyHash>
+        _surfacePointsCache;
     QMetaObject::Connection _managerCreatedConn;
     QMetaObject::Connection _managerClosingConn;
     QMetaObject::Connection _managerDestroyedConn;

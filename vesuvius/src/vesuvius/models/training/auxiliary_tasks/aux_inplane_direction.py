@@ -7,10 +7,8 @@ with 2 channels (2D) or 3 channels (3D), masked on the background.
 """
 
 from typing import Dict, Any
-import torch
 import numpy as np
-from scipy.ndimage import distance_transform_edt
-from vesuvius.image_proc.geometry.structure_tensor import StructureTensorComputer
+import vc_reader.transforms as A
 
 
 def create_inplane_direction_config(aux_task_name: str, aux_config: Dict[str, Any],
@@ -70,8 +68,8 @@ def _eigh2x2(a11, a12, a22):
     l2 = tr / 2 + tmp
     # eigenvectors for l1
     # Solve (A - lI)v = 0; pick vector orthogonal to [a12, l1 - a11]
-    v1x = np.where(np.abs(a12) > np.abs(l1 - a11), - (l1 - a11), -a12)
-    v1y = np.where(np.abs(a12) > np.abs(l1 - a11), a12, (a11 - l1))
+    v1x = np.where(np.abs(a12) > np.abs(l1 - a11), a12, -a12)
+    v1y = np.where(np.abs(a12) > np.abs(l1 - a11), l1 - a11, (a11 - l1))
     norm = np.sqrt(v1x * v1x + v1y * v1y) + 1e-12
     v1x /= norm
     v1y /= norm
@@ -109,44 +107,17 @@ def compute_inplane_direction(
     if compute_from.lower() == 'binary':
         base = binary_mask.astype(np.float32)
     else:
-        inside = distance_transform_edt(binary_mask)
-        outside = distance_transform_edt(1 - binary_mask)
-        base = (outside - inside).astype(np.float32)
+        base = A.DistanceTransform(implicit_background=True)(binary_mask[None])[0]
 
-    component_sigma = tensor_sigma if tensor_sigma and tensor_sigma > 0 else None
-    smooth_components = component_sigma is not None
-    computer = StructureTensorComputer(
-        sigma=float(grad_sigma),
-        component_sigma=component_sigma,
-        smooth_components=smooth_components,
-        device="cpu",
-        dtype=torch.float32,
-    )
+    st = A.StructureTensor(sigma=float(grad_sigma), rho=max(float(tensor_sigma or 0), 0.0),
+                           scale=3.0 / 8.0 if is_2d else 1.0)(base[None])
     if is_2d:
-        st = computer.compute(
-            base,
-            sigma=float(grad_sigma),
-            component_sigma=component_sigma,
-            smooth_components=smooth_components,
-            device="cpu",
-            spatial_dims=2,
-            as_numpy=True,
-        )
         Jyy, Jyx, Jxx = st
         Jxy = Jyx
         (l1, l2), vecs = _eigh2x2(Jxx, Jxy, Jyy)  # l1<=l2
         # eigenvector for smallest eigenvalue (index 0)
         v = vecs[0]  # shape (2, H, W)
     else:
-        st = computer.compute(
-            base,
-            sigma=float(grad_sigma),
-            component_sigma=component_sigma,
-            smooth_components=smooth_components,
-            device="cpu",
-            spatial_dims=3,
-            as_numpy=True,
-        )
         Jzz, Jzy, Jzx, Jyy, Jyx, Jxx = st
         J = np.stack(
             [

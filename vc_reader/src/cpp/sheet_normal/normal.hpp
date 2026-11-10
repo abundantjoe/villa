@@ -1,0 +1,167 @@
+#pragma once
+#include "../symmetric_eigen.hpp"
+#include <algorithm>
+#include <array>
+#include <cstdint>
+#include <cmath>
+#include <memory>
+#include <stdexcept>
+#include <vector>
+#ifdef __CUDACC__
+#define VCR_SHEET_HD __host__ __device__
+#else
+#define VCR_SHEET_HD
+#endif
+#ifdef VC_READER_CUDA
+#include "../cuda_buffer.hpp"
+#endif
+namespace vcr::sheet_normal {
+#ifdef VC_READER_CUDA
+// image/output are device storage; centers are host XYZ/validity metadata.
+device::Storage cuda(const void* image, bool floating, const float* centers,
+                     std::size_t batch, int device, device::Storage output = {});
+#endif
+inline constexpr const char* recipe="ct-anisotropic-1-24-4-grid3-r48-v4";
+constexpr int width=109, sites=33, count=sites*sites*sites;
+constexpr int zcount=sites*width*width, ycount=sites*sites*width;
+// Where the patch of one XYZ query sits: its ZYX start, and the query's XYZ offset from the
+// 3-voxel lattice. Global coordinates stay float64 until the lattice origin is removed.
+// valid: the whole patch lies inside the volume (shape ZYX).
+inline void region(const double* xyz,const std::int64_t* shape,std::int64_t* start,float* offset,bool* valid) {
+    *valid=true;
+    for(int axis=0;axis<3;++axis) {
+        if(!std::isfinite(xyz[axis]) || std::abs(xyz[axis])>=0x1p52) throw std::invalid_argument("invalid sheet-normal point");
+        const double lattice=std::floor(xyz[axis]/3)*3;
+        start[2-axis]=std::int64_t(lattice)-54;
+        // float32 can round a difference just below 3 up to 3: keep the open bound.
+        offset[axis]=std::min(float(xyz[axis]-lattice),std::nextafter(3.f,0.f));
+        *valid&=start[2-axis]>=0 && start[2-axis]+width<=shape[2-axis];
+    }
+}
+// The patch-local XYZ center and validity the estimators take, for offsets in [0,3).
+inline void center(const float* offset,bool valid,float* out) {
+    for(int axis=0;axis<3;++axis) {
+        if(!std::isfinite(offset[axis]) || offset[axis]<0 || offset[axis]>=3) throw std::invalid_argument("offsets_xyz must be finite (B,3) values in [0,3)");
+        // Preserve the open upper bound after float32 addition near a lattice edge.
+        out[axis]=std::min(offset[axis]+48.f,std::nextafter(51.f,48.f));
+    }
+    out[3]=valid;
+}
+// Centers (B,4) are patch-local XYZ in [48,51) plus validity.
+inline void check_centers(const float* centers,std::size_t batch) {
+    for(std::size_t b=0;b<batch;++b) for(int j=0;j<3;++j)
+        if(!std::isfinite(centers[4*b+j]) || centers[4*b+j]<48 || centers[4*b+j]>=51)
+            throw std::invalid_argument("center must be in [48,51)");
+}
+struct Kernels {
+    float taps[4][13]{}; // smooth/derivative sigma 2, then sigma 1, zero padded
+    Kernels() {
+        for(int scale=0;scale<2;++scale) {
+            double sigma=scale ? 1. : 2., sum=0;
+            int r=scale ? 3 : 6;
+            for(int j=-r;j<=r;++j) sum+=std::exp(-.5*j*j/(sigma*sigma));
+            for(int j=-r;j<=r;++j) {
+                double g=std::exp(-.5*j*j/(sigma*sigma))/sum;
+                taps[scale*2][j+6]=float(g);
+                taps[scale*2+1][j+6]=float(g*j/(sigma*sigma));
+            }
+        }
+    }
+};
+// Only the seven tensor sums and the 3x3 eigensystem use float64: the
+// relative eigengap validity threshold is 1e-6, including low-contrast CT.
+// Images, separable filters, gradients and magnitudes are float32.
+VCR_SHEET_HD inline bool principal(const double* sums, double* normal, double& gap) {
+    if(!(sums[6]>0)) return false;
+    double a[9]={sums[0],sums[1],sums[2],sums[1],sums[3],sums[4],sums[2],sums[4],sums[5]};
+    for(double& v:a) v/=sums[6];
+    double values[3], vectors[9];
+    math::symmetric_eigen(a,3,values,vectors);
+    if(!(values[2]>1e-12)) return false;
+    gap=(values[2]-values[1])/values[2];
+    if(!(gap>1e-6)) return false;
+    for(int j=0;j<3;++j) normal[j]=vectors[3*j+2];
+    return true;
+}
+VCR_SHEET_HD inline float magnitude(float x,float y,float z) {
+    return float(sqrt(double(x)*x+double(y)*y+double(z)*z));
+}
+VCR_SHEET_HD inline void contribution(int i,const float* g,const float* center,
+                                    const double* normal,float floor,bool refine,double* sums) {
+    double x=3*(i%sites)-center[0], y=3*((i/sites)%sites)-center[1], z=3*(i/(sites*sites))-center[2];
+    double exponent=(x*x+y*y+z*z)/576.;
+    if(refine) { double along=x*normal[0]+y*normal[1]+z*normal[2]; exponent+=along*along*(1./16.-1./576.); }
+    double gx=g[i], gy=g[count+i], gz=g[2*count+i];
+    double weight=exp(-.5*exponent);
+    if(refine) { float mag=magnitude(float(gx),float(gy),float(gz)); weight/=mag>floor ? mag : floor; }
+    sums[0]+=weight*gx*gx; sums[1]+=weight*gx*gy; sums[2]+=weight*gx*gz;
+    sums[3]+=weight*gy*gy; sums[4]+=weight*gy*gz; sums[5]+=weight*gz*gz; sums[6]+=weight;
+}
+// Filtered gradients depend only on the patch, not the query center. Keep
+// them immutable while evaluating nearby centers (e.g. integration stages).
+struct CpuPatch {
+    std::unique_ptr<float[]> gradients=std::make_unique_for_overwrite<float[]>(6*count);
+    float floor=0;
+    void evaluate(const float* center,float* output) const {
+        std::fill_n(output,4,0.f);
+        if(!center[3]) return;
+        double normal[3]{},gap=0; bool valid=true;
+        for(int pass=0;pass<4 && valid;++pass) {
+            double sums[7]{};
+            for(int i=0;i<count;++i) contribution(i,gradients.get()+(pass ? 3*count : 0),center,normal,floor,pass!=0,sums);
+            valid=principal(sums,normal,gap);
+        }
+        if(valid) { for(int j=0;j<3;++j) output[j]=float(normal[j]); output[3]=float(gap); }
+    }
+};
+
+struct CpuWorkspace {
+    Kernels k;
+    std::unique_ptr<float[]> z=std::make_unique_for_overwrite<float[]>(4*zcount);
+    std::unique_ptr<float[]> y=std::make_unique_for_overwrite<float[]>(6*ycount);
+    std::vector<float> mags=std::vector<float>(count);
+    template<class T> void prepare(const T* src,CpuPatch& patch) {
+        float* g=patch.gradients.get();
+        for(int c=0;c<4;++c) for(int zz=0;zz<sites;++zz) {
+            float* dst=z.get()+c*zcount+zz*width*width;
+            std::fill_n(dst,width*width,0.f);
+            for(int j=0;j<13;++j) {
+                const T* plane=src+(3*zz+j)*width*width;
+                const float w=k.taps[c][j];
+                for(int i=0;i<width*width;++i) dst[i]+=w*(float(plane[i])*(1.f/255.f));
+            }
+        }
+        for(int c=0;c<6;++c) for(int zz=0;zz<sites;++zz) for(int yy=0;yy<sites;++yy) {
+            int scale=c/3, axis=c%3, zc=2*scale+(axis==2), yc=2*scale+(axis==1);
+            float* dst=y.get()+c*ycount+(zz*sites+yy)*width;
+            std::fill_n(dst,width,0.f);
+            for(int j=0;j<13;++j) {
+                const float* row=z.get()+zc*zcount+(zz*width+3*yy+j)*width;
+                for(int xx=0;xx<width;++xx) dst[xx]+=k.taps[yc][j]*row[xx];
+            }
+        }
+        for(int c=0;c<6;++c) for(int i=0;i<count;++i) {
+            int xc=2*(c/3)+(c%3==0), x=i%sites, row=i/sites;
+            float value=0;
+            for(int j=0;j<13;++j) value+=k.taps[xc][j]*y[c*ycount+row*width+3*x+j];
+            g[c*count+i]=value;
+        }
+        for(int i=0;i<count;++i) mags[i]=magnitude(g[3*count+i],g[4*count+i],g[5*count+i]);
+        std::nth_element(mags.begin(),mags.begin()+count/2,mags.end());
+        patch.floor=std::max(mags[count/2],1e-8f);
+    }
+};
+
+template<class T> inline void cpu(const T* image,const float* centers,float* output,std::size_t batch) {
+    check_centers(centers,batch);
+    CpuWorkspace workspace;
+    CpuPatch patch;
+    for(std::size_t b=0;b<batch;++b) {
+        std::fill_n(output+b*4,4,0.f);
+        if(!centers[4*b+3]) continue;
+        workspace.prepare(image+b*width*width*width,patch);
+        patch.evaluate(centers+b*4,output+b*4);
+    }
+}
+}
+#undef VCR_SHEET_HD

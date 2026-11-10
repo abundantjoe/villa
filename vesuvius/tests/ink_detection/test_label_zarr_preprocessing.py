@@ -1,0 +1,482 @@
+from __future__ import annotations
+
+from pathlib import Path
+import subprocess
+import sys
+
+import numpy as np
+import pytest
+import tifffile
+from vc_reader.reader import open_group
+
+from vesuvius.ink_detection.preprocessing import (
+    create_label_zarrs as create_label_zarrs_module,
+)
+from vesuvius.ink_detection.preprocessing.create_label_zarrs import (
+    DEFAULT_LABEL_SLICE,
+    write_label_pyramid,
+    convert_image,
+    find_target_images,
+    main,
+    parse_target_image,
+)
+
+
+def _zarr_format(path: Path) -> int:
+    metadata = path / ".zgroup"
+    assert metadata.is_file()
+    import json
+
+    return int(json.loads(metadata.read_text())["zarr_format"])
+
+
+def test_label_image_names_share_segment_vocabulary_and_accept_png(tmp_path):
+    paths = [
+        tmp_path / "Segment-A_InkLabels.TIFF",
+        tmp_path / "segment-a_supervision_mask_v3.png",
+        tmp_path / "segment-a_validation_mask.tif",
+    ]
+    for path in paths:
+        path.touch()
+
+    assert parse_target_image(paths[0]) == {
+        "prefix": "Segment-A",
+        "label_kind": "inklabels",
+        "version_num": None,
+        "extension": ".TIFF",
+    }
+    assert parse_target_image(paths[1])["version_num"] == 3
+    assert parse_target_image(paths[2])["label_kind"] == "validation_mask"
+    padded_version = tmp_path / "segment-a_inklabels_v01.tif"
+    padded_version.touch()
+    assert parse_target_image(padded_version)["version_num"] == 1
+    assert parse_target_image(tmp_path / "missing_inklabels.tif") is None
+
+
+def test_discovery_is_stable_skips_zarr_trees_and_adds_one_composite(tmp_path):
+    segment = tmp_path / "segment-a"
+    segment.mkdir()
+    labels = [
+        segment / "segment-a_inklabels.tif",
+        segment / "segment-a_supervision_mask.tif",
+    ]
+    composites = [
+        segment / "segment-a_composite-b.tif",
+        segment / "segment-a_max-a.tif",
+    ]
+    for path in [*labels, *composites]:
+        path.touch()
+    hidden = segment / "old.zarr"
+    hidden.mkdir()
+    (hidden / "inside_inklabels.tif").touch()
+
+    assert find_target_images(tmp_path) == [
+        labels[0],
+        labels[1],
+        composites[0],
+    ]
+
+
+def test_label_and_composite_pyramids_keep_nearest_and_mean_rounding(tmp_path):
+    image_YX = np.array(
+        [[0, 1, 2], [3, 4, 5], [6, 7, 8]], dtype=np.uint8
+    )
+    write_label_pyramid(image_YX, tmp_path / "nearest.zarr", levels=2)
+    write_label_pyramid(image_YX, tmp_path / "mean.zarr", levels=2, downsample_mode="mean")
+    nearest = open_group(tmp_path / "nearest.zarr")
+    mean = open_group(tmp_path / "mean.zarr")
+
+    assert nearest["0"].shape == (65, 3, 3)
+    np.testing.assert_array_equal(nearest["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        nearest["1"][DEFAULT_LABEL_SLICE], np.array([[0, 2], [6, 8]])
+    )
+    np.testing.assert_array_equal(
+        mean["1"][DEFAULT_LABEL_SLICE], np.array([[2, 4], [6, 8]])
+    )
+    assert np.count_nonzero(nearest["1"][:DEFAULT_LABEL_SLICE]) == 0
+
+
+def test_conversion_writes_v2_ome_metadata_and_preserves_skip_overwrite(tmp_path):
+    label_path = tmp_path / "segment-a_inklabels.tif"
+    first_YX = np.arange(35, dtype=np.uint8).reshape(5, 7)
+    tifffile.imwrite(label_path, first_YX)
+
+    first = convert_image(label_path, levels=3)
+    output = label_path.with_suffix(".zarr")
+    assert first["status"] == "written"
+    assert _zarr_format(output) == 2
+    group = open_group(output)
+    assert sorted(group.array_keys()) == ["0", "1", "2"]
+    assert group.attrs["multiscales"][0]["axes"] == [
+        {"name": "z", "type": "space"},
+        {"name": "y", "type": "space"},
+        {"name": "x", "type": "space"},
+    ]
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], first_YX)
+    assert group["0"].attrs["_ARRAY_DIMENSIONS"] == ["z", "y", "x"]
+
+    replacement_YX = np.full((5, 7), 99, dtype=np.uint8)
+    tifffile.imwrite(label_path, replacement_YX)
+    assert convert_image(label_path, levels=3)["status"] == "skipped"
+    np.testing.assert_array_equal(
+        open_group(output)["0"][DEFAULT_LABEL_SLICE], first_YX
+    )
+
+    assert convert_image(label_path, levels=3, overwrite=True)["status"] == "written"
+    np.testing.assert_array_equal(
+        open_group(output)["0"][DEFAULT_LABEL_SLICE],
+        replacement_YX,
+    )
+
+
+def test_tiled_tiff_streaming_matches_flat_image(tmp_path):
+    label_path = tmp_path / "segment-a_supervision_mask.tif"
+    image_YX = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+    tifffile.imwrite(label_path, image_YX, tile=(16, 16))
+
+    result = convert_image(label_path, levels=2)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
+    )
+
+
+def test_striped_tiff_streaming_matches_flat_image(tmp_path):
+    """A plain ``tifffile.imwrite`` with no ``tile=`` writes a striped TIFF --
+    this is the input shape #1231's second half reports OOMing on, because the
+    old streaming gate checked only ``page.is_tiled``.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    image_YX = np.arange(64 * 96, dtype=np.uint16).reshape(64, 96)
+    tifffile.imwrite(label_path, image_YX)  # no tile= -> striped by default
+
+    with tifffile.TiffFile(label_path) as tif:
+        assert not tif.pages[0].is_tiled, "fixture must actually be striped"
+
+    result = convert_image(label_path, levels=2)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
+    )
+
+
+@pytest.mark.parametrize("compression", ["lzw", "deflate", "packbits"])
+def test_striped_tiff_streaming_covers_common_codecs(tmp_path, compression):
+    """Block decode must round-trip for every codec the streaming path
+    claims to support, not just uncompressed strips."""
+    label_path = tmp_path / f"segment-a_{compression}_supervision_mask.tif"
+    image_YX = np.random.default_rng(0).integers(
+        0, 255, size=(80, 120), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, image_YX, compression=compression)
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+def test_jpeg_tiff_streams(tmp_path):
+    """Every codec the reader decodes streams: it needs no per-codec gate."""
+    label_path = tmp_path / "segment-a_jpeg_inklabels.tif"
+    image_YX = np.random.default_rng(1).integers(
+        0, 255, size=(64, 64), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, image_YX, compression="jpeg")
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    # JPEG is lossy, so this is a sanity check on shape/dtype, not exact
+    # pixel equality.
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == image_YX.shape
+
+
+def test_one_row_strip_streams_correctly(tmp_path):
+    """A strip containing exactly one row must not lose its row axis.
+
+    ``page.decode`` returns ``(depth, rows, columns, samples)``; when
+    ``rows == 1`` that is ``(1, 1, width, 1)``, and squeezing it drops the row
+    axis to give ``(width,)`` -- which the 2D guard then rejects with
+    ``ValueError``. This arises whenever ``height % rowsperstrip == 1`` (only
+    the final strip is affected) or ``rowsperstrip == 1`` (every strip is).
+    Tiles cannot hit it, because TIFF tile heights are multiples of 16, which
+    is why the old ``is_tiled`` gate hid it.
+
+    These files converted before this PR, slowly, through the in-memory path,
+    so a crash here would be a regression.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    # 65 rows at 32 per strip -> strips of 32, 32, 1. The last strip is the
+    # one that decodes as (1, 1, width, 1).
+    image_YX = np.arange(65 * 48, dtype=np.uint16).reshape(65, 48)
+    tifffile.imwrite(label_path, image_YX, rowsperstrip=32)
+
+    with tifffile.TiffFile(label_path) as tif:
+        page = tif.pages[0]
+        assert not page.is_tiled, "fixture must actually be striped"
+        assert page.chunked[0] == 3, "fixture must have a one-row final strip"
+
+    result = convert_image(label_path, levels=2)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+    np.testing.assert_array_equal(
+        group["1"][DEFAULT_LABEL_SLICE], image_YX[::2, ::2]
+    )
+
+
+def test_every_strip_one_row_streams_correctly(tmp_path):
+    """``rowsperstrip=1`` makes every strip a one-row strip, not just the last.
+
+    Separate from the case above because it exercises the same decode shape on
+    every block rather than only the remainder, and because a writer that
+    produces it does so for every image it writes, not by accident of height.
+    """
+    label_path = tmp_path / "segment-a_validation_mask.tif"
+    image_YX = np.arange(24 * 40, dtype=np.uint16).reshape(24, 40)
+    tifffile.imwrite(label_path, image_YX, rowsperstrip=1)
+
+    with tifffile.TiffFile(label_path) as tif:
+        assert tif.pages[0].chunked[0] == 24, "fixture must be one row per strip"
+
+    result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+def test_tiled_input_streams_regardless_of_page_count_and_codec(tmp_path):
+    """Tiled input streamed unconditionally before this PR; it still must.
+
+    The first version of this change gated *both* tiled and striped input on a
+    single-page check and a codec whitelist. That silently sent tiled
+    multi-page files, and tiled files using a codec outside the whitelist,
+    back to the in-memory path they had always been exempt from -- which is
+    the allocation #1231 reports. Both are regressions rather than new
+    behaviour, so they are asserted here explicitly.
+    """
+    multipage_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(2).integers(
+        0, 2, size=(5, 32, 48), dtype=np.uint8
+    )
+    tifffile.imwrite(multipage_path, volume_ZYX, tile=(16, 16))
+    with tifffile.TiffFile(multipage_path) as tif:
+        assert len(tif.pages) == 5, "fixture must actually be multi-page"
+        assert tif.pages[0].is_tiled, "fixture must actually be tiled"
+
+    result = convert_image(multipage_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(multipage_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(
+        group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0]
+    )
+
+    zstd_path = tmp_path / "segment-b_supervision_mask.tif"
+    image_YX = np.arange(32 * 48, dtype=np.uint16).reshape(32, 48)
+    tifffile.imwrite(zstd_path, image_YX, tile=(16, 16), compression="zstd")
+    with tifffile.TiffFile(zstd_path) as tif:
+        page = tif.pages[0]
+        assert page.is_tiled, "fixture must actually be tiled"
+
+    result = convert_image(zstd_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(zstd_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+@pytest.mark.parametrize(
+    "name,shape,layout",
+    [
+        ("whole_image_strip", (2049, 3073), {}),
+        ("strip_1024", (2049, 2051), {"rowsperstrip": 1024}),
+        ("tiled", (2048, 2048), {"tile": (256, 256)}),
+    ],
+)
+def test_streaming_decodes_each_source_chunk_exactly_once(
+    tmp_path, monkeypatch, name, shape, layout
+):
+    """The streaming writer must not re-decode a source chunk.
+
+    Iterating destination blocks and decoding every intersecting source chunk
+    is correct but pathological for striped input: a strip spans the full
+    width, so it is decoded once per horizontal destination block. A default
+    uncompressed ``tifffile.imwrite`` writes ONE whole-image strip, which was
+    once decoded once per destination block -- 12 times for the 2049x3073 case
+    below, and 416 times for the 16125x25690 image in #1231.
+
+    This is invisible to a correctness test: the old code produced byte-exact
+    output while doing all that redundant work. Assert the decode count
+    directly instead.
+    """
+    label_path = tmp_path / f"segment-a_{name}_supervision_mask.tif"
+    height, width = shape
+    image_YX = (
+        np.arange(height * width, dtype=np.int64) % 251
+    ).reshape(height, width).astype(np.uint8)
+    tifffile.imwrite(label_path, image_YX, compression="lzw", **layout)
+
+    with tifffile.TiffFile(label_path) as tif:
+        expected_decodes = tif.pages[0].chunked[0] * tif.pages[0].chunked[1]
+
+    decodes = []
+    real_open = create_label_zarrs_module.images.open
+
+    class _Counting:
+        def __init__(self, *args, **kwargs):
+            self.reader = real_open(*args, **kwargs)
+
+        def __enter__(self):
+            return self.reader
+
+        def __exit__(self, *exc):
+            decodes.append(self.reader.stats()["decoded_cache"]["misses"])
+            self.reader.close()
+
+    monkeypatch.setattr(create_label_zarrs_module.images, "open", _Counting)
+    result = convert_image(label_path, levels=1)
+
+    assert result["streamed_tiled_tiff"] == "true"
+    assert max(decodes) == expected_decodes, (
+        f"{name}: decoded {max(decodes)} times for {expected_decodes} source "
+        f"chunks; each chunk must be decoded exactly once"
+    )
+
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], image_YX)
+
+
+def test_label_command_reports_failure_and_cli_module_help(tmp_path, capsys):
+    bad = tmp_path / "bad_inklabels.tif"
+    bad.write_bytes(b"not a tiff")
+    assert main([str(tmp_path), "--workers", "1", "--levels", "2"]) == 1
+    output = capsys.readouterr().out
+    assert "1 failed" in output
+    assert f"ERROR {bad}" in output
+
+    completed = subprocess.run(
+        [
+            sys.executable,
+            "-m",
+            "vesuvius.ink_detection.preprocessing.create_label_zarrs",
+            "-h",
+        ],
+        check=False,
+        capture_output=True,
+        text=True,
+    )
+    assert completed.returncode == 0
+    assert "--overwrite" in completed.stdout
+
+
+def test_label_command_rerun_counts_existing_output_as_skipped(tmp_path, capsys):
+    label_path = tmp_path / "segment-a_inklabels.png"
+    import cv2
+
+    assert cv2.imwrite(
+        str(label_path), np.array([[0, 255], [255, 0]], dtype=np.uint8)
+    )
+    assert main([str(tmp_path), "--workers", "1", "--levels", "1"]) == 0
+    assert main([str(tmp_path), "--workers", "1", "--levels", "1"]) == 0
+    assert "0 written, 1 skipped, 0 failed" in capsys.readouterr().out
+
+
+def test_label_command_validates_scan_root(tmp_path):
+    missing = tmp_path / "missing"
+    with pytest.raises(FileNotFoundError, match="Root folder does not exist"):
+        main([str(missing)])
+    file_path = tmp_path / "file"
+    file_path.touch()
+    with pytest.raises(NotADirectoryError, match="Root path is not a directory"):
+        main([str(file_path)])
+
+
+def test_multipage_striped_tiff_converts_page_one_and_warns(tmp_path, caplog):
+    """A multi-page striped TIFF used to become a (pages, height) zarr (#1738).
+
+    tifffile.imread stacks the pages and the channel squeeze then takes the
+    page axis for height. The converter now reads page 1 explicitly, so the
+    label keeps its (height, width), and it says which pages it ignored.
+    """
+    label_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(3).integers(
+        0, 2, size=(5, 20, 30), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, volume_ZYX)  # striped, 5 pages
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 5, "fixture must actually be multi-page"
+        assert not tif.pages[0].is_tiled, "fixture must actually be striped"
+
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    converted = group["0"][DEFAULT_LABEL_SLICE]
+    assert converted.shape == (20, 30), "page count must not become the height"
+    np.testing.assert_array_equal(converted, volume_ZYX[0])
+    assert "has 5 pages; converting page 1 only" in caplog.text
+
+
+def test_multipage_tiled_tiff_streams_page_one_and_warns(tmp_path, caplog):
+    """The tiled streaming path always converted page 1; now it says so."""
+    label_path = tmp_path / "segment-a_multipage_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(4).integers(
+        0, 2, size=(5, 32, 48), dtype=np.uint8
+    )
+    tifffile.imwrite(label_path, volume_ZYX, tile=(16, 16))
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    np.testing.assert_array_equal(group["0"][DEFAULT_LABEL_SLICE], volume_ZYX[0])
+    assert "has 5 pages; converting page 1 only" in caplog.text
+
+
+def test_single_page_tiff_conversion_is_unchanged_and_silent(tmp_path, caplog):
+    label_path = tmp_path / "segment-a_supervision_mask.tif"
+    image_YX = np.random.default_rng(5).integers(0, 2, size=(20, 30), dtype=np.uint8)
+    tifffile.imwrite(label_path, image_YX, compression="jpeg")
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == (20, 30)
+    assert "converting page 1 only" not in caplog.text
+
+
+def test_pyramid_sub_ifds_are_not_extra_pages(tmp_path, caplog):
+    """libvips/QuPath-style pyramids keep reduced levels as subfiletype=1 IFDs.
+
+    ``tifffile.imread`` already returned the base level for those, so the
+    output is unchanged and no multi-page warning is due.
+    """
+    label_path = tmp_path / "segment-a_supervision_mask.tif"
+    base_YX = np.random.default_rng(6).integers(0, 2, size=(64, 64), dtype=np.uint8)
+    with tifffile.TiffWriter(label_path) as writer:
+        writer.write(base_YX, compression="jpeg")
+        writer.write(base_YX[::2, ::2], subfiletype=1, compression="jpeg")
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 2 and tif.pages[1].subfiletype & 1
+
+    with caplog.at_level("WARNING"):
+        result = convert_image(label_path, levels=1)
+    assert result["streamed_tiled_tiff"] == "true"
+    group = open_group(label_path.with_suffix(".zarr"))
+    assert group["0"][DEFAULT_LABEL_SLICE].shape == (64, 64)
+    assert "converting page 1 only" not in caplog.text
+
+
+def test_two_page_tiff_warning_names_the_one_ignored_page(tmp_path, caplog):
+    label_path = tmp_path / "segment-a_two_supervision_mask.tif"
+    volume_ZYX = np.random.default_rng(7).integers(0, 2, size=(2, 20, 30), dtype=np.uint8)
+    tifffile.imwrite(label_path, volume_ZYX)
+    with tifffile.TiffFile(label_path) as tif:
+        assert len(tif.pages) == 2, "fixture must actually be two pages"
+    with caplog.at_level("WARNING"):
+        convert_image(label_path, levels=1)
+    assert "has 2 pages; converting page 1 only (page 2 is ignored)" in caplog.text

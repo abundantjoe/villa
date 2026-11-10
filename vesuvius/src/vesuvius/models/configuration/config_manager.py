@@ -25,8 +25,15 @@ class ConfigManager:
     def load_config(self, config_path):
         config_path = Path(config_path)
         self._config_path = config_path
-        with open(config_path, "r") as f:
-            config = yaml.safe_load(f)
+        # utf-8-sig drops a leading BOM so the first key stays intact (#1524).
+        try:
+            with open(config_path, "r", encoding="utf-8-sig") as f:
+                config = yaml.safe_load(f)
+        except UnicodeDecodeError as e:
+            raise ValueError(
+                f"Config file {config_path} is not valid UTF-8. "
+                "Config files must be UTF-8 encoded; re-save the file as UTF-8."
+            ) from e
 
         self.tr_info = config.get("tr_setup", {})
         self.tr_configs = config.get("tr_config", {})
@@ -235,6 +242,19 @@ class ConfigManager:
         }
         
         ### Dataset config ###
+        self.dataset_type = str(self.dataset_config.get("dataset_type", "zarr")).lower()
+        if self.dataset_type not in {"zarr", "cross_frame"}:
+            raise ValueError(
+                "dataset_config.dataset_type must be one of {'zarr', 'cross_frame'}; "
+                f"got {self.dataset_type!r}"
+            )
+        if self.dataset_type == "cross_frame":
+            for key in ("image_zarr_url", "labels_zarr_url", "transform_json_url"):
+                if not self.dataset_config.get(key):
+                    raise ValueError(
+                        f"dataset_config.{key} is required when dataset_type == 'cross_frame'"
+                    )
+
         self.min_labeled_ratio = float(self.dataset_config.get("min_labeled_ratio", 0.10))
         self.min_bbox_percent = float(self.dataset_config.get("min_bbox_percent", 0.95))
 
@@ -444,8 +464,6 @@ class ConfigManager:
         self.no_spatial = bool(self.dataset_config.get("no_spatial", False))
         # Control where augmentations run; default to CPU (in Dataset workers)
         self.augment_on_device = bool(self.tr_configs.get("augment_on_device", False))
-        # Enable per-augmentation timing (disabled by default)
-        self.profile_augmentations = bool(self.tr_configs.get("profile_augmentations", False))
 
         # Normalization configuration
         self.normalization_scheme = self.dataset_config.get("normalization_scheme", "zscore")
@@ -927,8 +945,8 @@ class ConfigManager:
         config_filename = f"{self.model_name}_config.yaml"
         config_path = model_ckpt_dir / config_filename
 
-        with config_path.open("w") as f:
-            yaml.safe_dump(combined_config, f, sort_keys=False)
+        with config_path.open("w", encoding="utf-8") as f:
+            yaml.safe_dump(combined_config, f, sort_keys=False, allow_unicode=True)
 
         print(f"Configuration saved to: {config_path}")
 

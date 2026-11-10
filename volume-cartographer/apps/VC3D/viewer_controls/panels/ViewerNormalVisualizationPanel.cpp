@@ -1,4 +1,5 @@
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
+#include "ReparentLayoutItem.hpp"
 
 #include "VCSettings.hpp"
 #include "ViewerManager.hpp"
@@ -15,22 +16,6 @@
 
 namespace
 {
-
-void reparentItemWidgets(QLayoutItem* item, QWidget* newParent)
-{
-    if (!item || !newParent) {
-        return;
-    }
-    if (auto* widget = item->widget()) {
-        widget->setParent(newParent);
-        return;
-    }
-    if (auto* layout = item->layout()) {
-        for (int i = 0; i < layout->count(); ++i) {
-            reparentItemWidgets(layout->itemAt(i), newParent);
-        }
-    }
-}
 
 void moveGridLayoutItems(QGridLayout* from, QGridLayout* to, QWidget* newParent)
 {
@@ -78,6 +63,29 @@ ViewerNormalVisualizationPanel::ViewerNormalVisualizationPanel(const UiRefs& uiR
                         layout,
                         this);
     setupControls();
+}
+
+void ViewerNormalVisualizationPanel::setViewerManager(ViewerManager* viewerManager)
+{
+    _viewerManager = viewerManager;
+    if (!_viewerManager) {
+        return;
+    }
+    const bool showNormals = _uiRefs.showSurfaceNormals && _uiRefs.showSurfaceNormals->isChecked();
+    const float arrowScale = _uiRefs.normalArrowLengthSlider
+        ? static_cast<float>(_uiRefs.normalArrowLengthSlider->value()) / 100.0f
+        : 1.0f;
+    const int maxArrows = _uiRefs.normalMaxArrowsSlider
+        ? _uiRefs.normalMaxArrowsSlider->value()
+        : 0;
+    _viewerManager->forEachBaseViewer([showNormals, arrowScale, maxArrows](VolumeViewerBase* viewer) {
+        if (!viewer) {
+            return;
+        }
+        viewer->setShowSurfaceNormals(showNormals);
+        viewer->setNormalArrowLengthScale(arrowScale);
+        viewer->setNormalMaxArrows(maxArrows);
+    });
 }
 
 void ViewerNormalVisualizationPanel::setupControls()

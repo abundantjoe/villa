@@ -2,8 +2,7 @@
 //
 // QuadSurface does not auto-trim on load or save. A surface with a
 // sparse valid region surrounded by (-1,-1,-1) cells round-trips
-// at its original grid size; cropping to the valid bbox is only
-// done when the user explicitly invokes vc_tifxyz_trim.
+// at its original grid size.
 //
 // Verified here:
 //  1) Size is preserved across save+load cycles for a sparse-but-
@@ -12,6 +11,8 @@
 //     <volpkg>/backups/<seg>/0/ contains the prior on-disk state.
 //  3) Atomic TIFF writes (provided by save's directory swap on
 //     Linux): a stray .tmp file does not break reload.
+//  4) The bbox written to meta.json reflects the point grid at save
+//     time, not the (possibly stale) bbox cached from load (#1272).
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
@@ -86,7 +87,8 @@ TEST_CASE("saveOverwrite round-trip preserves sparse-but-large surface")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // saveOverwrite path: load, then save again.
@@ -126,7 +128,8 @@ TEST_CASE("saveOverwrite snapshot captures the PRIOR on-disk state, not in-memor
         QuadSurface surf(ptsA, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));  // first save: no backups
 
@@ -179,10 +182,62 @@ TEST_CASE("saveOverwrite skips snapshot on first save when no on-disk state exis
         // is populated.
         // Use the underlying save API since saveOverwrite would also
         // exercise the snapshot path; both should leave no backup.
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     REQUIRE_FALSE(fs::exists(pkg.backupsDir));
+}
+
+TEST_CASE("save recomputes bbox after post-load point mutation (#1272)")
+{
+    TmpVolpkg pkg("bbox_recompute");
+
+    // Dense 64x64 grid: x = col in [0,63], y = row in [0,63], z = 100.
+    cv::Mat_<cv::Vec3f> pts(64, 64);
+    for (int r = 0; r < pts.rows; ++r) {
+        for (int c = 0; c < pts.cols; ++c) {
+            pts(r, c) = cv::Vec3f(static_cast<float>(c),
+                                  static_cast<float>(r),
+                                  100.f);
+        }
+    }
+
+    {
+        QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
+        surf.path = pkg.segDir;
+        surf.id = pkg.segName;
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
+    }
+
+    // Sanity: the first save recorded the original extent.
+    {
+        QuadSurface loaded(pkg.segDir);
+        REQUIRE(loaded.meta.contains("bbox"));
+        CHECK(loaded.meta["bbox"][1][2].get<float>() == doctest::Approx(100.f));
+
+        // Mutate a vertex far outside the old bbox through rawPointsPtr(),
+        // the uncontrolled mutation path used by growth/editing code (no
+        // invalidation hook runs). The load-time bbox cache is now stale.
+        loaded.ensureLoaded();
+        (*loaded.rawPointsPtr())(10, 10) = cv::Vec3f(500.f, 600.f, 700.f);
+        loaded.saveOverwrite();
+    }
+
+    // The saved meta.json bbox must cover the new extent.
+    {
+        QuadSurface reloaded(pkg.segDir);
+        REQUIRE(reloaded.meta.contains("bbox"));
+        const auto& bb = reloaded.meta["bbox"];
+        CHECK(bb[1][0].get<float>() == doctest::Approx(500.f));
+        CHECK(bb[1][1].get<float>() == doctest::Approx(600.f));
+        CHECK(bb[1][2].get<float>() == doctest::Approx(700.f));
+        // Untouched vertices still bound the low corner.
+        CHECK(bb[0][0].get<float>() == doctest::Approx(0.f));
+        CHECK(bb[0][1].get<float>() == doctest::Approx(0.f));
+        CHECK(bb[0][2].get<float>() == doctest::Approx(100.f));
+    }
 }
 
 TEST_CASE("stale .tmp file in segment dir does not break reload")
@@ -195,7 +250,8 @@ TEST_CASE("stale .tmp file in segment dir does not break reload")
         QuadSurface surf(pts, cv::Vec2f(1.f, 1.f));
         surf.path = pkg.segDir;
         surf.id = pkg.segName;
-        surf.save(pkg.segDir.string(), pkg.segName, /*force_overwrite=*/false);
+        surf.meta["uuid"] = pkg.segName;
+        surf.save(pkg.segDir.string(), /*force_overwrite=*/false);
     }
 
     // Simulate a crash mid-write: some file got written as .tmp but

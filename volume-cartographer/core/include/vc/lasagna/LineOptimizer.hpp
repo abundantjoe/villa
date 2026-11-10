@@ -3,10 +3,23 @@
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstdint>
+#include <stdexcept>
 #include <string>
 #include <vector>
 
 namespace vc::lasagna {
+
+// Thrown from solve entry points when LineOptimizationConfig::cancelFlag is
+// set: the caller superseded (or is tearing down) the solve, so no result is
+// wanted. Deliberately a distinct type so coordinators can tell cancellation
+// from a genuine failure and skip failure handling (fallback demotion,
+// rollback, error dialogs).
+struct LineOptimizationCancelled : std::runtime_error {
+    LineOptimizationCancelled()
+        : std::runtime_error("line optimization cancelled")
+    {
+    }
+};
 
 struct LineOptimizationLossReport {
     std::string name;
@@ -39,11 +52,8 @@ struct LineOptimizationReport {
     bool converged = false;
     int normalPrefetchCalls = 0;
     double ceresSolveMs = 0.0;
-    double normalChunkPrefetchMs = 0.0;
     double normalMaterializeMs = 0.0;
     double totalMs = 0.0;
-    uint64_t normalPrefetchRequestedChunks = 0;
-    uint64_t normalPrefetchChunksRead = 0;
     std::string message;
     std::vector<LineOptimizationLossReport> finalLosses;
     std::vector<LineOptimizationIterationReport> iterationProgress;
@@ -92,28 +102,22 @@ struct LineReinitializationSpanReport {
     int candLeftTruncatedPoints = 0;
     int candRightRolloutSteps = 0;
     int candRightTruncatedPoints = 0;
-    int candContinueLeftRolloutSteps = 0;
-    int candContinueLeftTruncatedPoints = 0;
-    int candContinueRightRolloutSteps = 0;
-    int candContinueRightTruncatedPoints = 0;
     int candLeftSelectedSign = 0;
     int candRightSelectedSign = 0;
     double candLeftClosestTargetDistance = 0.0;
     double candRightClosestTargetDistance = 0.0;
-    double candContinueLeftClosestTargetDistance = 0.0;
-    double candContinueRightClosestTargetDistance = 0.0;
     double candLeftInitialCost = 0.0;
     double candLeftFinalCost = 0.0;
     double candRightInitialCost = 0.0;
     double candRightFinalCost = 0.0;
-    double candContinueLeftInitialCost = 0.0;
-    double candContinueLeftFinalCost = 0.0;
-    double candContinueRightInitialCost = 0.0;
-    double candContinueRightFinalCost = 0.0;
     double chosenMaxEvenStepDeviation = 0.0;
     double chosenMaxTangentSmoothDeviation = 0.0;
     double chosenMaxNormalSmoothDeviation = 0.0;
     double chosenMaxNormalAlignmentAbs = 0.0;
+    bool hardLeftDirection = false;
+    bool hardRightDirection = false;
+    cv::Vec3d hardLeftDirectionVector{0.0, 0.0, 0.0};
+    cv::Vec3d hardRightDirectionVector{0.0, 0.0, 0.0};
     std::string chosen;
     std::vector<LineReinitializationCandidateReport> candidates;
 };
@@ -140,6 +144,17 @@ struct LineControlPoint {
     int optimizedIndex = -1;
 };
 
+enum class LineControlPointSide {
+    Before,
+    After,
+};
+
+struct LineControlPointHardDirectionConstraint {
+    int controlPointIndex = -1;
+    LineControlPointSide side = LineControlPointSide::After;
+    cv::Vec3d direction{0.0, 0.0, 0.0};
+};
+
 struct LineControlPointUpdateResult {
     std::vector<cv::Vec3d> linePoints;
     std::vector<LineControlPoint> controlPoints;
@@ -147,6 +162,15 @@ struct LineControlPointUpdateResult {
     int changedControlIndex = -1;
     int activeStart = -1;
     int activeEnd = -1;
+    // Half-open range [replacedStart, replacedStart + replacedCount) of
+    // linePoints this update rebuilt; every point outside it is carried over
+    // from the input line unchanged (the suffix shifted by the size delta).
+    // -1/0 when the whole line must be treated as new (single control, or an
+    // update that regrew a tail). Lets callers resample derived per-point
+    // data only where geometry actually changed. Set by the geometric
+    // overload; the solving overload leaves it unset.
+    int replacedStart = -1;
+    int replacedCount = 0;
 };
 
 [[nodiscard]] LineControlPointUpdateResult updateExistingLineControlPoint(
@@ -185,14 +209,17 @@ public:
         const LineOptimizationConfig& config = {},
         int activeStart = -1,
         int activeEnd = -1,
-        std::string candidateName = "existing-line+global") const;
+        std::string candidateName = "existing-line+global",
+        std::vector<std::pair<int, int>> protectedPointRanges = {}) const;
 
     [[nodiscard]] LineReinitializationOptimizationResult reinitializeAndOptimizeExistingLine(
         std::vector<cv::Vec3d> linePoints,
         std::vector<LineControlPoint> controlPoints,
         std::vector<int> fixedControlAnchorIndices,
         int displayFrameAnchorIndex,
-        const LineOptimizationConfig& config = {}) const;
+        const LineOptimizationConfig& config = {},
+        std::vector<std::pair<int, int>> protectedControlSpans = {},
+        std::vector<LineControlPointHardDirectionConstraint> hardDirectionConstraints = {}) const;
 
 private:
     const NormalSampler& normalSampler_;

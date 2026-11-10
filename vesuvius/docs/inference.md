@@ -6,7 +6,7 @@ The Vesuvius tooling exposes three command-line stages plus a convenience orches
 2. `vesuvius.blend_logits` — merge overlapping patches with Gaussian weighting.
 3. `vesuvius.finalize_outputs` — convert logits into probabilities or masks and build a multiscale Zarr.
 
-All commands honour local paths and remote storage backed by `fsspec` (for example S3). Run `vesuvius.accept_terms --yes` before accessing remote scroll volumes.
+All commands honour local paths and remote storage backed by `fsspec` (for example S3). Remote scroll volumes are covered by the [data licence](../README.md#data-licence).
 
 ## Stage 1 — `vesuvius.predict`
 
@@ -27,11 +27,15 @@ vesuvius.predict \
 | Argument | Description |
 |----------|-------------|
 | `--model_path` (required) | Path to a model directory, a `.pth` checkpoint, or `hf://` repository.
-| `--input_dir` (required) | Volume input: Zarr root, TIFF stack, or a directory understood by the `Volume` helper.
+| `--input_dir` (required) | Volume input: Zarr root, TIFF stack, or a directory understood by the `Volume` helper. For open data use the `s3://` access root the catalog publishes, together with `--input_anon`.
+| `--input_anon` | Read the input bucket anonymously. Required for `s3://vesuvius-challenge-open-data/...`, which is public but unsigned.
 | `--output_dir` (required) | Destination folder for logits (`logits_part_{id}.zarr`) and coordinates.
 | `--input_format` | Force `zarr`, `tiff`, or `volume` detection. Usually optional.
 | `--tta_type` / `--disable_tta` | Choose `rotation` (default) or `mirroring`, or disable test-time augmentation.
 | `--num_parts` / `--part_id` | Partition inference so multiple machines can process different chunks.
+| `--bbox` | Restrict inference to a region of interest: `"z0:z1,y0:y1,x0:x1"` in global voxel coordinates, half-open. Omit a bound to reach the volume edge (`"1000:1400,:,2000:"`). See [Region-of-interest inference](#region-of-interest-inference).
+| `--blend_in_memory OUTPUT_PATH` | Blend the patches in RAM and write the finalized output (what `blend_and_finalize` would write) to `OUTPUT_PATH`, with no per-patch logits on disk. Takes `--mode`, `--threshold`/`--threshold_value`, `--blend_sigma_scale`, `--blend_chunk_size` and `--blend_compression_level`. See [Blending in memory](#blending-in-memory).
+| `--chunk_cache_mb` | Keep up to this many MB of fetched input chunks in an in-memory LRU cache (zarr 3), so overlapping patches do not download the same chunks again. Each DataLoader worker keeps its own cache. Default `0` (off).
 | `--overlap` | Fractional patch overlap (0–1, default `0.5`).
 | `--batch_size` | Inference batch size (default `1`).
 | `--patch_size` | Override the model patch size using a comma-separated list (e.g. `192,192,192`).
@@ -41,8 +45,8 @@ vesuvius.predict \
 | `--normalization` | Runtime normalization (`instance_zscore`, `global_zscore`, `instance_minmax`, `ct`, `none`).
 | `--intensity-properties-json` | nnU-Net style JSON with intensity stats for CT normalization.
 | `--device` | Device string such as `cuda`, `cuda:1`, or `cpu`.
-| `--skip-empty-patches` / `--no-skip-empty-patches` | Toggle automatic removal of homogeneous patches.
-| `--zarr-compressor` / `--zarr-compression-level` | Configure output compression (`zstd` with level `3` by default).
+| `--skip_empty_patches` / `--no_skip_empty_patches` | Toggle automatic removal of homogeneous patches.
+| `--zarr_compressor` / `--zarr_compression_level` | Configure output compression (`zstd` with level `3` by default).
 | `--scroll_id`, `--segment_id`, `--energy`, `--resolution` | Metadata when reading remote scrolls via the `Volume` helper.
 | `--hf_token` | Hugging Face token for private repositories.
 | `--config-yaml` | Training YAML to resolve model architecture when the checkpoint lacks embedded metadata.
@@ -58,6 +62,91 @@ vesuvius.predict --model_path ... --num_parts 4 --part_id 1 --device cuda:0
 ```
 
 Each worker writes `logits_part_<id>.zarr` and `coordinates_part_<id>.zarr` into the output directory.
+
+### Region-of-interest inference
+
+`--bbox` restricts the sliding window to one region of the volume, given in **global voxel
+coordinates** as `"z0:z1,y0:y1,x0:x1"`. Ranges are half-open (`z0` included, `z1` excluded),
+and either bound may be omitted to reach the volume edge:
+
+```bash
+vesuvius.predict --model_path hf://scrollprize/surface_recto \
+    --input_dir s3://vesuvius-challenge-open-data/PHercParis4/volumes/<volume>.zarr --input_anon \
+    --output_dir /tmp/logits \
+    --bbox "2000:2200,1000:1200,1000:1200"
+
+# open bounds: from z=1000 to the end, all of y, up to x=2000
+vesuvius.predict ... --bbox "1000:,:,:2000"
+```
+
+Patch coordinates stay in the global frame, so `blend_logits` and `finalize_outputs` need no
+extra flags — the merged output lands at the same absolute position it would have had in a
+full-volume run. The requested ROI is recorded in the logits store's `bbox` attribute.
+
+This matters most when streaming a remote volume: only the chunks intersecting the ROI are
+ever fetched, so a small region of a multi-terabyte scroll costs seconds of network instead
+of hours. It is also the practical way to iterate on a model, inspect one column of text, or
+reproduce a result on a laptop.
+
+Notes:
+- `--num_parts`/`--part_id` split the ROI's Z extent (not the whole volume), so distributed
+  runs stay balanced when a bbox is active.
+- An ROI smaller than the model patch size along an axis is grown to the patch size and
+  shifted back inside the volume, so the model always sees a full patch.
+- Bounds are clamped to the volume; a bbox entirely outside it is an error.
+
+### Blending in memory
+
+For a region that fits in RAM, `--blend_in_memory` replaces stages 1 and 2 (or
+`blend_and_finalize`) with one command. Instead of writing every patch's logits and reading
+them back, `predict` keeps the two running sums the blend needs, sum(w * logits) and sum(w),
+over the region the patches cover, and writes the finalized output when inference ends:
+
+```bash
+vesuvius.predict --model_path /path/to/model \
+    --input_dir s3://vesuvius-challenge-open-data/<scroll>/volumes/<volume>.zarr --input_anon \
+    --output_dir /tmp/unused --bbox "2000:2512,1000:1512,1000:1512" \
+    --blend_in_memory /tmp/final.zarr
+```
+
+The output has the same shape, chunks, dtype and values as
+`vesuvius.blend_and_finalize <output_dir> /tmp/final.zarr` on the logits the staged run would have
+written. Where patches overlap, the float32 sums are added in patch order rather than in the
+order the chunked blend visits them, so a voxel can occasionally differ by one uint8 step.
+
+Memory: `(num_classes + 1) * 4` bytes per voxel of the region the patches cover, which is the
+bbox grown by up to one patch on each side. For a 512³ bbox and the 2-class m7 surface model
+(192³ patches) that region is 862 × 863 × 863 voxels, 7.2 GiB. `predict` checks this against the
+available memory before inference starts.
+
+With `--num_parts N --part_id I`, each part blends one Z slab of that region instead: the chunk
+rows the patches cover are divided between the parts (the same chunk-row split
+`blend_and_finalize --num_parts` uses), part `I` runs every patch that reaches into its slab,
+including the ones that start in the slab below, and writes only the chunks of its slab. The parts
+are independent jobs writing disjoint chunks of the same output. Part 0 creates the output before
+inference; the others wait for it before starting inference. No part recreates the array when it
+finishes, so they can finish in any order and together write exactly what a single process would.
+Memory per part is
+`(num_classes + 1) * 4` bytes per voxel of its slab, so more parts need less RAM each; the cost is
+that a patch crossing a slab boundary is run by both parts.
+
+Split in-memory runs require `--blend_run_id`: generate it once and pass the same value to every
+part, including jobs submitted separately on other machines. Use a **new ID for every fresh run**.
+Part 0 publishes that ID only after output creation succeeds; an existing array from an older run
+does not release waiting parts. Do not run different runs concurrently against the same output.
+
+`--blend_wait_timeout SECONDS` controls how long a part waits for initialization (default: 300).
+Increase it for scheduler delays. It does not limit inference time, and a timeout stops that part
+before inference begins. Wait for all parts to finish before consuming the output; the run marker
+indicates initialization, not completion.
+
+```bash
+blend_run_id=$(python -c 'import uuid; print(uuid.uuid4())')
+for i in 0 1 2 3; do
+  vesuvius.predict ... --blend_in_memory /tmp/final.zarr --num_parts 4 --part_id "$i" \
+    --blend_run_id "$blend_run_id" --blend_wait_timeout 3600 &
+done; wait
+```
 
 ## Stage 2 — `vesuvius.blend_logits`
 
@@ -90,11 +179,11 @@ Finalize logits into probabilities or masks and optionally build a multiscale py
 ```bash
 vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
   --mode binary \
-  --threshold --threshold-value 0.3 \
-  --delete-intermediates
+  --threshold --threshold_value 0.3 \
+  --delete_intermediates
 ```
 
-`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold-value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
+`--threshold` toggles binarization on (default cutoff `0.5`). `--threshold_value T` overrides the cutoff with any value in `(0, 1)` and requires `--threshold`. The right cutoff is model-dependent and should come from validation — `0.3` above is illustrative, not a recommendation.
 
 ### Options
 
@@ -103,11 +192,11 @@ vesuvius.finalize_outputs /tmp/merged_logits.zarr /tmp/final_output.zarr \
 | `input_path` | Path to the blended logits Zarr (level `0` is the logits array).
 | `output_path` | Destination multiscale Zarr root.
 | `--mode` | `binary` (default), `multiclass`, or `surface_frame` (keeps 9-channel frame outputs; no thresholding).
-| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold-value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
-| `--threshold-value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
-| `--delete-intermediates` | Remove the source logits after a successful run.
-| `--chunk-size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
-| `--num-workers` | Worker processes for finalization (defaults to half of CPU cores).
+| `--threshold` | Binarize the probability map. In `binary` mode cuts at the probability given by `--threshold_value` (default `0.5`). In `multiclass` mode emits the argmax channel. Ignored in `surface_frame` mode.
+| `--threshold_value T` | Override the `--threshold` cutoff with `T` in `(0, 1)`. Requires `--threshold`. Binary mode only — rejected in `multiclass` since argmax ignores the cutoff.
+| `--delete_intermediates` | Remove the source logits after a successful run.
+| `--chunk_size` | Spatial chunk size for the output store (`Z,Y,X`). Defaults to the logits chunking.
+| `--num_workers` | Worker processes for finalization (defaults to half of CPU cores).
 | `--quiet` | Suppress verbose logging.
 
 Without `--threshold`, binary mode outputs a single softmax foreground channel; multiclass mode writes one channel per class plus an argmax channel. `surface_frame` mode bypasses thresholding entirely and stores orthonormal 9-channel frames in float32.
@@ -122,9 +211,9 @@ vesuvius.predict --model_path hf://scrollprize/surface_recto \
     --num_parts 4 \
     --part_id 0 \
     --device cuda:0 \
-    --zarr-compressor zstd \
-    --zarr-compression-level 3 \
-    --skip-empty-patches
+    --zarr_compressor zstd \
+    --zarr_compression_level 3 \
+    --skip_empty_patches
 
 # ...repeat for part_id 1,2,3 on other hosts...
 
@@ -133,11 +222,11 @@ vesuvius.blend_logits s3://vesuvius/tmp/logits s3://vesuvius/tmp/merged_logits.z
     --num_workers 32 \
     --chunk_size 256,256,256
 
-# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold-value 0.3 for a different cutoff)
+# 3. Finalize outputs (bare --threshold cuts at 0.5; add --threshold_value 0.3 for a different cutoff)
 vesuvius.finalize_outputs s3://vesuvius/tmp/merged_logits.zarr s3://vesuvius/output/final.zarr \
     --mode binary \
     --threshold \
-    --delete-intermediates
+    --delete_intermediates
 ```
 
 After finalization the destination Zarr contains a multiscale hierarchy (`0/`, `1/`, …) and a `metadata.json` file describing the inference run. Rechunk the output if you plan to serve it through a viewer that expects different chunk sizes.

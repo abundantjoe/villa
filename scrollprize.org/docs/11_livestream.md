@@ -1,6 +1,5 @@
 ---
 title: "Livestreams"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -36,7 +35,7 @@ hide_table_of_contents: true
   />
 </head>
 
-Be sure to check [Discord](https://discord.com/invite/uTfNwwecCQ), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
+Be sure to check [Discord](https://discord.gg/V4fJhvtaQn), [Substack](https://scrollprize.substack.com/), and [X](https://x.com/scrollprize) for livestream announcements!
 
 ### June 25, 2026 - Press Conference
 
@@ -58,7 +57,7 @@ On [X](https://x.com/natfriedman/status/1790379272873623743) and [our recording]
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/F5ak1pRaqVo?si=njl57GBT0wFUeTV2"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
-### Mar 15, 2024 - 2023 Grand Prize Celebration talks
+### Mar 16, 2024 - 2023 Grand Prize Celebration talks
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/uPefxeXfssA?si=d6IB7KLvskAxFGMc"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
@@ -70,7 +69,7 @@ On [X](https://twitter.com/i/spaces/1eaJbgEkEnrxX?s=20) and [our recording](http
 
 <iframe className="w-[100%] mb-4 aspect-video" src="https://www.youtube.com/embed/w0EsoAbRk1M"  title="YouTube video player" frameBorder="0" allow="accelerometer; autoplay; clipboard-write; encrypted-media; gyroscope; picture-in-picture; web-share" allowFullScreen></iframe>
 
-More videos from the symposium can be found [here](https://www.herculaneum.ox.ac.uk/node/262).
+More videos from the symposium can be found [here](https://web.archive.org/web/20241207094227/https://www.herculaneum.ox.ac.uk/node/262).
 
 ### May 25, 2023 - Papyrology team Q&A
 

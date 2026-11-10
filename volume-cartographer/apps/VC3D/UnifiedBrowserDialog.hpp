@@ -5,9 +5,10 @@
 #include <cstdint>
 #include <functional>
 
-#include "vc/core/util/RemoteAuth.hpp"
+#include <vc_reader/native/reader_types.hpp>
 
 class QButtonGroup;
+class QCheckBox;
 class QLabel;
 class QLineEdit;
 class QListWidget;
@@ -28,12 +29,7 @@ public:
     void setAcceptsFiles(bool v) { _acceptsFiles = v; }
     void setAcceptsDirs(bool v) { _acceptsDirs = v; }
     void setLocalNameFilters(const QStringList& globs) { _localFilters = globs; }
-    void setStartUri(const QString& uri);
-
-    using AuthResolver = std::function<bool(const QString& url,
-                                             vc::HttpAuth* out,
-                                             QString* err)>;
-    void setAuthResolver(AuthResolver r) { _authResolver = std::move(r); }
+    void setStartUri(const QString& uri, bool isFile = false);
 
     QString selectedUri() const { return _selectedUri; }
 
@@ -46,13 +42,13 @@ private slots:
     void onOpenClicked();
 
 private:
+    bool eventFilter(QObject* watched, QEvent* event) override;
     void navigateLocal(const QString& absDir);
     void navigateRemote(const QString& urlPrefix);
-    bool ensureRemoteAuth(const QString& probeUrl);
     static Mode detectModeFromUri(const QString& uri);
     QString currentUri() const;
-    QString itemUri(const QListWidgetItem* item) const;
     bool isAcceptableUri(const QString& uri, bool isFile) const;
+    void handleTypedPath(const QString& typed, bool acceptDirectories);
 
     Mode _mode = Mode::Local;
     bool _acceptsFiles = true;
@@ -62,11 +58,8 @@ private:
 
     QString _currentLocalDir;
     QString _currentRemoteUrl;
+    bool _pathBarEdited = false;
 
-    vc::HttpAuth _auth;
-    bool _authResolved = false;
-    QString _authProbeUrl;
-    AuthResolver _authResolver;
 
     QRadioButton* _localRadio{nullptr};
     QRadioButton* _remoteRadio{nullptr};
@@ -77,6 +70,7 @@ private:
     QListWidget* _list{nullptr};
     QLabel* _status{nullptr};
     QPushButton* _openButton{nullptr};
+    QCheckBox* _showHidden{nullptr};
 
     std::uint64_t _listSeq{0};
 };

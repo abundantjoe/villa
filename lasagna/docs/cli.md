@@ -14,7 +14,6 @@ Each part provides `add_args(parser)` + `from_args(args)`:
   - `--winding-volume` optional winding volume zarr path
   - `--cuda-gridsample` enable custom CUDA uint8 sampling kernel
   - `--erode-valid-mask` erode valid mask by N pixels
-  - `--sparse-prefetch-backend` sparse streaming prefetcher (`tensorstore` default; `python-zarr` keeps the zarr fallback path)
 
 - **model**: [`cli_model.py`](../cli_model.py)
   - `--mesh-step` (default 100) height step in fullres voxels
@@ -68,3 +67,23 @@ Special config keys consumed by fit.py/fit_service.py before stage parsing:
 - `flatten` optimizes a 2D flattening over one external tifxyz source. The default [`configs/flatten.json`](../configs/flatten.json) keeps the existing inverse-map Adam path. [`configs/flatten_forward.json`](../configs/flatten_forward.json) sets `flatten_solver: "forward"` to optimize source-vertex UVs with the same pyramid/Adam stages, then invert that UV map at export. Use exactly one `external_surfaces` entry supplied by VC3D or the calling config.
 
 For VC3D integration, VC3D is transport only: it sends the selected tifxyz/model data and UI state it has available. `fit_service.py` / `fit.py` decide whether those fields are consumed as `tifxyz-init`, `external_surfaces`, approval-inpaint input, model checkpoint input, or ignored as surplus transport data.
+
+### Stored surfaces (VC3D)
+
+VC3D works on surfaces in a VC object store, never on tifxyz directories. Start the service with `--store LOCATION`:
+a store file, or the endpoint of the `vc_object_server` that hosts the store (`http://host:8750`, e.g. through an SSH
+tunnel), so a service on another machine works on the store VC3D attached; `/health` reports its `store_uuid`. VC3D
+starts its internal service on its attached store (file or endpoint) with `--shared-store`. A VC3D request names that store
+(`store_uuid`) and the volume it works in (`volume_uuid`); its surface references are
+`{"type": "surface", "uuid": ..., "generation": ..., "version": ...}` (the version optional) in `external_surfaces`, the atlas
+`base.ref`, and `model` (the model checkpoint a fit published with that surface: its `model.pt` artifact, read as a
+local copy in the service's object cache, `<object store dir>/artifacts/<sha256>/model.pt`).
+The fit reads the surfaces directly (`fit.py --store --volume-uuid`,
+references `vcobj:<uuid>[@<generation>/<version>]`), and the export creates new surfaces in the store
+(`fit2tifxyz.py --store LOCATION --volume-uuid UUID [--tag TAG]`): the `d` and flow-gate channels are surface
+channels, `model.pt`/`model_params.json`/mask debug files are published as the surface's artifacts (written to a
+temporary directory, then stored with the surface's version in one checked request), and the
+correction-point and atlas-control results are point collections attached to the surface (record meta `role`
+`lasagna_corr_points_results` / `lasagna_atlas_control_points_results`, an `attachment` relationship that is
+never a graph link). Provenance lists the stored surfaces the job read. The job reports the new surfaces'
+UUIDs as `output_surfaces`. Command-line fits keep reading and writing tifxyz directories.

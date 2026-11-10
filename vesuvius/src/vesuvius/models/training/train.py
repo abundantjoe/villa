@@ -10,6 +10,7 @@ import torch
 import torch.distributed as dist
 from torch.nn.parallel import DistributedDataParallel as DDP
 import torch.nn.functional as F
+from vesuvius.models.augmentation.pipelines import sample_seed
 from vesuvius.models.training.lr_schedulers import get_scheduler
 from torch.utils.data import DataLoader, SubsetRandomSampler, Subset, WeightedRandomSampler
 from torch.utils.data.distributed import DistributedSampler
@@ -30,6 +31,7 @@ from vesuvius.models.training.save_checkpoint import (
 )
 
 from vesuvius.models.utilities.load_checkpoint import load_checkpoint
+from vesuvius.models.utilities.compilation import has_triton
 from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.models.utilities.s3_utils import detect_s3_paths, setup_multiprocessing_for_s3
 from vesuvius.models.training.wandb_logging import save_train_val_filenames
@@ -40,6 +42,22 @@ from vesuvius.models.evaluation.voi import VOIMetric
 from contextlib import nullcontext
 from collections import deque, defaultdict
 import gc
+
+
+def _print_batch_item(name, value, indent=""):
+    if isinstance(value, dict):
+        print(f"{indent}{name}: (dictionary with keys: {list(value.keys())})")
+        for key, item in value.items():
+            _print_batch_item(key, item, indent + "  ")
+    elif isinstance(value, torch.Tensor):
+        summary = f"{value.dtype}, {value.shape}"
+        if value.numel():
+            summary += f", min {value.min()} max {value.max()}"
+        else:
+            summary += ", empty"
+        print(f"{indent}{name}: {summary}")
+    else:
+        print(f"{indent}{name}: {value}")
 
 
 
@@ -136,10 +154,6 @@ class BaseTrainer:
         # Default AMP dtype; resolved during training initialization
         self.amp_dtype = torch.float16
         self.amp_dtype_str = 'float16'
-        self._profile_augmentations = bool(getattr(self.mgr, 'profile_augmentations', False))
-        self._augmentation_names = None
-        self._epoch_aug_time = None
-        self._epoch_aug_count = None
         self._on_device_transforms = None
         ema_cfg = getattr(self.mgr, 'ema_config', {}) or {}
         self.ema_enabled = bool(getattr(self.mgr, 'ema_enabled', ema_cfg.get('enabled', False)))
@@ -303,6 +317,18 @@ class BaseTrainer:
                 print("Compile policy set to 'off'; using eager mode.")
             return model
 
+        # torch.compile's inductor backend needs triton on CUDA, but compilation
+        # is lazy: without this check the failure escapes the try/except below
+        # and surfaces as TritonMissing at the first forward pass (e.g. on
+        # Windows, where CUDA wheels do not bundle triton).
+        if not has_triton():
+            if not self.is_distributed or self.rank == 0:
+                print(
+                    "torch.compile requires a working triton installation, "
+                    "which is unavailable in this environment; using eager mode."
+                )
+            return model
+
         compile_start = perf_counter()
         if not self.is_distributed or self.rank == 0:
             print(f"Compiling model with policy '{compile_policy}'")
@@ -393,9 +419,22 @@ class BaseTrainer:
         print(f"Using ZarrDataset ({'training' if is_training else 'validation'})")
         return dataset
 
-    def _build_dataset_for_mgr(self, mgr, *, is_training: bool) -> ZarrDataset:
-        """Build a ZarrDataset for the given config manager."""
-        return ZarrDataset(mgr=mgr, is_training=is_training)
+    def _build_dataset_for_mgr(self, mgr, *, is_training: bool):
+        """Build a dataset for the given config manager.
+
+        Dispatches on ``mgr.dataset_config.dataset_type`` (default ``"zarr"``).
+        """
+        ds_cfg = getattr(mgr, "dataset_config", {}) or {}
+        dataset_type = str(ds_cfg.get("dataset_type", "zarr")).strip().lower()
+        if dataset_type == "cross_frame":
+            from vesuvius.models.datasets.cross_frame_dataset import CrossFrameZarrDataset
+
+            return CrossFrameZarrDataset(mgr=mgr, is_training=is_training)
+        if dataset_type == "zarr":
+            return ZarrDataset(mgr=mgr, is_training=is_training)
+        raise ValueError(
+            f"Unknown dataset_type '{dataset_type}'. Supported: 'zarr', 'cross_frame'."
+        )
 
     # --- hooks for subclasses --------------------------------------------------------------- #
 
@@ -406,72 +445,6 @@ class BaseTrainer:
     def _prepare_batch(self, batch: dict, *, is_training: bool) -> dict:
         """Allow subclasses to inject additional data into a batch dictionary."""
         return batch
-
-    def _reset_epoch_aug_timers(self) -> None:
-        if not self._profile_augmentations:
-            return
-        self._epoch_aug_time = defaultdict(float)
-        self._epoch_aug_count = defaultdict(int)
-
-    def _reduce_aug_value(self, value):
-        if torch.is_tensor(value):
-            return float(value.sum().item()), int(value.numel())
-        if isinstance(value, np.ndarray):
-            return float(value.sum()), int(value.size)
-        if isinstance(value, (list, tuple)):
-            total = 0.0
-            count = 0
-            for item in value:
-                t, c = self._reduce_aug_value(item)
-                total += t
-                count += c
-            return total, count
-        try:
-            return float(value), 1
-        except (TypeError, ValueError):
-            return 0.0, 0
-
-    def _accumulate_aug_timers(self, data_dict: dict) -> None:
-        if not self._profile_augmentations:
-            return
-        if not data_dict:
-            return
-        perf = data_dict.get('_aug_perf')
-        if perf is None:
-            return
-        if isinstance(perf, list):
-            for item in perf:
-                if isinstance(item, dict):
-                    self._accumulate_aug_timers({'_aug_perf': item})
-            return
-        if not isinstance(perf, dict):
-            return
-        if self._epoch_aug_time is None or self._epoch_aug_count is None:
-            self._reset_epoch_aug_timers()
-        for name, value in perf.items():
-            total, count = self._reduce_aug_value(value)
-            if count == 0:
-                continue
-            self._epoch_aug_time[name] += total
-            self._epoch_aug_count[name] += count
-
-    def _report_epoch_aug_timers(self, epoch: int) -> None:
-        if not self._profile_augmentations:
-            return
-        if not self._epoch_aug_time:
-            return
-        if self.is_distributed and self.rank != 0:
-            return
-
-        total_time = sum(self._epoch_aug_time.values())
-        if total_time <= 0:
-            return
-        print(f"\n[Perf] Augmentation timing for epoch {epoch + 1}: total={total_time:.2f}s")
-        for name, elapsed in sorted(self._epoch_aug_time.items(), key=lambda kv: kv[1], reverse=True):
-            count = max(1, self._epoch_aug_count.get(name, 1))
-            avg_ms = (elapsed / count) * 1000.0
-            pct = (elapsed / total_time) * 100.0 if total_time > 0 else 0.0
-            print(f"  {name}: {elapsed:.2f}s ({pct:.1f}%) avg={avg_ms:.2f}ms/sample")
 
     def _should_include_target_in_loss(self, target_name: str) -> bool:
         if target_name == 'is_unlabeled':
@@ -1285,20 +1258,29 @@ class BaseTrainer:
         scheduler_type = getattr(self.mgr, 'scheduler', 'poly')
         scheduler_kwargs = getattr(self.mgr, 'scheduler_kwargs', {})
 
+        # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
+        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup', 'diffusers_cosine_warmup']
+        is_per_iteration = scheduler_type.lower() in per_iter_schedulers
+
+        # These are stepped once per optimizer step, so their horizon is a step
+        # count; handing them max_epoch makes the schedule end steps_per_epoch
+        # times too early and then repeat.
+        steps_per_epoch = getattr(self, '_steps_per_epoch', None)
+        max_steps = self.mgr.max_epoch
+        if is_per_iteration and steps_per_epoch:
+            max_steps = self.mgr.max_epoch * steps_per_epoch
+
         scheduler = get_scheduler(
             scheduler_type=scheduler_type,
             optimizer=optimizer,
             initial_lr=self.mgr.initial_lr,
-            max_steps=self.mgr.max_epoch,
+            max_steps=max_steps,
             **scheduler_kwargs
         )
 
-        print(f"Using {scheduler_type} learning rate scheduler")
-        
-        # set some per iteration schedulers so we can easily step them once per iter vs once per epoch
-        per_iter_schedulers = ['onecycle', 'cyclic', 'cosine_warmup', 'diffusers_cosine_warmup']
-        is_per_iteration = scheduler_type.lower() in per_iter_schedulers
-        
+        print(f"Using {scheduler_type} learning rate scheduler over {max_steps} "
+              f"{'steps' if is_per_iteration else 'epochs'}")
+
         return scheduler, is_per_iteration
 
     # --- scaler --- #
@@ -1548,8 +1530,6 @@ class BaseTrainer:
         train_dataset = self._configure_dataset(is_training=True)
         self._record_startup_timing("train_dataset_init", perf_counter() - stage_start)
         self._train_dataset = train_dataset
-        if self._profile_augmentations:
-            self._augmentation_names = getattr(train_dataset, '_augmentation_names', None)
 
         if hasattr(self.mgr, 'val_data_path') and self.mgr.val_data_path is not None:
             from copy import deepcopy
@@ -1589,8 +1569,6 @@ class BaseTrainer:
         self._ds_weights = None
         stage_start = perf_counter()
         optimizer = self._get_optimizer(model)
-        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
-        self._is_per_iteration_scheduler = is_per_iteration_scheduler  # Store for later use
 
         model.apply(InitWeights_He(neg_slope=0.2))
         model = model.to(self.device)
@@ -1639,6 +1617,15 @@ class BaseTrainer:
         train_dataloader, val_dataloader, train_indices, val_indices = self._configure_dataloaders(train_dataset,
                                                                                                    val_dataset)
         self._record_startup_timing("dataloader_build", perf_counter() - stage_start)
+
+        # Built here rather than beside the optimizer: a per-iteration schedule
+        # needs to know how many optimizer steps an epoch actually takes.
+        steps_per_epoch = len(train_dataloader)
+        if getattr(self.mgr, 'max_steps_per_epoch', None):
+            steps_per_epoch = min(steps_per_epoch, self.mgr.max_steps_per_epoch)
+        self._steps_per_epoch = steps_per_epoch
+        scheduler, is_per_iteration_scheduler = self._get_scheduler(optimizer)
+        self._is_per_iteration_scheduler = is_per_iteration_scheduler
 
         ckpt_out_base = str(self.mgr.ckpt_out_base)
         os.makedirs(ckpt_out_base, exist_ok=True)
@@ -1813,7 +1800,7 @@ class BaseTrainer:
                     target_tensor = targets_dict[target_name]
                     target_info = self.mgr.targets.get(target_name, {})
                     ignore_label = target_info.get("ignore_label", target_info.get("ignore_index", target_info.get("ignore_value")))
-                    targets_dict[target_name][i:i + 1] = dilate_label_batch_with_cucim(
+                    targets_dict[target_name][i:i + 1] = dilate_label_batch(
                         target_tensor[i:i + 1],
                         padding_mask[i:i + 1],
                         distance,
@@ -1834,39 +1821,6 @@ class BaseTrainer:
         
         return inputs, targets_dict, outputs
 
-    def _apply_transforms_per_sample(self, tfm, batched_dict):
-        """Apply a ComposeTransforms pipeline to each sample in a batched dict.
-        Expects tensors shaped [B, C, ...]. Returns a new batched dict with tensors stacked on dim 0.
-        Non-tensor fields that are lists/tuples of length B are passed per-sample and returned as lists.
-        """
-        if 'image' not in batched_dict or not isinstance(batched_dict['image'], torch.Tensor):
-            return batched_dict
-        B = batched_dict['image'].shape[0]
-        out_accum = {}
-        perf_names = self._augmentation_names if (self._profile_augmentations and self._augmentation_names) else None
-        for b in range(B):
-            sample = {}
-            for k, v in batched_dict.items():
-                if isinstance(v, torch.Tensor) and v.shape[0] == B:
-                    sample[k] = v[b]
-                elif isinstance(v, (list, tuple)) and len(v) == B:
-                    sample[k] = v[b]
-                else:
-                    sample[k] = v
-            if perf_names is not None:
-                sample['_aug_perf'] = {name: 0.0 for name in perf_names}
-            sample_out = tfm(**sample)
-            for k, v in sample_out.items():
-                out_accum.setdefault(k, []).append(v)
-
-        batched_out = {}
-        for k, vals in out_accum.items():
-            if isinstance(vals[0], torch.Tensor):
-                batched_out[k] = torch.stack(vals, dim=0)
-            else:
-                batched_out[k] = vals
-        return batched_out
-
     def _train_step(self, model, data_dict, loss_fns, use_amp, autocast_ctx, epoch, step, verbose=False,
                     scaler=None, optimizer=None, num_iters=None, grad_accumulate_n=1):
         """Execute a single training step including gradient updates."""
@@ -1877,13 +1831,7 @@ class BaseTrainer:
         if epoch == 0 and step == 0 and verbose:
             print("Items from the first batch -- Double check that your shapes and values are expected:")
             for item, val in data_dict.items():
-                if isinstance(val, dict):
-                    print(f"{item}: (dictionary with keys: {list(val.keys())})")
-                    for sub_key, sub_val in val.items():
-                        print(
-                            f"  {sub_key}: {sub_val.dtype}, {sub_val.shape}, min {sub_val.min()} max {sub_val.max()}")
-                else:
-                    print(f"{item}: {val.dtype}, {val.shape}, min {val.min()} max {val.max()}")
+                _print_batch_item(item, val)
 
         # Optionally run augmentations on the model device instead of Dataset workers
         if getattr(self.mgr, 'augment_on_device', False) and getattr(self, '_train_dataset', None) is not None:
@@ -1895,15 +1843,11 @@ class BaseTrainer:
                 for k, v in data_dict.items():
                     dd[k] = v.to(self.device, non_blocking=(self.device.type == 'cuda')) if isinstance(v, torch.Tensor) else v
 
-                # Apply transforms per-sample (transforms expect unbatched (C, ...) tensors)
-                try:
-                    data_for_forward = self._apply_transforms_per_sample(tfm, dd)
-                except Exception as e:
-                    raise RuntimeError(f"On-device augmentation failed: {e}")
+                seeds = [sample_seed(index) for index in range(dd['image'].shape[0])]
+                data_for_forward = tfm.batch(dd, seeds=seeds, device=self.device)
         else:
             data_for_forward = data_dict
 
-        self._accumulate_aug_timers(data_for_forward)
 
         should_time_first_step = self.startup_timing and epoch == 0 and step == 0
         if should_time_first_step:
@@ -2179,7 +2123,6 @@ class BaseTrainer:
             else:
                 num_iters = len(train_dataloader)
 
-            self._reset_epoch_aug_timers()
             epoch_losses = {t_name: [] for t_name in self.mgr.targets}
             train_iter = iter(train_dataloader)
             # Progress bar for training iterations
@@ -2312,7 +2255,6 @@ class BaseTrainer:
             if pbar is not None:
                 pbar.close()
 
-            self._report_epoch_aug_timers(epoch)
 
             if not is_per_iteration_scheduler and not step_scheduler_at_epoch_begin:
                 scheduler.step()

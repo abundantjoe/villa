@@ -1,7 +1,6 @@
 ---
 title: "Tutorial: Segmentation"
 sidebar_label: "Segmentation"
-hide_table_of_contents: true
 ---
 
 <head>
@@ -38,9 +37,13 @@ hide_table_of_contents: true
 </head>
 
 
-import { TutorialsTop } from '@site/src/components/TutorialsTop';
 
-<TutorialsTop highlightId={4} />
+
+:::warning[ARCHIVED]
+
+This page has been archived and is no longer maintained. It describes an earlier generation of the Vesuvius Challenge pipeline — tools, data layouts, and results referenced here may have been superseded. See [Open Problems](2026_open_problems) for the current state of the pipeline and [Prizes](prizes) for what is open today.
+
+:::
 
 *Last updated: February 20, 2025*
 
@@ -55,11 +58,13 @@ import TOCInline from '@theme/TOCInline';
 
 
 ### Installation Instructions
-Due to a complex set of dependencies, it is *highly* recommended to use the docker image. We host an up-to-date image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
+Due to a complex set of dependencies, it is *highly* recommended to use a prebuilt package: the downloads on the [releases page](https://github.com/ScrollPrize/villa/releases) (see [Installing VC3D](/tutorial_VC3D#installing-vc3d); on Linux a single AppImage contains VC3D and the `vc_*` command-line tools) or the docker image. We host an image on the [github container registry](https://github.com/ScrollPrize/villa/pkgs/container/villa%2Fvolume-cartographer) which can be pulled with a simple command :
 
 ```bash
 docker pull ghcr.io/scrollprize/villa/volume-cartographer:edge
 ```
+
+The `edge` and `main` image tags currently carry the build of 2026-05-13 (see [issue #1588](https://github.com/ScrollPrize/villa/issues/1588)); the `latest` release downloads are rebuilt from `main`.
 
 If you want to install vc3d from source, the easiest path is to look at the [Dockerfile](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/Dockerfile) (and the shared [install_build_deps.sh](https://github.com/ScrollPrize/villa/blob/main/volume-cartographer/scripts/install_build_deps.sh) it uses) and adapt for your environment. Building from source presently requires a *nix like environment for atomic rename support. If you are on Windows, either use the docker image or WSL. 
 
@@ -237,7 +242,7 @@ _Widget for creating initial segmentations which can be used for traces or later
 
 
 
-### Creating an inital segmentation 
+### Creating an initial segmentation 
 
 For all growth or editing actions, you'll need an initial mesh to start from. This can be done either through the GUI or the CLI. 
 
@@ -273,7 +278,7 @@ An existing segmentation can be semi-automatically grown utlizing the tracer opt
 
 ### Correcting errors in a segmentation
 
-There are a few ways to fix errors which occured during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
+There are a few ways to fix errors which occurred during segmentation. All parameters controlling these actions are in the `segmentation` widget , and have tooltips which will appear on mouse hover.
 
 *Deforming/manipulating the mesh manually by left-clicking or dragging near it* 
 

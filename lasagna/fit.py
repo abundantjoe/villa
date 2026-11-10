@@ -8,6 +8,7 @@ from pathlib import Path
 
 import torch
 import torch.nn.functional as F
+from dtypes import torch_float_hi
 
 import cli_data
 import cli_json
@@ -923,13 +924,25 @@ def _apply_cylinder_prepare_model_step(mdl: "model.Model3D", model_step: float |
 		mdl.cyl_shell_current_height_step = step
 
 
-def _require_manifest_init_shell_dir(prep_params: dict) -> str:
-	value = prep_params.get("init_shell_dir", None)
+def _require_init_shell_dir(
+	prep_params: dict, *, override: str | None = None
+) -> str:
+	value = (
+		override
+		if isinstance(override, str) and override.strip()
+		else prep_params.get("init_shell_dir", None)
+	)
 	if value is None:
-		raise ValueError("shell-dir-crop init requires .lasagna.json key 'init_shell_dir'")
+		raise ValueError(
+			"shell-dir-crop init requires --init-shell-dir or "
+			".lasagna.json key 'init_shell_dir'"
+		)
 	if not isinstance(value, str) or not value.strip():
-		raise ValueError("shell-dir-crop init requires non-empty string .lasagna.json key 'init_shell_dir'")
-	return str(value)
+		raise ValueError(
+			"shell-dir-crop init requires a non-empty --init-shell-dir or "
+			".lasagna.json key 'init_shell_dir'"
+		)
+	return value.strip()
 
 
 def _parse_corr_points(obj: dict, device: torch.device) -> fit_data.CorrPoints3D | None:
@@ -1021,6 +1034,13 @@ def _build_parser() -> argparse.ArgumentParser:
 	p.add_argument("--approval-inpaint-output-mask-dilate", type=int, default=3,
 		help="Output-mask dilation radius in exported mesh vertices")
 	p.add_argument("--approval-inpaint-tifxyz", default=None, help=argparse.SUPPRESS)
+	p.add_argument("--store", default=None,
+		help="VC object store holding the stored surfaces (vcobj:<uuid>[@<generation>/<version>]) the fit reads: a store "
+			 "file or a vc_object_server endpoint (http://...)")
+	p.add_argument("--volume-uuid", default=None,
+		help="Volume whose voxels stored-surface coordinates are read in")
+	p.add_argument("--voxel-scale", type=float, default=1.0,
+		help="Scale of those voxels to the volume's own, 2^-N at working level N")
 	p.add_argument("--tifxyz-flow-gate-channels", action=argparse.BooleanOptionalAction, default=False,
 		help="Store flow-gate component maps in the final checkpoint for tifxyz export")
 	p.add_argument("--progress", action="store_true", default=False,
@@ -1108,18 +1128,18 @@ def _dummy_flatten_data() -> fit_data.FitData3D:
 	)
 
 
-def _mesh_step_from_tifxyz_meta(meta: dict, fallback: int) -> int:
+def _flatten_source_step_from_tifxyz_meta(meta: dict, fallback: int) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
-		return max(1, int(round(1.0 / float(scale[0]))))
-	return max(1, int(fallback))
+		return 1.0 / float(scale[0])
+	return float(max(1, int(fallback)))
 
 
-def _scale_from_tifxyz_meta(meta: dict, mesh_step: int) -> float:
+def _scale_from_tifxyz_meta(meta: dict, source_step: float) -> float:
 	scale = meta.get("scale") if isinstance(meta, dict) else None
 	if isinstance(scale, list) and scale and float(scale[0]) > 0.0:
 		return float(scale[0])
-	return 1.0 / float(max(1, int(mesh_step)))
+	return 1.0 / float(source_step)
 
 
 def _shape_list(shape: tuple[int, int, int] | None) -> list[int] | None:
@@ -1152,9 +1172,12 @@ def _load_scaled_tifxyz(
 	base_shape_zyx: tuple[int, int, int] | None,
 	request_shape_zyx: tuple[int, int, int] | None,
 	path_label: str,
+	store: str | None = None,
+	volume: str | None = None,
+	target_scale: float = 1.0,
 ):
 	from tifxyz_io import load_tifxyz
-	xyz, valid, meta = load_tifxyz(path, device=device)
+	xyz, valid, meta = load_tifxyz(path, device=device, store=store, volume=volume, target_scale=target_scale)
 	scale = _tifxyz_scale_to_base(
 		meta,
 		base_shape_zyx=base_shape_zyx,
@@ -1172,46 +1195,44 @@ def _load_scaled_tifxyz(
 	return xyz, valid, meta, scale
 
 
-def _scaled_approval_tifxyz_path(
+def _scaled_approval_surface(
 	path: str,
 	*,
-	tmp_parent: Path | None,
 	base_shape_zyx: tuple[int, int, int] | None,
 	request_shape_zyx: tuple[int, int, int] | None,
-) -> str:
-	meta = volume_scale.read_tifxyz_meta(path)
+	store: str | None,
+	volume: str | None,
+	target_scale: float = 1.0,
+):
+	from approval_inpaint import load_approval_surface
+	surface = load_approval_surface(path, store=store, volume=volume, target_scale=target_scale)
 	scale = _tifxyz_scale_to_base(
-		meta,
+		surface.meta,
 		base_shape_zyx=base_shape_zyx,
 		request_shape_zyx=request_shape_zyx,
 		path_label="approval-inpaint tifxyz",
 	)
 	if scale.is_identity:
-		return path
-	parent = tmp_parent if tmp_parent is not None else Path(path).parent
-	parent.mkdir(parents=True, exist_ok=True)
-	dst = parent / "approval_inpaint_base_scale.tifxyz"
-	volume_scale.copy_scaled_tifxyz_dir(
-		path,
-		dst,
-		factor=scale.factor,
-		base_shape_zyx=base_shape_zyx,
-	)
+		return surface
 	print(
 		f"[fit] approval-inpaint tifxyz scaled by {scale.factor:.9g} "
 		f"from source_shape={_shape_list(scale.source_shape_zyx)} "
 		f"to base_shape={_shape_list(scale.base_shape_zyx)}",
 		flush=True,
 	)
-	return str(dst)
+	return surface.scaled(scale.factor, base_shape_zyx=base_shape_zyx)
 
 
-def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict) -> None:
+def _flatten_checkpoint_state(*, mdl: model.Model3D, fit_config: dict) -> dict:
+	"""Build the flatten checkpoint state dict (runs the full UV inversion)."""
 	st = dict(mdl.state_dict())
 	for k in [k for k in st if k.startswith("mesh_ms.")]:
 		del st[k]
+	for k in ("conn_offsets", "cyl_shell_w_offsets", "amp", "bias"):
+		st.pop(k, None)
 	with torch.no_grad():
-		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
+		map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
+			inversion_output_device=torch.device("cpu"))
 		sentinel = torch.full_like(xyz, -1.0)
 		xyz = torch.where(point_mask.unsqueeze(0).unsqueeze(-1), xyz, sentinel)
 		st["mesh_flat"] = xyz.permute(3, 0, 1, 2).detach().cpu()
@@ -1223,6 +1244,12 @@ def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData
 		params["lasagna_base_shape_zyx"] = list(fit_config["lasagna_base_shape_zyx"])
 	st["_model_params_"] = params
 	st["_fit_config_"] = fit_config
+	return st
+
+
+def _save_flatten_model(path: str, *, mdl: model.Model3D, data: fit_data.FitData3D, fit_config: dict,
+						state: dict | None = None) -> None:
+	st = state if state is not None else _flatten_checkpoint_state(mdl=mdl, fit_config=fit_config)
 	torch.save(st, path)
 
 
@@ -1235,26 +1262,42 @@ def _export_flatten_result(
 	voxel_size_um: float | None,
 	fit_config: dict,
 	model_source: Path | None,
+	state: dict | None = None,
 ) -> None:
 	import numpy as np
 	import fit2tifxyz
 
 	out_dir.mkdir(parents=True, exist_ok=True)
-	with torch.no_grad():
-		_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current()
-	xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
-	mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
-	x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
-	y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
-	z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
-	mesh_step = 1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step)
-	area = fit2tifxyz._get_area(x, y, z, mesh_step, voxel_size_um)
+	if state is not None:
+		# The checkpoint state already carries the inverted output-grid mesh
+		# with the -1 sentinel applied at invalid points; reusing it skips a
+		# second, identical full-grid inversion.
+		mesh_np = state["mesh_flat"].detach().cpu().numpy().astype(np.float32, copy=False)
+		x = mesh_np[0, 0]
+		y = mesh_np[1, 0]
+		z = mesh_np[2, 0]
+	else:
+		with torch.no_grad():
+			_map_yx, xyz, point_mask, _quad_mask = mdl._flatten_sample_current(
+				inversion_output_device=torch.device("cpu"))
+		xyz_np = xyz[0].detach().cpu().numpy().astype(np.float32, copy=False)
+		mask_np = point_mask.detach().cpu().numpy().astype(bool, copy=False)
+		x = np.where(mask_np, xyz_np[..., 0], -1.0).astype(np.float32, copy=False)
+		y = np.where(mask_np, xyz_np[..., 1], -1.0).astype(np.float32, copy=False)
+		z = np.where(mask_np, xyz_np[..., 2], -1.0).astype(np.float32, copy=False)
+	output_step = (
+		float(mdl.params.flatten_output_step)
+		if mdl.params.flatten_output_step is not None
+		else (1.0 / float(scale) if float(scale) > 0.0 else float(mdl.params.mesh_step))
+	)
+	output_scale = 1.0 / output_step
+	area = fit2tifxyz._get_area(x, y, z, output_step, voxel_size_um)
 	fit2tifxyz._write_tifxyz(
 		out_dir=out_dir / "flatten.tifxyz",
 		x=x,
 		y=y,
 		z=z,
-		scale=scale,
+		scale=output_scale,
 		model_source=model_source,
 		fit_config=fit_config,
 		area=area,
@@ -1266,6 +1309,16 @@ def _export_flatten_result(
 	fit2tifxyz._print_area(area)
 
 
+def _initial_flatten_state(
+	mdl: model.Model3D,
+	*,
+	invert_forward: bool = True,
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+	if mdl.flatten_direction == "forward" and not invert_forward:
+		return mdl._flatten_forward_current()
+	return mdl._flatten_sample_current()
+
+
 def _run_flatten_mode(
 	*,
 	cfg: dict,
@@ -1275,6 +1328,8 @@ def _run_flatten_mode(
 	opt_cfg: cli_opt.OptConfig,
 	progress_enabled: bool,
 	out_dir: str | None,
+	lifecycle_fn=None,
+	state_sink: dict | None = None,
 ) -> int:
 	ext_surfaces_cfg = cfg.get("external_surfaces", None)
 	if not isinstance(ext_surfaces_cfg, list) or len(ext_surfaces_cfg) != 1:
@@ -1289,9 +1344,10 @@ def _run_flatten_mode(
 
 	device = torch.device(str(getattr(args, "device", "cuda")))
 	from tifxyz_io import load_tifxyz
-	xyz, valid, meta = load_tifxyz(str(ext0["path"]), device=device)
-	mesh_step = _mesh_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
-	scale = _scale_from_tifxyz_meta(meta, mesh_step)
+	xyz, valid, meta = load_tifxyz(
+		str(ext0["path"]), device=device, store=args.store, volume=args.volume_uuid, target_scale=args.voxel_scale)
+	source_step = _flatten_source_step_from_tifxyz_meta(meta, model_cfg.mesh_step)
+	scale = _scale_from_tifxyz_meta(meta, source_step)
 
 	stage_cfg = copy.deepcopy(cfg)
 	for key in ("external_surfaces", "tifxyz", "voxel_size_um", "corr_points"):
@@ -1311,14 +1367,25 @@ def _run_flatten_mode(
 		"flatten_output_margin",
 		flatten_args.get("flatten_forward_output_margin", 0.10),
 	))
+	flatten_output_step = float(flatten_args.get(
+		"flatten_output_step",
+		source_step,
+	))
+	flatten_initial_uv_rescale = _truthy_config_bool(
+		flatten_args.get(
+			"flatten_initial_uv_rescale",
+			flatten_args.get("flatten_initial_match_output_step", True),
+		)
+	)
 	filter_source_angles = _truthy_config_bool(flatten_args.get("flatten_filter_source_angles", True))
 	filter_angle_deg = float(flatten_args.get("flatten_filter_angle_deg", 90.0))
 	filter_radius = int(flatten_args.get("flatten_filter_radius", 2))
+	initial_inversion = _truthy_config_bool(flatten_args.get("flatten_initial_inversion", True))
 	mdl = model.Model3D.from_flatten_tifxyz_crop(
 		xyz,
 		valid,
 		device=device,
-		mesh_step=mesh_step,
+		mesh_step=source_step,
 		winding_step=model_cfg.winding_step,
 		subsample_mesh=model_cfg.subsample_mesh,
 		subsample_winding=model_cfg.subsample_winding,
@@ -1327,6 +1394,8 @@ def _run_flatten_mode(
 		flatten_filter_radius=filter_radius,
 		flatten_direction=flatten_direction,
 		flatten_output_margin=flatten_output_margin,
+		flatten_output_step=flatten_output_step,
+		flatten_initial_uv_rescale=flatten_initial_uv_rescale,
 	)
 	data = _dummy_flatten_data()
 
@@ -1337,7 +1406,10 @@ def _run_flatten_mode(
 		f"[fit] model-init=flatten solver={flatten_direction} source={ext0['path']} "
 		f"shape={tuple(xyz.shape)} valid={int(valid.sum())}/{valid.numel()} "
 		f"model_shape={mdl.mesh_h}x{mdl.mesh_w} "
-		f"mesh_step={mesh_step} target_step={float(mdl.flatten_target_step.detach().cpu()):.6g}",
+		f"source_step={source_step:.6g} output_step={flatten_output_step:.6g} "
+		f"measured_source_step={float(mdl.flatten_measured_source_step.detach().cpu()):.6g} "
+		f"initial_uv_rescale={int(flatten_initial_uv_rescale)} "
+		f"flatten_correction_scales={len(mdl.flatten_map_ms)}",
 		flush=True,
 	)
 	filter_stats = getattr(mdl, "flatten_source_filter_stats", {})
@@ -1351,6 +1423,9 @@ def _run_flatten_mode(
 			f"{int(filter_stats.get('cell_valid_before', 0.0))}",
 			flush=True,
 		)
+	# Model3D owns sanitized device copies from here on. The loader/projector
+	# tensors otherwise remain referenced by this frame for the whole solve.
+	del xyz, valid
 
 	def _snapshot(*, stage: str, step: int, loss: float, data, res=None) -> None:
 		if out_dir is None:
@@ -1366,13 +1441,23 @@ def _run_flatten_mode(
 			print(f"PROGRESS {step} {total} {loss:.6f}", flush=True)
 
 	with torch.no_grad():
-		map_yx, xyz0, point_mask, quad_mask = mdl._flatten_sample_current()
+		map_yx, xyz0, point_mask, quad_mask = _initial_flatten_state(
+			mdl,
+			invert_forward=initial_inversion,
+		)
+		if flatten_direction == "forward" and not initial_inversion:
+			initial_label = "initial forward flatten (inversion skipped)"
+		else:
+			initial_label = "initial flatten"
 		print(
-			f"initial flatten: map_shape={tuple(map_yx.shape)} "
+			f"{initial_label}: map_shape={tuple(map_yx.shape)} "
 			f"point_valid={int(point_mask.sum())}/{point_mask.numel()} "
 			f"quad_valid={int(quad_mask.sum())}/{quad_mask.numel()}",
 			flush=True,
 		)
+	# These are inspection-only views/results. In particular map_yx owns a full
+	# integrated UV grid that is recomputed by the first optimizer evaluation.
+	del map_yx, xyz0, point_mask, quad_mask
 
 	optimizer.optimize(
 		model=mdl,
@@ -1385,20 +1470,30 @@ def _run_flatten_mode(
 		seed_xyz=None,
 		out_dir=out_dir,
 	)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized flatten model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30
 		print(f"[fit] peak GPU memory: {peak_gb:.2f} GiB", flush=True)
 
 	model_out: str | None = model_cfg.model_output
+	flatten_state: dict | None = None
+	if model_out is not None or out_dir is not None or state_sink is not None:
+		# The state (and its full-grid UV inversion) is computed once and
+		# shared by every consumer below; the results are identical to
+		# recomputing it per consumer.
+		flatten_state = _flatten_checkpoint_state(mdl=mdl, fit_config=fit_config)
 	if model_out is not None:
-		_save_flatten_model(str(model_out), mdl=mdl, data=data, fit_config=fit_config)
+		_save_flatten_model(str(model_out), mdl=mdl, data=data,
+							fit_config=fit_config, state=flatten_state)
 		print(f"[fit] saved model to {model_out}")
 	if out_dir is not None:
 		out = Path(out_dir)
 		out.mkdir(parents=True, exist_ok=True)
 		final_path = out / "model_final.pt"
-		_save_flatten_model(str(final_path), mdl=mdl, data=data, fit_config=fit_config)
+		_save_flatten_model(str(final_path), mdl=mdl, data=data,
+							fit_config=fit_config, state=flatten_state)
 		model_source = Path(model_out) if model_out is not None else final_path
 		_export_flatten_result(
 			mdl=mdl,
@@ -1408,18 +1503,32 @@ def _run_flatten_mode(
 			voxel_size_um=(None if cfg.get("voxel_size_um") is None else float(cfg.get("voxel_size_um"))),
 			fit_config=fit_config,
 			model_source=model_source,
+			state=flatten_state,
 		)
+	if state_sink is not None and flatten_state is not None:
+		# Hand the checkpoint to the caller in host memory so it does not have
+		# to torch.load the file it just asked us to write (or ask for the
+		# file at all).  GPU tensors are copied off-device so retaining the
+		# state does not pin the model's VRAM.
+		state_sink["flatten_state"] = {
+			key: value.detach().cpu() if torch.is_tensor(value) else value
+			for key, value in flatten_state.items()
+		}
 	return 0
 
 
-def main(argv: list[str] | None = None) -> int:
+def main(argv: list[str] | None = None, *, lifecycle_fn=None,
+		 state_sink: dict | None = None) -> int:
+	# state_sink: optional dict that receives the flatten checkpoint state as
+	# {"flatten_state": ...} (CPU tensors) so an in-process caller can consume
+	# it without re-reading the checkpoint file. Flatten mode only.
 	if argv is None:
 		argv = sys.argv[1:]
 
 	_t_fit_total = _stage_start("total")
 	_t = _stage_start("parse_config")
 	parser = _build_parser()
-	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv)
+	cfg_paths, argv_rest = cli_json.split_cfg_argv(argv, parser)
 	cfg_paths = [str(x) for x in cfg_paths]
 	cfg = cli_json.merge_cfgs(cfg_paths)
 	fit_config = copy.deepcopy(cfg)
@@ -1461,6 +1570,8 @@ def main(argv: list[str] | None = None) -> int:
 			opt_cfg=opt_cfg,
 			progress_enabled=progress_enabled,
 			out_dir=_out_dir,
+			lifecycle_fn=lifecycle_fn,
+			state_sink=state_sink,
 		)
 
 	data_cfg = cli_data.from_args(args)
@@ -1496,7 +1607,10 @@ def main(argv: list[str] | None = None) -> int:
 	if init_mode == "shell-dir-crop" and model_init != "seed":
 		raise ValueError("init-mode=shell-dir-crop requires args.model-init=seed")
 	if init_mode == "shell-dir-crop" and "init_shell_dir" in cfg:
-		raise ValueError("do not set top-level config key 'init_shell_dir'; shell-dir-crop reads it from --input .lasagna.json")
+		raise ValueError(
+			"do not set top-level config key 'init_shell_dir'; put 'init-shell-dir' "
+			"under 'args' or pass --init-shell-dir"
+		)
 
 	# Probe preprocessed data for scaledown and volume extent (in base/VC3D coords)
 	_t = _stage_start("probe_preprocessed_data")
@@ -1554,15 +1668,17 @@ def main(argv: list[str] | None = None) -> int:
 		if not approval_tifxyz:
 			raise ValueError("approval-inpaint requires service arg approval-inpaint-tifxyz")
 		from approval_inpaint import build_approval_inpaint
-		approval_tifxyz = _scaled_approval_tifxyz_path(
+		approval_surface = _scaled_approval_surface(
 			str(approval_tifxyz),
-			tmp_parent=None,
 			base_shape_zyx=lasagna_base_shape_zyx,
 			request_shape_zyx=vc3d_volume_shape_zyx,
+			store=args.store,
+			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 
 		result = build_approval_inpaint(
-			tifxyz_path=str(approval_tifxyz),
+			surface=approval_surface,
 			seed=tuple(float(v) for v in data_cfg.seed),
 			mesh_step=float(model_cfg.mesh_step),
 			corr_spacing=getattr(args, "approval_inpaint_corr_spacing", None),
@@ -1623,13 +1739,13 @@ def main(argv: list[str] | None = None) -> int:
 		if corr_points_3d_for_roi is None or corr_points_3d_for_roi.points_xyz_winda.shape[0] <= 0:
 			raise ValueError("corr-point-roi requires nonempty corr_points")
 		from init_shell_index import InitShellIndex
-		init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+		init_shell_dir = _require_init_shell_dir(
+			prep_params, override=data_cfg.init_shell_dir)
 		corr_point_roi_shell_index = InitShellIndex.from_directory(init_shell_dir)
 		if device.type == "cuda":
 			corr_point_roi_normal_data = fit_data.load_3d_streaming(
 				path=str(data_cfg.input),
 				device=device,
-				sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 				skip_channels={"cos", "pred_dt"},
 			)
 		else:
@@ -1764,6 +1880,9 @@ def main(argv: list[str] | None = None) -> int:
 			device=device,
 			mesh_step=model_cfg.mesh_step,
 			winding_step=model_cfg.winding_step,
+			store=args.store,
+			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 		mdl = atlas_init.model
 		atlas_lines_3d = atlas_init.atlas_lines
@@ -1783,6 +1902,9 @@ def main(argv: list[str] | None = None) -> int:
 			base_shape_zyx=lasagna_base_shape_zyx,
 			request_shape_zyx=vc3d_volume_shape_zyx,
 			path_label="tifxyz-init",
+			store=args.store,
+			volume=args.volume_uuid,
+			target_scale=args.voxel_scale,
 		)
 		_step_h, _step_w, _step_diag, step_avg = surface_step_stats(xyz_init, valid_init)
 		mesh_step_init = model_cfg.mesh_step
@@ -1807,7 +1929,8 @@ def main(argv: list[str] | None = None) -> int:
 				shell_quality_analysis,
 				trim_shell_surface_rows_by_quality,
 			)
-			init_shell_dir = _require_manifest_init_shell_dir(prep_params)
+			init_shell_dir = _require_init_shell_dir(
+				prep_params, override=data_cfg.init_shell_dir)
 			if corr_point_roi_init is not None:
 				shell_index = corr_point_roi_shell_index if corr_point_roi_shell_index is not None else InitShellIndex.from_directory(init_shell_dir)
 				closest = corr_point_roi_init.closest
@@ -2021,6 +2144,10 @@ def main(argv: list[str] | None = None) -> int:
 	print(f"Model3D: depth={mdl.depth} mesh_h={mdl.mesh_h} mesh_w={mdl.mesh_w} "
 		  f"cylinder_enabled={getattr(mdl, 'cylinder_enabled', False)}")
 	_stage_done("construct_model", _t)
+	require_umbilicus = bool(
+		getattr(mdl, "cylinder_enabled", False)
+		and hasattr(mdl, "prepare_umbilicus_tube_init")
+	)
 
 	# Load external reference surfaces
 	_t = _stage_start("load_external_surfaces")
@@ -2049,6 +2176,9 @@ def main(argv: list[str] | None = None) -> int:
 				base_shape_zyx=lasagna_base_shape_zyx,
 				request_shape_zyx=vc3d_volume_shape_zyx,
 				path_label=f"external surface {es_path}",
+				store=args.store,
+				volume=args.volume_uuid,
+				target_scale=args.voxel_scale,
 			)
 			idx = mdl.add_external_surface(xyz_ext, valid=valid_ext, offset=es_offset)
 			meta_ext_base = volume_scale.scale_tifxyz_meta(
@@ -2152,8 +2282,8 @@ def main(argv: list[str] | None = None) -> int:
 		d = fit_data.load_3d_streaming(
 			path=str(data_cfg.input),
 			device=device,
-			sparse_prefetch_backend=data_cfg.sparse_prefetch_backend,
 			skip_channels=_streaming_skip_channels(needed_channels),
+			require_umbilicus=require_umbilicus,
 		)
 		Z, Y, X = d.size
 		# Volume extent covers the full zarr volume
@@ -2386,6 +2516,8 @@ def main(argv: list[str] | None = None) -> int:
 		require_snap_surf_map_state=(model_init == "model" and self_map_init != "off"),
 	)
 	_stage_done("optimizer", _t)
+	if lifecycle_fn is not None:
+		lifecycle_fn("saving", "Saving optimized Lasagna model")
 
 	if device.type == "cuda":
 		peak_gb = torch.cuda.max_memory_allocated(device) / 2**30

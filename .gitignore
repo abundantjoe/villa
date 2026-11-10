@@ -1,8 +1,14 @@
 # Python venvs, IDE files, build artifacts
+/local/
+/plans/
+/task.md
+/experiments/
+/global-fiber-sgd
 **/.venv*/
 **/.idea/*
 **/__pycache__/
 *.pyc
+*.so
 node_modules/.yarn-integrity
 **/*.egg-info*/
 
@@ -13,15 +19,16 @@ node_modules/.yarn-integrity
 
 *.DS_Store
 
+# Defense in depth for google-github-actions/auth. Progress Prize workflows set
+# create_credentials_file: false and must never produce these files.
+gha-creds-*.json
+
 **/checkpoints/
 
-# WandB (allow general wandb but ignore this one)
+# WandB (allow general wandb)
 !**/wandb/**
-/segmentation/models/arch/nnunet/wandb/
 
 *.pth
-segmentation/models/arch/nnunet/build/
-segmentation/models/batchgeneratorsv2/build/
 segmentation/napari_trainer/cline_rules.md
 segmentation/napari_trainer/test_1638_debug.png
 /wandb
@@ -46,13 +53,42 @@ volume-cartographer/AGENTS.md
 /volume-cartographer/coverage/
 /coverage/
 
-# Dead-code analysis outputs
-/volume-cartographer/dead-code/
-/dead-code/
-
 # ccache (mounted into builder docker)
 /volume-cartographer/.ccache/
 /.ccache/
 /lasagna/snap_surf_objs
-/volume-cartographer/scripts/spiral/bench
+/spiral-fitting/bench
 /volume-cartographer/scripts/cache
+/volume-cartographer/docs/plans
+/spiral-fitting/scratch
+/spiral-fitting/out
+/vesuvius/experiments
+/vesuvius/src/vesuvius/neural_tracing/winding_models/runs
+/spiral-fitting/plans
+/volume-cartographer/scripts/spiral/out
+/spiral-fitting/.claude
+dinovol/cufile.log
+/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/datasets/automated_fiber_volumes
+/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/plans
+/vesuvius/src/vesuvius/neural_tracing/tracers/sheets/output
+/spiral-fitting/outputs/anchored_strip_extension
+/spiral-fitting/outputs
+/vesuvius/src/vesuvius/neural_tracing/fiber_follow/output
+
+# Local Claude Code settings
+**/.claude/settings.local.json
+/vesuvius/src/vesuvius/neural_tracing/tracers/fibers/evaluation/audit
+/volume-cartographer/plans
+/spiral-fitting/experiments
+/vc_object_store/docs/benchmarks
+/vc_reader/benchmarks/results
+*.csv
+/vc_object_store/build-core
+/vc_object_store/docs/benchmarks
+/volume-cartographer/planning
+/dinovol/dinovol_2/perf
+/dinovol/evals/kaggle_surfaces/data
+/dinovol/evals/kaggle_surfaces/runs
+/dinovol/outputs
+/dinovol/perf_results
+/volume-cartographer/benchmarks/saved

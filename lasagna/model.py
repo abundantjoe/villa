@@ -6,6 +6,7 @@ import math
 import torch
 from torch import nn
 import torch.nn.functional as F
+from dtypes import torch_float_hi, numpy_float_hi
 
 import fit_data
 
@@ -23,6 +24,7 @@ class ModelParams3D:
 	model_w: float | None = None
 	model_h: float | None = None
 	depth_windings: tuple[int, ...] = field(default_factory=tuple)
+	flatten_output_step: float | None = None
 
 
 def _normalize_depth_windings(raw, *, depth: int, where: str) -> tuple[int, ...]:
@@ -293,13 +295,17 @@ class FitResult3D:
 	flatten_xyz: torch.Tensor | None = None              # (1, Hout, Wout, 3) sampled frozen source surface
 	flatten_point_mask: torch.Tensor | None = None       # (Hout, Wout) bool
 	flatten_quad_mask: torch.Tensor | None = None        # (1, Hout-1, Wout-1) bool
-	flatten_target_step: torch.Tensor | None = None      # scalar measured source spacing
+	flatten_target_step: torch.Tensor | None = None      # scalar requested output spacing
+	flatten_map_step: torch.Tensor | None = None         # scalar map increment per grid edge
 	flatten_avg_offset_mask: torch.Tensor | None = None  # (Hout, Wout) bool fixed init-valid anchor mask
 	flatten_initial_avg_offset: torch.Tensor | None = None  # (2,) initial mean map offset over anchor mask
 	flatten_direction: str = "inverse"                   # inverse: output->source, forward: source->output UV
 	flatten_source_xyz: torch.Tensor | None = None       # (Hs, Ws, 3) frozen source surface
 	flatten_source_valid: torch.Tensor | None = None     # (Hs, Ws) bool frozen source vertices
 	flatten_source_cell_valid: torch.Tensor | None = None  # (Hs-1, Ws-1) bool frozen source quads
+	flatten_source_metric: torch.Tensor | None = None    # (Hs-1, Ws-1, 3) frozen g00,g01,g11
+	flatten_identity_y: torch.Tensor | None = None       # (Hmap,) frozen canonical row coordinates
+	flatten_identity_x: torch.Tensor | None = None       # (Wmap,) frozen canonical column coordinates
 	# Per ext surface: (mask, offset, ext_P, ext_N, full_h, full_w)
 	# ext_P/ext_N = ext corner pos/normal (detached), full_h/full_w = model grid position (row+u, col+v)
 	# Shapes: (D, H_ext, W_ext, ...). Model quad corners are re-gathered from xyz_lr in the loss.
@@ -376,7 +382,11 @@ class Model3D(nn.Module):
 		# at the seed along the optimized cylinder axis.
 		self.cyl_params = nn.Parameter(self._default_cylinder_params(device=device))
 		self.cyl_shell_delta_ms = nn.ParameterList()
-		self.cyl_shell_w_offsets = nn.Parameter(torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
+		self.cyl_shell_w_offsets = nn.Parameter(
+			torch.empty(0, device=device, dtype=torch.float32)
+			if self.init_mode == "flatten"
+			else torch.zeros(self.mesh_h, self.mesh_w, device=device, dtype=torch.float32)
+		)
 		self.cyl_seed_xyz = torch.zeros(3, device=device, dtype=torch.float32)
 		self.cyl_shell_mode = False
 		self.cyl_shell_n_scales = 5
@@ -420,15 +430,24 @@ class Model3D(nn.Module):
 		self.cyl_outside_sample_factor: int = 2
 		self.cyl_outside_model_step: float | None = None
 
-		# Residual mesh pyramid: (3, D, H, W) per scale, 5 levels
-		n_scales = int(self.cyl_shell_n_scales)
-		self.mesh_ms = self._build_zero_pyramid(
-			n_scales=n_scales, channels=3, d=self.depth, h=self.mesh_h, w=self.mesh_w, device=device,
-			pyramid_d=self.pyramid_d,
-		)
+		# Flattening owns a separate UV pyramid and never reads the generic XYZ
+		# mesh. Avoid materialising the full generic pyramid for that mode.
+		if self.init_mode == "flatten":
+			self.mesh_ms = nn.ParameterList()
+		else:
+			n_scales = int(self.cyl_shell_n_scales)
+			self.mesh_ms = self._build_zero_pyramid(
+				n_scales=n_scales, channels=3, d=self.depth, h=self.mesh_h, w=self.mesh_w, device=device,
+				pyramid_d=self.pyramid_d,
+			)
 		# Connection offsets buffer: (4, D, Hm, Wm) — [prev_h, prev_w, next_h, next_w]
 		# Not gradient-optimized; updated by update_conn_offsets() after each step.
-		self.register_buffer("conn_offsets", torch.zeros(4, self.depth, self.mesh_h, self.mesh_w, device=device, dtype=torch.float32))
+		self.register_buffer(
+			"conn_offsets",
+			torch.empty(0, device=device, dtype=torch.float32)
+			if self.init_mode == "flatten"
+			else torch.zeros(4, self.depth, self.mesh_h, self.mesh_w, device=device, dtype=torch.float32),
+		)
 
 		# External reference surfaces: frozen meshes for offset optimization
 		self._ext_surfaces: list[torch.Tensor] = []          # each (H_ext, W_ext, 3)
@@ -451,13 +470,35 @@ class Model3D(nn.Module):
 		self.register_buffer("flatten_source_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_source_cell_valid", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_target_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
+		self.register_buffer("flatten_map_step", torch.tensor(1.0, device=device, dtype=torch.float32))
+		self.register_buffer("flatten_measured_source_step", torch.tensor(float(mesh_step), device=device, dtype=torch.float32))
 		self.register_buffer("flatten_avg_offset_mask", torch.empty(0, 0, device=device, dtype=torch.bool))
 		self.register_buffer("flatten_initial_avg_offset", torch.zeros(2, device=device, dtype=torch.float32))
+		self.register_buffer(
+			"flatten_source_metric",
+			torch.empty(0, 0, 3, device=device, dtype=torch.float32),
+			persistent=False,
+		)
+		self.register_buffer(
+			"flatten_identity_y",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
+		self.register_buffer(
+			"flatten_identity_x",
+			torch.empty(0, device=device, dtype=torch.float32),
+			persistent=False,
+		)
 		self.flatten_source_filter_stats: dict[str, float] = {}
 
-		# Amplitude and bias for data matching (deferred but needed for FitResult3D)
-		amp_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 1.0, device=device, dtype=torch.float32)
-		bias_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 0.5, device=device, dtype=torch.float32)
+		# Amplitude and bias are irrelevant to the flatten-only objective. Keep
+		# empty parameters so checkpoint/module structure remains predictable.
+		if self.init_mode == "flatten":
+			amp_init = torch.empty(0, device=device, dtype=torch.float32)
+			bias_init = torch.empty(0, device=device, dtype=torch.float32)
+		else:
+			amp_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 1.0, device=device, dtype=torch.float32)
+			bias_init = torch.full((self.depth, 1, self.mesh_h, self.mesh_w), 0.5, device=device, dtype=torch.float32)
 		self.amp = nn.Parameter(amp_init)
 		self.bias = nn.Parameter(bias_init)
 
@@ -535,12 +576,28 @@ class Model3D(nn.Module):
 		return count
 
 	@staticmethod
-	def _flatten_output_shape_for_source(h: int, w: int) -> tuple[int, int]:
-		def _scaled_vertex_count(n: int) -> int:
-			extent = max(1, int(n) - 1)
-			return max(2, int(math.ceil(float(extent) * 1.2)) + 1)
+	def _flatten_output_shape_for_source(
+		h: int,
+		w: int,
+		*,
+		source_step: float,
+		output_step: float,
+	) -> tuple[int, int]:
+		"""Derive vertex counts from physical span and requested density."""
+		if not math.isfinite(float(source_step)) or float(source_step) <= 0.0:
+			raise ValueError("flatten source_step must be finite and positive")
+		if not math.isfinite(float(output_step)) or float(output_step) <= 0.0:
+			raise ValueError("flatten output_step must be finite and positive")
 
-		return _scaled_vertex_count(h), _scaled_vertex_count(w)
+		def _vertex_count(n: int) -> int:
+			# N vertices contain N-1 physical intervals.
+			if int(n) < 1:
+				raise ValueError("flatten source dimensions must be positive")
+			intervals = int(n) - 1
+			physical_span = float(intervals) * float(source_step)
+			return int(math.ceil(physical_span / float(output_step))) + 1
+
+		return _vertex_count(h), _vertex_count(w)
 
 	@staticmethod
 	def _centered_flatten_source_map(
@@ -549,16 +606,27 @@ class Model3D(nn.Module):
 		source_w: int,
 		out_h: int,
 		out_w: int,
+		source_step: float,
+		output_step: float,
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> torch.Tensor:
 		map_yx = Model3D._identity_flatten_map(h=out_h, w=out_w, device=device, dtype=dtype)
-		offset = torch.tensor(
-			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+		source_per_output = float(output_step) / float(source_step)
+		output_center = torch.tensor(
+			[0.5 * float(out_h - 1), 0.5 * float(out_w - 1)],
 			device=device,
 			dtype=dtype,
 		)
-		return (map_yx - offset.reshape(1, 1, 2)).contiguous()
+		source_center = torch.tensor(
+			[0.5 * float(source_h - 1), 0.5 * float(source_w - 1)],
+			device=device,
+			dtype=dtype,
+		)
+		return (
+			(map_yx - output_center.reshape(1, 1, 2)) * source_per_output
+			+ source_center.reshape(1, 1, 2)
+		).contiguous()
 
 	@staticmethod
 	def _normalize_flatten_direction(raw: str | None) -> str:
@@ -576,16 +644,27 @@ class Model3D(nn.Module):
 		source_w: int,
 		out_h: int,
 		out_w: int,
+		source_step: float,
+		output_step: float,
 		device: torch.device,
 		dtype: torch.dtype,
 	) -> torch.Tensor:
 		uv_yx = Model3D._identity_flatten_map(h=source_h, w=source_w, device=device, dtype=dtype)
-		offset = torch.tensor(
-			[0.5 * float(out_h - source_h), 0.5 * float(out_w - source_w)],
+		output_per_source = float(source_step) / float(output_step)
+		source_center = torch.tensor(
+			[0.5 * float(source_h - 1), 0.5 * float(source_w - 1)],
 			device=device,
 			dtype=dtype,
 		)
-		return (uv_yx + offset.reshape(1, 1, 2)).contiguous()
+		output_center = torch.tensor(
+			[0.5 * float(out_h - 1), 0.5 * float(out_w - 1)],
+			device=device,
+			dtype=dtype,
+		)
+		return (
+			(uv_yx - source_center.reshape(1, 1, 2)) * output_per_source
+			+ output_center.reshape(1, 1, 2)
+		).contiguous()
 
 	def _shell_delta_scale_count(self) -> int:
 		return max(1, int(getattr(self, "cyl_shell_n_scales", 5)))
@@ -2848,6 +2927,26 @@ class Model3D(nn.Module):
 		return torch.zeros(2, device=map_yx.device, dtype=map_yx.dtype)
 
 	@staticmethod
+	def _flatten_source_metric(xyz: torch.Tensor) -> torch.Tensor:
+		"""Precompute the fixed first fundamental form for each source quad."""
+		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
+			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
+		p00 = xyz[:-1, :-1]
+		p10 = xyz[1:, :-1]
+		p01 = xyz[:-1, 1:]
+		p11 = xyz[1:, 1:]
+		xy = 0.5 * ((p10 - p00) + (p11 - p01))
+		xx = 0.5 * ((p01 - p00) + (p11 - p10))
+		return torch.stack(
+			(
+				(xy * xy).sum(dim=-1),
+				(xy * xx).sum(dim=-1),
+				(xx * xx).sum(dim=-1),
+			),
+			dim=-1,
+		).contiguous()
+
+	@staticmethod
 	def _source_cell_valid(valid: torch.Tensor) -> torch.Tensor:
 		if int(valid.shape[0]) < 2 or int(valid.shape[1]) < 2:
 			return torch.zeros(max(0, int(valid.shape[0]) - 1), max(0, int(valid.shape[1]) - 1),
@@ -2941,11 +3040,23 @@ class Model3D(nn.Module):
 		return filtered, stats
 
 	@staticmethod
-	def _measured_flatten_target_step(xyz: torch.Tensor, valid: torch.Tensor, *, fallback: float) -> torch.Tensor:
+	def _measured_flatten_target_step(
+		xyz: torch.Tensor,
+		valid: torch.Tensor,
+		*,
+		fallback: float,
+		cell_valid: torch.Tensor | None = None,
+	) -> torch.Tensor:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3 or int(xyz.shape[0]) < 2 or int(xyz.shape[1]) < 2:
 			return torch.tensor(float(max(1.0e-12, fallback)), device=xyz.device, dtype=xyz.dtype)
 		valid = valid.to(device=xyz.device, dtype=torch.bool) & torch.isfinite(xyz).all(dim=-1)
-		cell_valid = Model3D._source_cell_valid(valid)
+		if cell_valid is None:
+			cell_valid_t = Model3D._source_cell_valid(valid)
+		else:
+			cell_valid_t = cell_valid.to(device=xyz.device, dtype=torch.bool)
+			expected = (max(0, int(xyz.shape[0]) - 1), max(0, int(xyz.shape[1]) - 1))
+			if tuple(cell_valid_t.shape) != expected:
+				raise ValueError(f"cell_valid shape {tuple(cell_valid_t.shape)} does not match source {expected}")
 		lengths: list[torch.Tensor] = []
 
 		def _append(delta: torch.Tensor, mask: torch.Tensor, scale: float = 1.0) -> None:
@@ -2954,11 +3065,29 @@ class Model3D(nn.Module):
 			if bool(ok.any().detach().cpu()):
 				lengths.append(val[ok])
 
-		_append(xyz[1:, :] - xyz[:-1, :], valid[1:, :] & valid[:-1, :])
-		_append(xyz[:, 1:] - xyz[:, :-1], valid[:, 1:] & valid[:, :-1])
+		row_edge_valid = torch.zeros(
+			max(0, int(xyz.shape[0]) - 1),
+			int(xyz.shape[1]),
+			device=xyz.device,
+			dtype=torch.bool,
+		)
+		col_edge_valid = torch.zeros(
+			int(xyz.shape[0]),
+			max(0, int(xyz.shape[1]) - 1),
+			device=xyz.device,
+			dtype=torch.bool,
+		)
+		if int(cell_valid_t.shape[0]) > 0 and int(cell_valid_t.shape[1]) > 0:
+			row_edge_valid[:, :-1] |= cell_valid_t
+			row_edge_valid[:, 1:] |= cell_valid_t
+			col_edge_valid[:-1, :] |= cell_valid_t
+			col_edge_valid[1:, :] |= cell_valid_t
+
+		_append(xyz[1:, :] - xyz[:-1, :], row_edge_valid & valid[1:, :] & valid[:-1, :])
+		_append(xyz[:, 1:] - xyz[:, :-1], col_edge_valid & valid[:, 1:] & valid[:, :-1])
 		sqrt2 = math.sqrt(2.0)
-		_append(xyz[1:, 1:] - xyz[:-1, :-1], cell_valid, sqrt2)
-		_append(xyz[1:, :-1] - xyz[:-1, 1:], cell_valid, sqrt2)
+		_append(xyz[1:, 1:] - xyz[:-1, :-1], cell_valid_t, sqrt2)
+		_append(xyz[1:, :-1] - xyz[:-1, 1:], cell_valid_t, sqrt2)
 		if not lengths:
 			return torch.tensor(float(max(1.0e-12, fallback)), device=xyz.device, dtype=xyz.dtype)
 		return torch.cat(lengths).mean().clamp_min(1.0e-12)
@@ -3022,12 +3151,15 @@ class Model3D(nn.Module):
 		min_shape: tuple[int, int] | None = None,
 		k_candidates: int = 32,
 		chunk_points: int = 65536,
+		output_device: torch.device | str | None = None,
 	) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
 		"""Invert a source-vertex UV map onto a regular output grid for export.
 
 		This is intentionally non-differentiable.  Optimization happens on the
-		forward source->UV map; export finds the source quad containing each
-		output UV pixel and bilinearly samples the frozen tifxyz source.
+		forward source->UV map; export finds the fixed-diagonal source triangle
+		containing each output UV pixel and barycentrically samples the frozen
+		tifxyz source. The split matches VC's (p00,p10,p01), (p10,p11,p01)
+		structured-mesh topology.
 		"""
 		if uv_yx.ndim != 3 or int(uv_yx.shape[-1]) != 2:
 			raise ValueError(f"forward flatten UV map must have shape (H,W,2), got {tuple(uv_yx.shape)}")
@@ -3038,15 +3170,23 @@ class Model3D(nn.Module):
 		if tuple(source_cell_valid.shape) != (max(0, int(uv_yx.shape[0]) - 1), max(0, int(uv_yx.shape[1]) - 1)):
 			raise ValueError("forward flatten source_cell_valid shape does not match UV map")
 
+		from concurrent.futures import ThreadPoolExecutor
+
 		import numpy as np
 
 		device = uv_yx.device
+		result_device = device if output_device is None else torch.device(output_device)
 		dtype = uv_yx.dtype
-		uv = uv_yx.detach().cpu().numpy().astype(np.float64, copy=False)
-		xyz = source_xyz.detach().cpu().numpy().astype(np.float64, copy=False)
+		uv = uv_yx.detach().cpu().numpy().astype(numpy_float_hi, copy=False)
+		xyz = source_xyz.detach().cpu().numpy().astype(numpy_float_hi, copy=False)
 		cell_valid = source_cell_valid.detach().cpu().numpy().astype(bool, copy=False)
 		Hs, Ws = int(uv.shape[0]), int(uv.shape[1])
-		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(Hs, Ws)
+		min_h, min_w = min_shape if min_shape is not None else Model3D._flatten_output_shape_for_source(
+			Hs,
+			Ws,
+			source_step=1.0,
+			output_step=1.0,
+		)
 		min_h = max(2, int(min_h))
 		min_w = max(2, int(min_w))
 
@@ -3055,9 +3195,9 @@ class Model3D(nn.Module):
 			out_xyz = np.zeros((1, min_h, min_w, 3), dtype=np.float32)
 			out_mask = np.zeros((min_h, min_w), dtype=bool)
 			return (
-				torch.as_tensor(out_map, device=device, dtype=dtype),
-				torch.as_tensor(out_xyz, device=device, dtype=dtype),
-				torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+				torch.as_tensor(out_map, device=result_device, dtype=dtype),
+				torch.as_tensor(out_xyz, device=result_device, dtype=dtype),
+				torch.as_tensor(out_mask, device=result_device, dtype=torch.bool),
 			)
 
 		q00_all = uv[:-1, :-1]
@@ -3080,21 +3220,34 @@ class Model3D(nn.Module):
 			np.isfinite(xyz01_all).all(axis=-1) &
 			np.isfinite(xyz11_all).all(axis=-1)
 		)
-		e_s = 0.5 * ((q10_all - q00_all) + (q11_all - q01_all))
-		e_t = 0.5 * ((q01_all - q00_all) + (q11_all - q10_all))
-		det_center = e_s[..., 0] * e_t[..., 1] - e_s[..., 1] * e_t[..., 0]
-		valid_cells_2d = cell_valid & finite_uv & finite_xyz & np.isfinite(det_center) & (det_center > 1.0e-10)
+		tri0_s_all = q10_all - q00_all
+		tri0_t_all = q01_all - q00_all
+		tri1_u_all = q11_all - q10_all
+		tri1_v_all = q01_all - q10_all
+		det0 = tri0_s_all[..., 0] * tri0_t_all[..., 1] - tri0_s_all[..., 1] * tri0_t_all[..., 0]
+		det1 = tri1_u_all[..., 0] * tri1_v_all[..., 1] - tri1_u_all[..., 1] * tri1_v_all[..., 0]
+		valid_cells_2d = (
+			cell_valid
+			& finite_uv
+			& finite_xyz
+			& np.isfinite(det0)
+			& np.isfinite(det1)
+			& (det0 > 1.0e-10)
+			& (det1 > 1.0e-10)
+		)
 		if not valid_cells_2d.any():
 			out_map = np.zeros((min_h, min_w, 2), dtype=np.float32)
 			out_xyz = np.zeros((1, min_h, min_w, 3), dtype=np.float32)
 			out_mask = np.zeros((min_h, min_w), dtype=bool)
 			return (
-				torch.as_tensor(out_map, device=device, dtype=dtype),
-				torch.as_tensor(out_xyz, device=device, dtype=dtype),
-				torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+				torch.as_tensor(out_map, device=result_device, dtype=dtype),
+				torch.as_tensor(out_xyz, device=result_device, dtype=dtype),
+				torch.as_tensor(out_mask, device=result_device, dtype=torch.bool),
 			)
 
 		rows, cols = np.nonzero(valid_cells_2d)
+		rows_float = rows.astype(np.float64)
+		cols_float = cols.astype(np.float64)
 		q00 = q00_all[rows, cols]
 		q10 = q10_all[rows, cols]
 		q01 = q01_all[rows, cols]
@@ -3110,18 +3263,15 @@ class Model3D(nn.Module):
 		pad = np.maximum(float(output_margin), 0.0) * span
 		lo = lo - pad
 		hi = hi + pad
-		out_h = max(min_h, int(math.ceil(float(hi[0] - lo[0]))) + 1)
-		out_w = max(min_w, int(math.ceil(float(hi[1] - lo[1]))) + 1)
-		if out_h > int(math.ceil(float(hi[0] - lo[0]))) + 1:
-			extra = 0.5 * float(out_h - (int(math.ceil(float(hi[0] - lo[0]))) + 1))
-			lo[0] -= extra
-		if out_w > int(math.ceil(float(hi[1] - lo[1]))) + 1:
-			extra = 0.5 * float(out_w - (int(math.ceil(float(hi[1] - lo[1]))) + 1))
-			lo[1] -= extra
+		extent_h = int(math.ceil(float(hi[0] - lo[0]))) + 1
+		extent_w = int(math.ceil(float(hi[1] - lo[1]))) + 1
+		out_h = max(min_h, extent_h)
+		out_w = max(min_w, extent_w)
+		if out_h > extent_h:
+			lo[0] -= 0.5 * float(out_h - extent_h)
+		if out_w > extent_w:
+			lo[1] -= 0.5 * float(out_w - extent_w)
 
-		out_map = np.zeros((out_h, out_w, 2), dtype=np.float32)
-		out_xyz = np.zeros((out_h, out_w, 3), dtype=np.float32)
-		out_mask = np.zeros((out_h, out_w), dtype=bool)
 		centers = 0.25 * (q00 + q10 + q01 + q11)
 		k = max(1, min(int(k_candidates), int(centers.shape[0])))
 		try:
@@ -3134,92 +3284,213 @@ class Model3D(nn.Module):
 			if int(centers.shape[0]) * int(out_h) * int(out_w) > 20_000_000:
 				raise RuntimeError("scipy.spatial.cKDTree is required for large forward-flatten export")
 
+		# Vectorized triangle barycentric solve. Only the KDTree candidate search
+		# stays on CPU. Float64 keeps shared-edge and overlapping-cell tie behavior
+		# stable across CPU and CUDA.
+		# Keep the immutable cell table in host memory. Only the k candidates for
+		# the current output chunk are staged on the compute device below.
+		tri0_s_cell = q10 - q00
+		tri0_t_cell = q01 - q00
+		tri1_u_cell = q11 - q10
+		tri1_v_cell = q01 - q10
+		# One packed per-cell table so each chunk gathers and uploads its
+		# candidates in a single pass instead of six; the staged values are
+		# the same float64 bits either way.
+		cell_table = np.concatenate([
+			q00, tri0_s_cell, tri0_t_cell,
+			q10, tri1_u_cell, tri1_v_cell,
+		], axis=1)
+		del q00, q10, q01, q11
+		del tri0_s_cell, tri0_t_cell, tri1_u_cell, tri1_v_cell
+		# Zero-copy torch view of the cell table: torch's CPU index_select
+		# gathers candidate rows on all cores and without holding the GIL,
+		# copying exactly the bits numpy fancy indexing would.
+		cell_table_t = torch.from_numpy(cell_table)
+
+		def _gather_staged(cand: np.ndarray) -> torch.Tensor:
+			return cell_table_t.index_select(
+				0, torch.from_numpy(cand.reshape(-1)),
+			).view(int(cand.shape[0]), int(cand.shape[1]), -1)
+		if not use_tree:
+			centers_c = torch.as_tensor(centers, dtype=torch_float_hi, device=device)
+
+		out_map_t = torch.zeros((out_h * out_w, 2), dtype=torch.float32, device=result_device)
+		out_xyz_t = torch.zeros((out_h * out_w, 3), dtype=torch.float32, device=result_device)
+		out_mask_t = torch.zeros((out_h * out_w,), dtype=torch.bool, device=result_device)
+
 		total = int(out_h) * int(out_w)
 		chunk = max(1, int(chunk_points))
-		cell_index_all = np.arange(int(centers.shape[0]), dtype=np.int64)
-		for start in range(0, total, chunk):
+		starts = list(range(0, total, chunk))
+
+		def _chunk_points(start: int) -> tuple[np.ndarray, np.ndarray]:
 			stop = min(total, start + chunk)
 			flat_idx = np.arange(start, stop, dtype=np.int64)
 			oy = flat_idx // int(out_w)
 			ox = flat_idx - oy * int(out_w)
-			points = np.stack([lo[0] + oy.astype(np.float64), lo[1] + ox.astype(np.float64)], axis=-1)
-			if use_tree:
-				_dist, cand = tree.query(points, k=k)
-				cand = np.asarray(cand, dtype=np.int64)
-				if cand.ndim == 1:
-					cand = cand[:, None]
-			else:
-				d2 = ((points[:, None, :] - centers[None, :, :]) ** 2).sum(axis=-1)
-				if k < int(centers.shape[0]):
-					cand = np.argpartition(d2, kth=k - 1, axis=1)[:, :k]
+			points = np.stack([lo[0] + oy.astype(numpy_float_hi), lo[1] + ox.astype(numpy_float_hi)], axis=-1)
+			return flat_idx, points
+
+		def _stage_chunk(start: int):
+			"""CPU stage of one chunk: output points, k-NN cells, staged rows.
+
+			This runs one chunk ahead on a worker thread so the KDTree query
+			and the host-side candidate gather overlap the previous chunk's
+			device solve. Every chunk is computed exactly as before and chunks
+			write disjoint output rows, so pipelining changes no results.
+			"""
+			flat_idx, points = _chunk_points(start)
+			_dist, cand = tree.query(points, k=k, workers=-1)
+			cand = np.asarray(cand, dtype=np.int64)
+			if cand.ndim == 1:
+				cand = cand[:, None]
+			return flat_idx, points, cand, _gather_staged(cand)
+
+		prefetcher = None
+		pending = None
+		if use_tree and len(starts) > 1:
+			prefetcher = ThreadPoolExecutor(
+				max_workers=1, thread_name_prefix="flatten-invert-prefetch")
+			pending = prefetcher.submit(_stage_chunk, starts[0])
+		try:
+			for index, start in enumerate(starts):
+				if pending is not None:
+					flat_idx, points, cand, staged = pending.result()
+					pending = (
+						prefetcher.submit(_stage_chunk, starts[index + 1])
+						if index + 1 < len(starts) else None)
+				elif use_tree:
+					flat_idx, points, cand, staged = _stage_chunk(start)
 				else:
-					cand = np.broadcast_to(cell_index_all.reshape(1, -1), (points.shape[0], centers.shape[0]))
+					flat_idx, points = _chunk_points(start)
+					pts_bf = torch.as_tensor(points, dtype=torch_float_hi, device=device)
+					d2 = ((pts_bf[:, None, :] - centers_c[None, :, :]) ** 2).sum(dim=-1)
+					cand = torch.topk(
+						d2, min(k, int(centers_c.shape[0])), dim=1, largest=False,
+					).indices.detach().cpu().numpy()
+					staged = _gather_staged(cand)
 
-			Q00 = q00[cand]
-			Q10 = q10[cand]
-			Q01 = q01[cand]
-			Q11 = q11[cand]
-			rhs = points[:, None, :] - Q00
-			es = Q10 - Q00
-			et = Q01 - Q00
-			bilin = Q11 - Q10 - Q01 + Q00
-			det = es[..., 0] * et[..., 1] - es[..., 1] * et[..., 0]
-			s = np.where(np.abs(det) > 1.0e-12, (rhs[..., 0] * et[..., 1] - et[..., 0] * rhs[..., 1]) / det, 0.5)
-			t = np.where(np.abs(det) > 1.0e-12, (es[..., 0] * rhs[..., 1] - rhs[..., 0] * es[..., 1]) / det, 0.5)
-			for _ in range(6):
-				P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
-				resid = P - points[:, None, :]
-				Js = es + t[..., None] * bilin
-				Jt = et + s[..., None] * bilin
-				jdet = Js[..., 0] * Jt[..., 1] - Js[..., 1] * Jt[..., 0]
-				ok = np.abs(jdet) > 1.0e-12
-				ds = np.where(ok, (resid[..., 0] * Jt[..., 1] - Jt[..., 0] * resid[..., 1]) / jdet, 0.0)
-				dt = np.where(ok, (Js[..., 0] * resid[..., 1] - resid[..., 0] * Js[..., 1]) / jdet, 0.0)
-				s = s - ds
-				t = t - dt
-			P = Q00 + s[..., None] * es + t[..., None] * et + (s * t)[..., None] * bilin
-			res2 = ((P - points[:, None, :]) ** 2).sum(axis=-1)
-			inside = (
-				np.isfinite(res2) &
-				(s >= -1.0e-4) & (s <= 1.0 + 1.0e-4) &
-				(t >= -1.0e-4) & (t <= 1.0 + 1.0e-4) &
-				(res2 <= 1.0e-5)
-			)
-			score = np.where(inside, res2, np.inf)
-			best_pos = np.argmin(score, axis=1)
-			best_score = score[np.arange(score.shape[0]), best_pos]
-			good = np.isfinite(best_score)
-			if not good.any():
-				continue
-			best_cell = cand[np.arange(cand.shape[0]), best_pos][good]
-			best_s = np.clip(s[np.arange(s.shape[0]), best_pos][good], 0.0, 1.0)
-			best_t = np.clip(t[np.arange(t.shape[0]), best_pos][good], 0.0, 1.0)
-			dst_y = oy[good]
-			dst_x = ox[good]
-			src_r = rows[best_cell].astype(np.float64) + best_s
-			src_c = cols[best_cell].astype(np.float64) + best_t
-			X00 = x00[best_cell]
-			X10 = x10[best_cell]
-			X01 = x01[best_cell]
-			X11 = x11[best_cell]
-			S = best_s[:, None]
-			T = best_t[:, None]
-			sampled = (
-				(1.0 - S) * (1.0 - T) * X00
-				+ S * (1.0 - T) * X10
-				+ (1.0 - S) * T * X01
-				+ S * T * X11
-			)
-			out_map[dst_y, dst_x, 0] = src_r.astype(np.float32, copy=False)
-			out_map[dst_y, dst_x, 1] = src_c.astype(np.float32, copy=False)
-			out_xyz[dst_y, dst_x] = sampled.astype(np.float32, copy=False)
-			out_mask[dst_y, dst_x] = True
+				pts_t = torch.as_tensor(points, dtype=torch_float_hi, device=device)
+				cand_table = torch.as_tensor(
+					staged, dtype=torch_float_hi, device=device)
+				del staged
+				q00_c = cand_table[..., 0:2]
+				e0s = cand_table[..., 2:4]
+				e0t = cand_table[..., 4:6]
 
-		out_xyz = np.where(out_mask[..., None], out_xyz, 0.0).astype(np.float32, copy=False)
+				# Triangle 0: q00 + s*(q10-q00) + t*(q01-q00).
+				rhs0 = pts_t[:, None, :] - q00_c
+				del q00_c
+				det0_c = e0s[..., 0] * e0t[..., 1] - e0s[..., 1] * e0t[..., 0]
+				s0 = (rhs0[..., 0] * e0t[..., 1] - e0t[..., 0] * rhs0[..., 1]) / det0_c
+				t0 = (e0s[..., 0] * rhs0[..., 1] - rhs0[..., 0] * e0s[..., 1]) / det0_c
+				resid0 = s0[..., None] * e0s + t0[..., None] * e0t - rhs0
+				res20 = (resid0 * resid0).sum(dim=-1)
+				inside0 = (
+					torch.isfinite(res20)
+					& (s0 >= -1.0e-4)
+					& (t0 >= -1.0e-4)
+					& (s0 + t0 <= 1.0 + 1.0e-4)
+					& (res20 <= 1.0e-5)
+				)
+				inf = torch.full_like(res20, float("inf"))
+				score0 = torch.where(inside0, res20, inf)
+				del rhs0, e0s, e0t, det0_c, resid0, res20, inside0
+
+				# Triangle 1: q10 + u*(q11-q10) + v*(q01-q10).
+				q10_c = cand_table[..., 6:8]
+				e1u = cand_table[..., 8:10]
+				e1v = cand_table[..., 10:12]
+				rhs1 = pts_t[:, None, :] - q10_c
+				del q10_c
+				det1_c = e1u[..., 0] * e1v[..., 1] - e1u[..., 1] * e1v[..., 0]
+				u1 = (rhs1[..., 0] * e1v[..., 1] - e1v[..., 0] * rhs1[..., 1]) / det1_c
+				v1 = (e1u[..., 0] * rhs1[..., 1] - rhs1[..., 0] * e1u[..., 1]) / det1_c
+				resid1 = u1[..., None] * e1u + v1[..., None] * e1v - rhs1
+				res21 = (resid1 * resid1).sum(dim=-1)
+				inside1 = (
+					torch.isfinite(res21)
+					& (u1 >= -1.0e-4)
+					& (v1 >= -1.0e-4)
+					& (u1 + v1 <= 1.0 + 1.0e-4)
+					& (res21 <= 1.0e-5)
+				)
+				score1 = torch.where(inside1, res21, inf)
+				del rhs1, e1u, e1v, det1_c, resid1, res21, inside1, inf, cand_table
+				use_tri1 = score1 < score0
+				score = torch.minimum(score0, score1)
+				# Deterministic argmin matching numpy: lowest candidate position among
+				# minimal scores (torch.min's tie-break is unspecified on CUDA).
+				best_score = score.min(dim=1, keepdim=True).values
+				positions = torch.arange(score.shape[1], device=device)
+				tie_pos = torch.where(score == best_score, positions, score.shape[1])
+				best_pos = tie_pos.min(dim=1).values
+				best_score = best_score.squeeze(1)
+				good = torch.isfinite(best_score)
+				if not bool(good.any()):
+					continue
+				ar = torch.arange(cand.shape[0], device=device)
+				best_tri1 = use_tri1[ar, best_pos][good]
+				best_s0 = s0[ar, best_pos][good]
+				best_t0 = t0[ar, best_pos][good]
+				best_u1 = u1[ar, best_pos][good]
+				best_v1 = v1[ar, best_pos][good]
+				best_pos_np = best_pos.detach().cpu().numpy()
+				good_np = good.detach().cpu().numpy()
+				best_cell = cand[np.arange(cand.shape[0]), best_pos_np][good_np]
+				del score0, score1, score, best_score, tie_pos, best_pos, good
+				del s0, t0, u1, v1, use_tri1
+
+				# Clamp tiny shared-edge tolerances, then renormalize barycentric
+				# weights so source coordinates and sampled xyz use the same point.
+				zero = torch.zeros_like(best_s0)
+				w00 = torch.where(best_tri1, zero, 1.0 - best_s0 - best_t0)
+				w10 = torch.where(best_tri1, 1.0 - best_u1 - best_v1, best_s0)
+				w01 = torch.where(best_tri1, best_v1, best_t0)
+				w11 = torch.where(best_tri1, best_u1, zero)
+				weights = torch.stack((w00, w10, w01, w11), dim=-1).clamp_min(0.0)
+				weights = weights / weights.sum(dim=-1, keepdim=True).clamp_min(1.0e-12)
+				def _selected_tensor(values: np.ndarray) -> torch.Tensor:
+					return torch.as_tensor(
+						np.ascontiguousarray(values[best_cell]),
+						dtype=torch_float_hi,
+						device=device,
+					)
+
+				best_rows = _selected_tensor(rows_float)
+				best_cols = _selected_tensor(cols_float)
+				x00_c = _selected_tensor(x00)
+				x10_c = _selected_tensor(x10)
+				x01_c = _selected_tensor(x01)
+				x11_c = _selected_tensor(x11)
+				flat_out = torch.as_tensor(
+					flat_idx[good_np], dtype=torch.long, device=result_device)
+				src_r = best_rows + weights[:, 1] + weights[:, 3]
+				src_c = best_cols + weights[:, 2] + weights[:, 3]
+				sampled = (
+					weights[:, 0, None] * x00_c
+					+ weights[:, 1, None] * x10_c
+					+ weights[:, 2, None] * x01_c
+					+ weights[:, 3, None] * x11_c
+				)
+				out_map_t[flat_out, 0] = src_r.to(device=result_device, dtype=torch.float32)
+				out_map_t[flat_out, 1] = src_c.to(device=result_device, dtype=torch.float32)
+				out_xyz_t[flat_out] = sampled.to(device=result_device, dtype=torch.float32)
+				out_mask_t[flat_out] = True
+		finally:
+			if prefetcher is not None:
+				if pending is not None:
+					pending.cancel()
+				prefetcher.shutdown(wait=True)
+
+		# out_xyz_t is zero-initialized and written only at filled pixels, so it is
+		# already zero everywhere out_mask is False.
+		out_map = out_map_t.view(out_h, out_w, 2)
+		out_mask = out_mask_t.view(out_h, out_w)
+		out_xyz = out_xyz_t.view(out_h, out_w, 3)
 		return (
-			torch.as_tensor(out_map, device=device, dtype=dtype),
-			torch.as_tensor(out_xyz[None], device=device, dtype=dtype),
-			torch.as_tensor(out_mask, device=device, dtype=torch.bool),
+			out_map.to(device=result_device, dtype=dtype),
+			out_xyz.unsqueeze(0).to(device=result_device, dtype=dtype),
+			out_mask.to(device=result_device, dtype=torch.bool),
 		)
 
 	def _flatten_map_flat(self) -> torch.Tensor:
@@ -3238,7 +3509,7 @@ class Model3D(nn.Module):
 		xyz: torch.Tensor,
 		valid: torch.Tensor,
 		*,
-		mesh_step: int,
+		mesh_step: float,
 		winding_step: int,
 		subsample_mesh: int,
 		subsample_winding: int,
@@ -3247,6 +3518,8 @@ class Model3D(nn.Module):
 		flatten_filter_radius: int = 2,
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
+		flatten_output_step: float | None = None,
+		flatten_initial_uv_rescale: bool = True,
 	) -> None:
 		if xyz.ndim != 3 or int(xyz.shape[-1]) != 3:
 			raise ValueError(f"flatten source xyz must have shape (H,W,3), got {tuple(xyz.shape)}")
@@ -3256,32 +3529,25 @@ class Model3D(nn.Module):
 		if H < 2 or W < 2:
 			raise ValueError(f"flatten source must be at least 2x2, got {H}x{W}")
 		device = self.conn_offsets.device
+		# init_flatten_source is also a public conversion path, so release any
+		# generic full-grid state even when this instance was not constructed with
+		# init_mode="flatten".
+		self.mesh_ms = nn.ParameterList()
+		self.conn_offsets = torch.empty(0, device=device, dtype=torch.float32)
+		self.cyl_shell_w_offsets = nn.Parameter(
+			torch.empty(0, device=device, dtype=torch.float32), requires_grad=False)
+		self.amp = nn.Parameter(
+			torch.empty(0, device=device, dtype=torch.float32), requires_grad=False)
+		self.bias = nn.Parameter(
+			torch.empty(0, device=device, dtype=torch.float32), requires_grad=False)
 		xyz_dev = xyz.detach().to(device=device, dtype=torch.float32)
 		valid_dev = valid.detach().to(device=device, dtype=torch.bool) & torch.isfinite(xyz_dev).all(dim=-1)
 		xyz_dev = torch.where(valid_dev.unsqueeze(-1), xyz_dev, torch.zeros_like(xyz_dev))
-		Hout, Wout = self._flatten_output_shape_for_source(H, W)
-		direction = self._normalize_flatten_direction(flatten_direction)
-		map_h, map_w = (H, W) if direction == "forward" else (Hout, Wout)
-
-		self.depth = 1
-		self.mesh_h = map_h
-		self.mesh_w = map_w
-		self.pyramid_d = False
-		self.params = replace(
-			self.params,
-			mesh_step=int(mesh_step),
-			winding_step=int(winding_step),
-			subsample_mesh=int(subsample_mesh),
-			subsample_winding=int(subsample_winding),
-			pyramid_d=False,
-			model_h=float(max(1, Hout - 1) * max(1, int(mesh_step))),
-			model_w=float(max(1, Wout - 1) * max(1, int(mesh_step))),
+		output_step = (
+			float(mesh_step)
+			if flatten_output_step is None
+			else float(flatten_output_step)
 		)
-		self.conn_offsets = torch.zeros(4, 1, map_h, map_w, device=device, dtype=torch.float32)
-		self.amp = nn.Parameter(torch.ones(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
-		self.bias = nn.Parameter(torch.zeros(1, 1, map_h, map_w, device=device, dtype=torch.float32), requires_grad=False)
-		self.flatten_source_xyz = xyz_dev
-		self.flatten_source_valid = valid_dev
 		source_cell_valid = self._source_cell_valid(valid_dev)
 		if bool(flatten_filter_source_angles):
 			source_cell_valid, filter_stats = self._filter_source_cells_by_angle(
@@ -3290,9 +3556,8 @@ class Model3D(nn.Module):
 				max_angle_deg=float(flatten_filter_angle_deg),
 				radius=int(flatten_filter_radius),
 			)
-			self.flatten_source_filter_stats = filter_stats
 		else:
-			self.flatten_source_filter_stats = {
+			filter_stats = {
 				"enabled": 0.0,
 				"angle_deg": float(flatten_filter_angle_deg),
 				"radius": float(max(0, int(flatten_filter_radius))),
@@ -3302,18 +3567,76 @@ class Model3D(nn.Module):
 				"cell_valid_before": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
 				"cell_valid_after": float(source_cell_valid.to(dtype=torch.float32).sum().detach().cpu()),
 			}
-		self.flatten_source_cell_valid = source_cell_valid
-		self.flatten_target_step = self._measured_flatten_target_step(
+		measured_source_step = self._measured_flatten_target_step(
 			xyz_dev,
 			valid_dev,
 			fallback=float(mesh_step),
+			cell_valid=source_cell_valid,
 		).detach()
+		direction = self._normalize_flatten_direction(flatten_direction)
+		source_layout_step = float(measured_source_step.detach().cpu())
+		if (
+			direction != "forward"
+			or not bool(flatten_initial_uv_rescale)
+			or not math.isfinite(source_layout_step)
+			or source_layout_step <= 0.0
+		):
+			source_layout_step = float(mesh_step)
+		Hout, Wout = self._flatten_output_shape_for_source(
+			H,
+			W,
+			source_step=source_layout_step,
+			output_step=output_step,
+		)
+		map_h, map_w = (H, W) if direction == "forward" else (Hout, Wout)
+
+		self.depth = 1
+		self.mesh_h = map_h
+		self.mesh_w = map_w
+		self.pyramid_d = False
+		self.params = replace(
+			self.params,
+			mesh_step=max(1, int(round(output_step))),
+			winding_step=int(winding_step),
+			subsample_mesh=int(subsample_mesh),
+			subsample_winding=int(subsample_winding),
+			pyramid_d=False,
+			model_h=float(max(1, Hout - 1) * output_step),
+			model_w=float(max(1, Wout - 1) * output_step),
+			flatten_output_step=output_step,
+		)
+		self.flatten_source_xyz = xyz_dev
+		self.flatten_source_valid = valid_dev
+		self.flatten_identity_y = torch.arange(map_h, device=device, dtype=torch.float32)
+		self.flatten_identity_x = torch.arange(map_w, device=device, dtype=torch.float32)
+		self.flatten_source_filter_stats = filter_stats
+		self.flatten_source_cell_valid = source_cell_valid
+		self.flatten_source_metric = (
+			self._flatten_source_metric(xyz_dev).detach()
+			if direction == "forward"
+			else torch.empty(0, 0, 3, device=device, dtype=torch.float32)
+		)
+		self.flatten_target_step = torch.tensor(
+			output_step,
+			device=device,
+			dtype=torch.float32,
+		)
+		self.flatten_measured_source_step = measured_source_step
+		self.flatten_map_step = torch.tensor(
+			source_layout_step / output_step
+			if direction == "forward"
+			else output_step / source_layout_step,
+			device=device,
+			dtype=torch.float32,
+		)
 		if direction == "forward":
 			identity = self._centered_flatten_forward_uv_map(
 				source_h=H,
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
+				source_step=source_layout_step,
+				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
 			)
@@ -3324,6 +3647,8 @@ class Model3D(nn.Module):
 				source_w=W,
 				out_h=Hout,
 				out_w=Wout,
+				source_step=source_layout_step,
+				output_step=output_step,
 				device=device,
 				dtype=torch.float32,
 			)
@@ -3359,7 +3684,7 @@ class Model3D(nn.Module):
 		valid: torch.Tensor,
 		*,
 		device: torch.device,
-		mesh_step: int = 1,
+		mesh_step: float = 1,
 		winding_step: int = 1,
 		subsample_mesh: int = 1,
 		subsample_winding: int = 1,
@@ -3368,9 +3693,21 @@ class Model3D(nn.Module):
 		flatten_filter_radius: int = 2,
 		flatten_direction: str = "inverse",
 		flatten_output_margin: float = 0.10,
+		flatten_output_step: float | None = None,
+		flatten_initial_uv_rescale: bool = True,
 	) -> "Model3D":
 		H, W, _ = xyz.shape
-		Hout, Wout = Model3D._flatten_output_shape_for_source(H, W)
+		output_step = (
+			float(mesh_step)
+			if flatten_output_step is None
+			else float(flatten_output_step)
+		)
+		Hout, Wout = Model3D._flatten_output_shape_for_source(
+			H,
+			W,
+			source_step=float(mesh_step),
+			output_step=output_step,
+		)
 		direction = Model3D._normalize_flatten_direction(flatten_direction)
 		init_h, init_w = (H, W) if direction == "forward" else (Hout, Wout)
 		mdl = Model3D(
@@ -3378,7 +3715,7 @@ class Model3D(nn.Module):
 			depth=1,
 			mesh_h=init_h,
 			mesh_w=init_w,
-			mesh_step=mesh_step,
+			mesh_step=max(1, int(round(output_step))),
 			winding_step=winding_step,
 			subsample_mesh=subsample_mesh,
 			subsample_winding=subsample_winding,
@@ -3397,6 +3734,8 @@ class Model3D(nn.Module):
 			flatten_filter_radius=flatten_filter_radius,
 			flatten_direction=direction,
 			flatten_output_margin=flatten_output_margin,
+			flatten_output_step=output_step,
+			flatten_initial_uv_rescale=flatten_initial_uv_rescale,
 		)
 		return mdl
 
@@ -3407,15 +3746,14 @@ class Model3D(nn.Module):
 		torch.Tensor,
 	]:
 		map_yx = self.flatten_map()
-		xyz = torch.where(
-			self.flatten_source_valid.unsqueeze(-1),
-			self.flatten_source_xyz,
-			torch.zeros_like(self.flatten_source_xyz),
-		)
 		quad_mask = self.flatten_source_cell_valid.unsqueeze(0)
-		return map_yx, xyz.unsqueeze(0), self.flatten_source_valid, quad_mask
+		return map_yx, self.flatten_source_xyz.unsqueeze(0), self.flatten_source_valid, quad_mask
 
-	def _flatten_sample_current(self) -> tuple[
+	def _flatten_sample_current(
+		self,
+		*,
+		inversion_output_device: torch.device | str | None = None,
+	) -> tuple[
 		torch.Tensor,
 		torch.Tensor,
 		torch.Tensor,
@@ -3429,6 +3767,7 @@ class Model3D(nn.Module):
 				map_yx,
 				output_margin=float(getattr(self, "flatten_output_margin", 0.10)),
 				min_shape=getattr(self, "flatten_output_shape", None),
+				output_device=inversion_output_device,
 			)
 			if int(point_mask.shape[0]) > 1 and int(point_mask.shape[1]) > 1:
 				quad_mask = (
@@ -3974,8 +4313,12 @@ class Model3D(nn.Module):
 		D = self.depth
 		Hm = self.mesh_h
 		Wm = self.mesh_w
-		amp_lr = self.amp.clamp(0.1, 1.0)
-		bias_lr = self.bias.clamp(0.0, 0.45)
+		if self.flatten_enabled:
+			amp_lr = self.amp
+			bias_lr = self.bias
+		else:
+			amp_lr = self.amp.clamp(0.1, 1.0)
+			bias_lr = self.bias.clamp(0.0, 0.45)
 
 		# Target: cosine pattern along width (only meaningful when cos channel is loaded)
 		target_plain = None
@@ -4108,12 +4451,16 @@ class Model3D(nn.Module):
 			flatten_point_mask=flatten_point_mask,
 			flatten_quad_mask=flatten_quad_mask,
 			flatten_target_step=self.flatten_target_step if self.flatten_enabled else None,
+			flatten_map_step=self.flatten_map_step if self.flatten_enabled else None,
 			flatten_avg_offset_mask=self.flatten_avg_offset_mask if self.flatten_enabled else None,
 			flatten_initial_avg_offset=self.flatten_initial_avg_offset if self.flatten_enabled else None,
 			flatten_direction=self.flatten_direction if self.flatten_enabled else "inverse",
 			flatten_source_xyz=self.flatten_source_xyz if self.flatten_enabled else None,
 			flatten_source_valid=self.flatten_source_valid if self.flatten_enabled else None,
 			flatten_source_cell_valid=self.flatten_source_cell_valid if self.flatten_enabled else None,
+			flatten_source_metric=self.flatten_source_metric if self.flatten_enabled else None,
+			flatten_identity_y=self.flatten_identity_y if self.flatten_enabled else None,
+			flatten_identity_x=self.flatten_identity_x if self.flatten_enabled else None,
 		)
 
 	def opt_params(self) -> dict[str, list[nn.Parameter]]:
@@ -4214,8 +4561,13 @@ class Model3D(nn.Module):
 		st.pop("flatten_source_valid", None)
 		st.pop("flatten_source_cell_valid", None)
 		st.pop("flatten_target_step", None)
+		st.pop("flatten_map_step", None)
+		st.pop("flatten_measured_source_step", None)
 		st.pop("flatten_avg_offset_mask", None)
 		st.pop("flatten_initial_avg_offset", None)
+		st.pop("flatten_source_metric", None)
+		st.pop("flatten_identity_y", None)
+		st.pop("flatten_identity_x", None)
 		st.pop("flatten_map_flat", None)
 		st.pop("flatten_point_mask", None)
 		incompat = super().load_state_dict(st, strict=bool(strict))
@@ -4257,6 +4609,11 @@ class Model3D(nn.Module):
 			mdl.params,
 			model_w=None if mp.get("model_w") is None else float(mp["model_w"]),
 			model_h=None if mp.get("model_h") is None else float(mp["model_h"]),
+			flatten_output_step=(
+				None
+				if mp.get("flatten_output_step") is None
+				else float(mp["flatten_output_step"])
+			),
 			depth_windings=_normalize_depth_windings(
 				mp.get("depth_windings"),
 				depth=D,

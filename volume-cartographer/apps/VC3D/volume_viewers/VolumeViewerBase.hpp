@@ -5,6 +5,7 @@
 #include <QPointF>
 #include <QRectF>
 
+#include <cstddef>
 #include <cstdint>
 #include <functional>
 #include <map>
@@ -17,12 +18,15 @@
 
 #include <opencv2/core/mat.hpp>
 #include "overlays/ViewerOverlayControllerBase.hpp"
+#include "volume_viewers/SurfaceProjection.hpp"
+#include "vc/core/PointCollections.hpp"
 #include "vc/core/util/Compositing.hpp"
 
 class CVolumeViewerView;
 class QGraphicsItem;
 class Surface;
 class QuadSurface;
+namespace vcr::grid { class Surface; }
 class Volume;
 class VCCollection;
 
@@ -33,25 +37,28 @@ class VolumeViewerBase
 public:
     virtual ~VolumeViewerBase() = default;
 
-    // Active segmentation handle (shared definition for both viewer types)
-    struct ActiveSegmentationHandle {
-        QuadSurface* surface{nullptr};
-        std::string slotName;
-        QColor accentColor;
-        bool viewerIsSegmentationView{false};
-
-        bool valid() const { return surface != nullptr; }
-        explicit operator bool() const { return valid(); }
-        void reset()
-        {
-            surface = nullptr;
-            slotName.clear();
-            accentColor = QColor();
-            viewerIsSegmentationView = false;
-        }
-    };
-
     // --- Coordinate transforms ---
+    //
+    // volumeToScene() is the composition of the two halves below. The split
+    // exists because the halves have very different costs and very different
+    // dependencies: projecting a volume point onto the displayed surface is a
+    // nearest-point search over that surface, and depends only on the surface,
+    // the patch index and the displayed depth band; turning that projection
+    // into a scene point is a handful of multiply-adds that depend on the
+    // camera. Overlays that redraw on every pan/zoom cache the first half and
+    // re-run only the second.
+
+    // SurfaceProjection / SurfaceProjectionContext live in
+    // volume_viewers/SurfaceProjection.hpp; see it for what the split is for.
+
+    // nullopt when the point does not project onto the displayed surface or,
+    // for quad surfaces, lies more than `depthTolerance` outside the
+    // displayed depth band.
+    virtual std::optional<SurfaceProjection> projectVolumePoint(
+        const cv::Vec3f& vol_point, float depthTolerance) const = 0;
+    virtual QPointF surfaceProjectionToScene(const SurfaceProjection& projection) const = 0;
+    virtual SurfaceProjectionContext surfaceProjectionContext() const = 0;
+
     virtual QPointF volumeToScene(const cv::Vec3f& vol_point) = 0;
     virtual cv::Vec3f sceneToVolume(const QPointF& scenePoint) const = 0;
     virtual cv::Vec2f sceneToSurfaceCoords(const QPointF& scenePos) const = 0;
@@ -63,29 +70,21 @@ public:
     virtual void setSurface(const std::string& name) = 0;
     virtual void setIntersects(const std::set<std::string>& names) = 0;
     virtual void renderVisible(
-        bool force = false,
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
     virtual void requestRender(
         const char* reason = "external caller",
         std::source_location caller = std::source_location::current()) = 0;
-    // Called by ViewerManager's global maintenance clock. Render requests submit
-    // immediately; this hook is for non-render maintenance such as deferred
-    // intersections and status refreshes.
-    virtual void serviceRenderTick() {}
+    // Called by ViewerManager's status clock every few seconds.
+    virtual void refreshStatus() {}
     virtual void invalidateVis() = 0;
-    virtual void invalidateVisRegion(const std::string& name, const cv::Rect& changedCells)
-    {
-        (void)name;
-        (void)changedCells;
-        invalidateVis();
-    }
-    virtual void centerOnVolumePoint(const cv::Vec3f& point, bool forceRender = false) = 0;
-    virtual void centerOnSurfacePoint(const cv::Vec2f& point, bool forceRender = false) = 0;
+    virtual void centerOnVolumePoint(const cv::Vec3f& point) = 0;
+    virtual void centerOnSurfacePoint(const cv::Vec2f& point) = 0;
     virtual void adjustZoomByFactor(float factor) = 0;
     virtual void adjustSurfaceOffset(float delta) = 0;
     virtual void resetSurfaceOffsets() = 0;
     virtual void fitSurfaceInView() = 0;
+    virtual void resetViewForCurrentContent() {}
 
     // --- Data access ---
     virtual Surface* currentSurface() const = 0;
@@ -95,13 +94,9 @@ public:
 
     // --- Display settings ---
     virtual float getCurrentScale() const = 0;
-    virtual float dsScale() const = 0;
     virtual float normalOffset() const = 0;
-    virtual int datasetScaleIndex() const = 0;
-    virtual float datasetScaleFactor() const = 0;
 
-    // --- Direction/normal hints ---
-    virtual bool isShowDirectionHints() const = 0;
+    // --- Surface normal hints ---
     virtual bool isShowSurfaceNormals() const = 0;
     virtual float normalArrowLengthScale() const = 0;
     virtual int normalMaxArrows() const = 0;
@@ -114,26 +109,30 @@ public:
     virtual bool isPlaneCompositeEnabled() const = 0;
     virtual void setCompositeRenderSettings(const CompositeRenderSettings& settings) = 0;
     virtual void setVolumeWindow(float low, float high) = 0;
-    virtual void setBaseColormap(const std::string& id) = 0;
     virtual void setResetViewOnSurfaceChange(bool enabled) = 0;
     virtual void setPlaneIntersectionLinesVisible(bool visible) = 0;
-    virtual void setShowDirectionHints(bool enabled) = 0;
     virtual void setShowSurfaceNormals(bool enabled) = 0;
-    virtual void setSegmentationEditActive(bool active) = 0;
-    virtual void setSegmentationIntersectionDeferral(bool active) = 0;
     virtual void setSegmentationCursorMirroring(bool enabled) = 0;
+    // Suppress only this viewer's local mouse crosshair while a controller
+    // supplies a more specific cursor cue. Linked cursor projections remain
+    // independently controlled by cursor mirroring.
+    virtual void setLocalCursorCrosshairSuppressed(bool) {}
     virtual void setOverlayVolume(std::shared_ptr<Volume> volume) = 0;
     virtual void setOverlayOpacity(float opacity) = 0;
     virtual void setOverlayColormap(const std::string& colormapId) = 0;
-    virtual void setOverlayThreshold(float threshold) = 0;
+    // Position and normal at a grid position (column, row) of `quad`, as frames place them,
+    // so overlays measure depth the same way; false when this viewer draws no such frames.
+    virtual bool framePointAt(const QuadSurface&, float /*column*/, float /*row*/, float* /*xyz*/, float* /*normal*/) const { return false; }
+    virtual void setOverlaySamplingMethod(int method) = 0;
+    virtual void setOverlayIntensityAsAlpha(bool enabled) = 0;
     virtual void setOverlayWindow(float low, float high) = 0;
+    virtual void setOverlayMaxDisplayedResolution(int level) = 0;
+    virtual void setOverlayComposite(const OverlayCompositeSettings& settings) = 0;
     virtual void reloadPerfSettings() = 0;
 
     // --- Interaction state ---
-    virtual uint64_t highlightedPointId() const = 0;
-    virtual uint64_t selectedPointId() const = 0;
-    virtual uint64_t selectedCollectionId() const = 0;
-    virtual bool isPointDragActive() const = 0;
+    virtual std::optional<vc::PointRef> highlightedPoint() const = 0;
+    virtual std::optional<vc::PointRef> selectedPoint() const = 0;
     virtual bool isSameWrapAnnotationModeEnabled() const = 0;
     virtual double sameWrapAnnotationPolylineOpacity() const = 0;
     virtual const std::vector<ViewerOverlayControllerBase::PathPrimitive>& drawingPaths() const = 0;
@@ -141,7 +140,6 @@ public:
     // --- Overlay management ---
     virtual void setOverlayGroup(const std::string& key, const std::vector<QGraphicsItem*>& items) = 0;
     virtual void clearOverlayGroup(const std::string& key) = 0;
-    virtual void clearAllOverlayGroups() = 0;
 
     // --- BBox ---
     virtual std::vector<std::pair<QRectF, QColor>> selections() const = 0;
@@ -150,38 +148,23 @@ public:
     virtual QuadSurface* makeBBoxFilteredSurfaceFromSceneRect(const QRectF& sceneRect) = 0;
     virtual void clearSelections() = 0;
 
-    // --- Intersection rendering ---
-    virtual void renderIntersections(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) = 0;
-    virtual void scheduleIntersectionRender(
-        const char* reason = "external caller",
-        std::source_location caller = std::source_location::current()) = 0;
-    virtual void invalidateIntersect(const std::string& name = "") = 0;
-    virtual void invalidateIntersectRegion(const std::string& name, const cv::Rect& changedCells)
-    {
-        (void)name;
-        (void)changedCells;
-        invalidateIntersect();
-    }
+    // --- Where surfaces cross the view (StoreSurfaceOverlayController draws them) ---
+    // The named surfaces (setIntersects) whose crossings a plane viewer shows,
+    // or the planes ("seg xy/xz/yz") drawn cutting a surface viewer's surface.
+    virtual const std::set<std::string>& intersects() const = 0;
+    virtual bool planeIntersectionLinesVisible() const = 0;
     virtual float intersectionOpacity() const = 0;
     virtual float intersectionThickness() const = 0;
-    virtual int surfacePatchSamplingStride() const = 0;
     virtual void setIntersectionOpacity(float opacity) = 0;
     virtual void setIntersectionThickness(float thickness) = 0;
-    virtual void setHighlightedSurfaceIds(const std::vector<std::string>& ids) = 0;
-    virtual void setSurfacePatchSamplingStride(int stride) = 0;
 
     // --- Surface overlays ---
     virtual bool surfaceOverlayEnabled() const = 0;
     virtual const std::map<std::string, cv::Vec3b>& surfaceOverlays() const = 0;
+    virtual std::uint64_t surfaceOverlaysRevision() const = 0;
     virtual float surfaceOverlapThreshold() const = 0;
     virtual void setSurfaceOverlayEnabled(bool enabled) = 0;
     virtual void setSurfaceOverlays(const std::map<std::string, cv::Vec3b>& overlays) = 0;
-    virtual void setSurfaceOverlapThreshold(float threshold) = 0;
-
-    // --- Active segmentation ---
-    virtual const ActiveSegmentationHandle& activeSegmentationHandle() const = 0;
 
     // --- Graphics view access (for overlay controllers) ---
     virtual CVolumeViewerView* graphicsView() const = 0;

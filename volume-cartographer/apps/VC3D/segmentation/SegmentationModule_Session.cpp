@@ -1,19 +1,37 @@
 #include "SegmentationModule.hpp"
+#include "SurfaceCorrections.hpp"
+#include "SurfaceStoreEdit.hpp"
 
 #include "../CState.hpp"
+#include "../SessionDrafts.hpp"
 #include "SegmentationWidget.hpp"
 #include "tools/SegmentationEditManager.hpp"
-#include "tools/ApprovalMaskBrushTool.hpp"
 #include "tools/SurfaceMaskBrushTool.hpp"
 #include "ViewerManager.hpp"
 #include "overlays/SegmentationOverlayController.hpp"
 
 #include <QLoggingCategory>
+#include <QMessageBox>
+#include <QPushButton>
 #include <QTimer>
 
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
 #include "vc/ui/VCCollection.hpp"
+#include <vc_object_store/objects/StoreReader.hpp>
+
+bool SegmentationModule::prepareEditingDestination(const std::shared_ptr<QuadSurface>& surface)
+{
+    if (!_editingDestinationResolver) return true;
+    // Save workers capture their destination; drain before creating its copy.
+    try {
+        if (_saveFuture.isRunning()) _saveFuture.waitForFinished();
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("Finish the failed surface save before changing destinations: %1")
+            .arg(QString::fromUtf8(error.what())), 15000);
+        return false;
+    }
+    return _editingDestinationResolver(surface);
+}
 
 bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surface)
 {
@@ -21,19 +39,50 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
         return false;
     }
 
+    if (!prepareEditingDestination(surface)) return false;
+    // Editing starts from the revision on screen and holds the object until it ends.
+    const auto storeEdit = storeEditFor(surface.get());
+    if (!storeEdit) {
+        emit statusMessageRequested(tr("Only surfaces opened from the object store can be edited."), kStatusLong);
+        return false;
+    }
+    // Unsaved edits recovered from an earlier session come first.
+    if (const auto* drafts = _state->sessionDrafts(); drafts && drafts->recovered(surface->id)) {
+        offerRecoveredDraft(QString::fromStdString(surface->id));
+        if (_state->sessionDrafts()->recovered(surface->id)) return false;
+    }
+    try {
+        if (!_state->objectStoreSession()->writable(storeEdit->pin().attachment))
+            throw std::runtime_error("The object store is attached read-only");
+        _state->objectStoreSession()->requireCurrent(storeEdit->pin());
+    } catch (const std::exception& error) {
+        emit statusMessageRequested(tr("This surface cannot be edited now: %1").arg(QString::fromUtf8(error.what())),
+                                    kStatusLong);
+        return false;
+    }
     stopAllPushPull();
     clearUndoStack();
-    resetHoverLookupDetail();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
-    if (!_editManager->beginSession(surface)) {
+    // The edit's draft is declared in the frame the surface was read through.
+    SegmentationEditManager::DraftTarget draft{_state->objectStoreSession(), editCoordinates(*storeEdit),
+                                               storeEdit->pin().attachment};
+    draft.base = storeEdit->pin().reference();
+    draft.saved = !_autosaveState.pending() && !_autosaveState.saveInProgress();
+    if (!_editManager->beginSession(surface, std::move(draft))) {
         qCWarning(lcSegModule) << "Failed to begin segmentation editing session";
         return false;
     }
     _autosaveState.beginSession();
 
     if (_state) {
-        _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        _state->setActiveSurfaceEditing(true);
+        // The preview is the base surface itself, unchanged. Re-announcing the
+        // surface already on screen as an edit would drop every flattened-view
+        // tile and flash the pane black until they refill.
+        if (_state->surface("segmentation") != _editManager->previewSurface()) {
+            _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
+        }
     }
 
     if (_overlay) {
@@ -42,36 +91,17 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
     useFalloff(_activeFalloff);
 
-    // Set surface on approval tool if edit approval mask mode is active
-    if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(_editManager->baseSurface().get());
-    }
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setSurface(_editManager->baseSurface().get());
         _surfaceMaskTool->setActive(_editingEnabled && _drawMaskEnabled);
-    }
-
-    // Reload approval mask image if showing OR editing approval mask
-    // Ensures dimensions match the session's surface
-    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
-        _overlay->loadApprovalMaskImage(_editManager->baseSurface().get());
     }
 
     if (_overlay) {
         refreshOverlay();
     }
 
-    // Auto-load persisted corrections and set path for auto-save
-    if (_pointCollection && !surface->path.empty()) {
-        qCInfo(lcSegModule) << "Loading correction points from segment path:"
-                            << QString::fromStdString(surface->path.string());
-        _pointCollection->loadFromSegmentPath(surface->path);
-        _correctionsSegmentPath = surface->path;
-    } else {
-        qCInfo(lcSegModule) << "No segment path for correction points auto-save (path empty:"
-                            << surface->path.empty() << ")";
-        _correctionsSegmentPath.clear();
-    }
+    // The surface's stored corrections, auto-saved while it stays active.
+    loadCorrections(surface.get());
 
     emitPendingChanges();
     _pendingAutosaveVertexUpdates.clear();
@@ -83,55 +113,34 @@ bool SegmentationModule::beginEditingSession(std::shared_ptr<QuadSurface> surfac
 
 void SegmentationModule::endEditingSession()
 {
-    _forceFullSurfaceAutosave = false;
-    _pendingGridOffsetColDelta = 0;
-    _pendingGridOffsetRowDelta = 0;
+    _manualAddContinuation.reset();
     stopAllPushPull();
     clearUndoStack();
     cancelDrag();
-    clearLineDragStroke();
     if (_surfaceMaskTool) {
         _surfaceMaskTool->setActive(false);
     }
-    _lineDrawKeyActive = false;
-    resetHoverLookupDetail();
     _hoverPointer.valid = false;
     _hoverPointer.viewer = nullptr;
     refreshOverlay();
-    auto baseSurface = _editManager ? _editManager->baseSurface() : nullptr;
-    auto previewSurface = _editManager ? _editManager->previewSurface() : nullptr;
-
-    if (_state && previewSurface) {
-        auto currentSurface = _state->surface("segmentation");
-        if (currentSurface.get() == previewSurface.get()) {
-            const bool previousGuard = _ignoreSegSurfaceChange;
-            _ignoreSegSurfaceChange = true;
-            _state->setSurface("segmentation", baseSurface, false, true);
-            _ignoreSegSurfaceChange = previousGuard;
-        }
-    }
+    // Edits land in the base surface in place (the preview is the base), so the
+    // surface on screen stays as it is: nothing to restore or re-announce.
 
     // Save any pending corrections immediately and clear auto-save state
     if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
         _correctionsSaveTimer->stop();
     }
-    if (_pointCollection && !_correctionsSegmentPath.empty()) {
-        qCInfo(lcSegModule) << "Saving correction points on session end to:"
-                            << QString::fromStdString(_correctionsSegmentPath.string());
-        _pointCollection->saveToSegmentPath(_correctionsSegmentPath);
-    }
-    _correctionsSegmentPath.clear();
+    saveCorrections();
 
     if (_autosaveState.pending()) {
         performAutosave();
     }
 
-    if (_viewerManager && previewSurface) {
-        _viewerManager->refreshSurfacePatchIndex(previewSurface);
-    }
-
     if (_editManager) {
         _editManager->endSession();
+    }
+    if (_state) {
+        _state->setActiveSurfaceEditing(false);
     }
     _autosaveState.endSession();
     _saveSnapshot.reset();
@@ -213,6 +222,7 @@ void SegmentationModule::discardLastUndoSnapshot()
 
 bool SegmentationModule::restoreUndoSnapshot()
 {
+    if (_sheetWalkRunning) return false;
     if (_suppressUndoCapture) {
         return false;
     }
@@ -304,15 +314,6 @@ bool SegmentationModule::restoreUndoSnapshot()
             }
         }
 
-        // Also undo the corresponding auto-approval if approval mask is active
-        if (_overlay && _overlay->hasApprovalMaskData() && _overlay->canUndoAutoApproval()) {
-            _overlay->undoLastAutoApproval();
-            // Schedule save to persist the undo
-            if (_editManager && _editManager->baseSurface()) {
-                _overlay->scheduleDebouncedSave(_editManager->baseSurface().get());
-            }
-        }
-
         refreshOverlay();
         emitPendingChanges();
         queueAutosaveVertexUpdates(autosaveEdits);
@@ -358,17 +359,6 @@ void SegmentationModule::refreshSessionFromSurface(QuadSurface* surface)
         _state->setSurface("segmentation", _editManager->previewSurface(), false, true);
     }
 
-    // Update approval tool surface if editing approval mask
-    if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(surface);
-    }
-
-    // Reload approval mask image if showing OR editing approval mask
-    // Both modes need correct dimensions to render/paint properly
-    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
-        _overlay->loadApprovalMaskImage(surface);
-    }
-
     refreshOverlay();
     emitPendingChanges();
 }
@@ -382,45 +372,6 @@ bool SegmentationModule::applySurfaceUpdateFromGrowth(const cv::Rect& vertexRect
         return false;
     }
 
-    auto* baseSurf = _editManager->baseSurface().get();
-
-    // IMPORTANT: Reload approval mask image FIRST to get correct dimensions.
-    // The surface has already been updated with the preserved approval mask from growth,
-    // but the overlay's QImages still have the old dimensions. We must reload before
-    // doing any auto-approval painting, otherwise we'd paint into wrong-sized images
-    // and overwrite the correctly-preserved mask with garbage.
-    // Reload if showing OR editing - both modes need correct dimensions.
-    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
-        _overlay->loadApprovalMaskImage(baseSurf);
-    }
-
-    // Auto-approve the growth region if approval mask is active (growth = reviewed/corrected).
-    // Now that images are correctly sized, we can safely paint the auto-approval.
-    if (_autoApprovalEnabled && _overlay && _overlay->hasApprovalMaskData() && vertexRect.area() > 0) {
-        std::vector<std::pair<int, int>> gridPositions;
-        gridPositions.reserve(static_cast<size_t>(vertexRect.area()));
-        for (int row = vertexRect.y; row < vertexRect.y + vertexRect.height; ++row) {
-            for (int col = vertexRect.x; col < vertexRect.x + vertexRect.width; ++col) {
-                gridPositions.emplace_back(row, col);
-            }
-        }
-
-        if (!gridPositions.empty()) {
-            // performAutoApproval() paints and schedules a debounced save.
-            // A synchronous save here would rewrite approval.tif per growth
-            // step on the GUI thread; the debounce coalesces the burst.
-            performAutoApproval(gridPositions);
-            _overlay->clearApprovalMaskUndoHistory();
-            qCInfo(lcSegModule) << "Auto-approved growth region:" << gridPositions.size() << "vertices"
-                                << "(rect:" << vertexRect.width << "x" << vertexRect.height << ")";
-        }
-    }
-
-    // Update approval tool surface if editing approval mask
-    if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(baseSurf);
-    }
-
     refreshOverlay();
     emitPendingChanges();
     return true;
@@ -431,34 +382,6 @@ void SegmentationModule::requestAutosaveFromGrowth()
     markAutosaveNeeded();
 }
 
-void SegmentationModule::updateApprovalToolAfterGrowth(QuadSurface* surface)
-{
-    if (!surface) {
-        return;
-    }
-
-    // Use base surface if there's an active editing session, otherwise use the provided surface
-    QuadSurface* approvalSurface = surface;
-    if (_editManager && _editManager->hasSession()) {
-        approvalSurface = _editManager->baseSurface().get();
-    }
-
-    if (!approvalSurface) {
-        return;
-    }
-
-    // Update approval tool surface if editing approval mask
-    if (isEditingApprovalMask() && _approvalTool) {
-        _approvalTool->setSurface(approvalSurface);
-    }
-
-    // Reload approval mask image if showing OR editing approval mask
-    // Both modes need correct dimensions to render/paint properly
-    if ((_showApprovalMask || isEditingApprovalMask()) && _overlay) {
-        _overlay->loadApprovalMaskImage(approvalSurface);
-    }
-}
-
 void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offsetY)
 {
     if (_pointCollection) {
@@ -466,9 +389,118 @@ void SegmentationModule::applyCorrectionAnchorOffset(float offsetX, float offset
     }
 }
 
-void SegmentationModule::saveCorrectionPoints(const std::filesystem::path& segmentPath)
+void SegmentationModule::loadCorrections(QuadSurface* surface)
 {
-    if (_pointCollection && !segmentPath.empty()) {
-        _pointCollection->saveToSegmentPath(segmentPath);
+    _correctionsSurfaceId.clear();
+    if (!_pointCollection) {
+        return;
     }
+    std::map<uint64_t, nlohmann::json> stored;
+    if (const auto storeEdit = storeEditFor(surface)) {
+        try {
+            stored = vc3d::corrections::read(*_state->objectStoreSession(), storeEdit->pin().attachment, storeEdit->uuid(),
+                                             storeEdit->view());
+            _correctionsSurfaceId = storeEdit->uuid();
+        } catch (const std::exception& error) {
+            emit statusMessageRequested(tr("Cannot read correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+        }
+    }
+    _pointCollection->replaceAnchoredCollections(stored);
+}
+
+void SegmentationModule::saveCorrections()
+{
+    if (_correctionsSaveTimer && _correctionsSaveTimer->isActive()) {
+        _correctionsSaveTimer->stop();
+    }
+    if (!_pointCollection || _correctionsSurfaceId.empty() || !_storeEdit || _storeEdit->uuid() != _correctionsSurfaceId ||
+        !_state || !_state->annotationVolume()) {
+        return;
+    }
+    try {
+        vc3d::corrections::write(*_state->objectStoreSession(), _storeEdit->pin().attachment, _correctionsSurfaceId,
+                                 _pointCollection->anchoredCollections(), *_state->annotationVolume(), _storeEdit->view());
+    } catch (const std::exception& error) {
+        qCWarning(lcSegModule) << "Saving correction points failed:" << error.what();
+        emit statusMessageRequested(tr("Failed to save correction points: %1").arg(QString::fromUtf8(error.what())), kStatusLong);
+    }
+}
+
+vc::objects::CoordinateJson SegmentationModule::editCoordinates(const SurfaceStoreEdit& storeEdit) const
+{
+    if (const auto& view = storeEdit.view()) return vc::objects::volumeCoordinates(view->volume, view->scale);
+    vc::objects::CoordinateJson coordinates = nlohmann::json::object();
+    _state->objectStoreSession()->readStore(storeEdit.pin().attachment, [&](const vc::objects::StoreReader& reader, const auto&) {
+        if (const auto object = reader.currentObject(storeEdit.uuid()))
+            coordinates = nlohmann::json::parse(object->record.meta).value("coordinates", nlohmann::json::object());
+    });
+    return coordinates;
+}
+
+void SegmentationModule::offerRecoveredDraft(const QString& objectUuid)
+{
+    auto* drafts = _state ? _state->sessionDrafts() : nullptr;
+    const auto uuid = objectUuid.toStdString();
+    const auto surface = std::dynamic_pointer_cast<QuadSurface>(_state ? _state->surface("segmentation") : nullptr);
+    if (!drafts || !drafts->recovered(uuid) || !surface || surface->id != uuid || _offeringRecoveredDraft) return;
+    _offeringRecoveredDraft = true;
+    struct Reset { bool& flag; ~Reset() { flag = false; } } reset{_offeringRecoveredDraft};
+    const auto session = _state->objectStoreSession();
+    const auto contents = session->draftContents(uuid);
+    const auto state = session->draftState(uuid);
+    const auto storeEdit = storeEditFor(surface.get());
+    if (!contents || !state || !storeEdit) return;
+    const auto* points = surface->rawPointsPtr();
+    const auto pin = storeEdit->pin();
+    // The recovered grid must address this surface's grid in the frame it is open in.
+    QString mismatch;
+    if (!points || contents->surface.rows != points->rows || contents->surface.columns != points->cols)
+        mismatch = tr("its grid size differs from the surface as opened");
+    else if (vc::objects::geometryCoordinates(contents->coordinates) != vc::objects::geometryCoordinates(editCoordinates(*storeEdit)))
+        mismatch = tr("it was made in another volume or scale; open the surface in that volume to restore it");
+
+    QMessageBox box;
+    box.setIcon(QMessageBox::Question);
+    box.setWindowTitle(tr("Recovered edits"));
+    QString text = tr("Unsaved edits of surface %1 were recovered from an earlier session.").arg(objectUuid);
+    QPushButton* restore = nullptr;
+    QPushButton* keep = nullptr;
+    if (!mismatch.isEmpty()) {
+        text += QStringLiteral("\n\n") + tr("They cannot be restored here: %1.").arg(mismatch);
+        keep = box.addButton(tr("Keep for Later"), QMessageBox::RejectRole);
+    } else {
+        if (!state->base)
+            text += QStringLiteral("\n\n") + tr("The version they were made on is not known; restoring them replaces "
+                                                 "the surface's current geometry (version %1).").arg(pin.version);
+        else if (state->base->generation != pin.generation || state->base->version != pin.version)
+            text += QStringLiteral("\n\n") + tr("The surface was saved since they were made (version %1, now %2); "
+                                                 "restoring them replaces those changes.")
+                                                  .arg(state->base->version).arg(pin.version);
+        if (!state->conflict.empty())
+            text += QStringLiteral("\n\n") + tr("Their last save conflicted: %1").arg(QString::fromStdString(state->conflict));
+        restore = box.addButton(tr("Restore"), QMessageBox::AcceptRole);
+        keep = box.addButton(tr("Keep for Later"), QMessageBox::RejectRole);
+    }
+    auto* discard = box.addButton(tr("Discard"), QMessageBox::DestructiveRole);
+    box.setText(text);
+    box.setDefaultButton(restore ? restore : keep);
+    box.exec();
+    if (box.clickedButton() == discard) {
+        session->clearDraft(uuid);
+        _state->recoveredDraftResolved(uuid, false);
+        emit statusMessageRequested(tr("Recovered edits discarded."), kStatusMedium);
+        return;
+    }
+    if (!restore || box.clickedButton() != restore) return;
+
+    // The recovered grid becomes the surface's, reapplied on the version on
+    // screen, and the next autosave publishes all of it.
+    SessionDrafts::restoreSurface(*surface, contents->surface);
+    session->setDraft(uuid, contents->surface, contents->coordinates, pin.attachment, pin.reference());
+    _state->recoveredDraftResolved(uuid, true);
+    _saveSnapshot.reset();
+    _autosaveFullSurfaceNeeded = true;
+    _state->setSurface("segmentation", surface, false, true);
+    markAutosaveNeeded();
+    emit statusMessageRequested(tr("Recovered edits restored; saving."), kStatusMedium);
 }

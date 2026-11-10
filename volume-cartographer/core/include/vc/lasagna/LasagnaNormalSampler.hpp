@@ -1,25 +1,40 @@
 #pragma once
 
 #include "vc/lasagna/Dataset.hpp"
+#include "vc/lasagna/ChannelSampler.hpp"
 #include "vc/lasagna/LineModel.hpp"
 
 #include <cstddef>
+#include <array>
 #include <filesystem>
 #include <memory>
 #include <optional>
 #include <string_view>
+#include <utility>
+#include <vector>
 
-namespace vc::lasagna {
+namespace vc::lasagna
+{
 
+void validateLasagnaNormalDatasetStructure(const LasagnaDataset& dataset);
+
+// The memory cache of the sampler's channel arrays: `memoryCache` when set (one
+// cache shared with other readers), else a new cache of maxCachedBytes.
 struct LasagnaNormalSamplerOptions {
     size_t maxCachedBytes = 512ULL * 1024ULL * 1024ULL;
+    std::shared_ptr<vcr::MemoryCache> memoryCache;
 };
 
-class LasagnaNormalSampler final : public NormalSampler {
+class LasagnaNormalSampler final : public NormalSampler
+{
 public:
-    explicit LasagnaNormalSampler(
-        const LasagnaDataset& dataset,
-        LasagnaNormalSamplerOptions options = {});
+    struct FloatNormalSample {
+        cv::Vec3f normal{0.0f, 0.0f, 0.0f};
+        bool valid = false;
+    };
+
+    explicit LasagnaNormalSampler(const LasagnaDataset& dataset);
+    LasagnaNormalSampler(const LasagnaDataset& dataset, LasagnaNormalSamplerOptions options);
     ~LasagnaNormalSampler() override;
 
     LasagnaNormalSampler(const LasagnaNormalSampler&) = delete;
@@ -27,27 +42,34 @@ public:
     LasagnaNormalSampler(LasagnaNormalSampler&&) noexcept;
     LasagnaNormalSampler& operator=(LasagnaNormalSampler&&) noexcept;
 
+    [[nodiscard]] bool supportsConcurrentSampling() const noexcept override { return true; }
+    [[nodiscard]] bool masksInvalidCorners() const noexcept;
+    [[nodiscard]] std::array<LasagnaChannelBinding,3> regionChannels() const; // grad_mag,nx,ny
     [[nodiscard]] NormalSample sampleNormal(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] std::optional<double> sampleWindingDensity(const cv::Vec3d& volumePoint) const;
-    [[nodiscard]] std::optional<double> samplePredDt(const cv::Vec3d& volumePoint) const;
-    [[nodiscard]] bool hasPredDtChannel() const;
-    [[nodiscard]] std::optional<double> predDtSpacing() const;
-    [[nodiscard]] double windingDistance(const cv::Vec3d& a,
-                                         const cv::Vec3d& b,
-                                         double stepVx = 8.0) const;
-    [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(
-        const cv::Vec3d& volumePoint) const override;
-    [[nodiscard]] NormalPrefetchReport prefetchNormalSamples(
-        const std::vector<cv::Vec3d>& volumePoints,
-        bool withDerivative) const override;
+    [[nodiscard]] double windingDistance(const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
+    [[nodiscard]] double normalAlignedWindingDistance(
+        const cv::Vec3d& a, const cv::Vec3d& b, double stepVx = 8.0) const;
+    [[nodiscard]] std::vector<double> normalAlignedWindingDistancesBatch(
+        const std::vector<std::pair<cv::Vec3d, cv::Vec3d>>& connectors,
+        double stepVx = 8.0, int parallelThreads = 0) const;
+    [[nodiscard]] NormalSampleWithDerivative sampleNormalWithDerivative(const cv::Vec3d& volumePoint) const override;
     [[nodiscard]] NormalBatchReport sampleNormalBatch(
-        const std::vector<cv::Vec3d>& volumePoints,
-        bool withDerivative,
-        std::vector<NormalSampleWithDerivative>& samples) const override;
+        const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, std::vector<NormalSampleWithDerivative>& samples) const override;
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints, bool withDerivative, int parallelThreads, std::vector<NormalSampleWithDerivative>& samples) const override;
+    // Reuses chunks across points, preserving sampleNormal's arithmetic.
+    [[nodiscard]] NormalBatchReport sampleNormalBatchScalarEquivalent(
+        const std::vector<cv::Vec3d>& volumePoints, int parallelThreads,
+        std::vector<NormalSampleWithDerivative>& samples) const;
+    [[nodiscard]] NormalBatchReport sampleNormalBatch(const std::vector<cv::Vec3f>& volumePoints, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
+    // grad_mag, nx and ny when they share one sampling grid (corner batches), else null.
+    [[nodiscard]] std::array<const LasagnaChannelBinding*, 3> groupedCornerBindings() const noexcept;
+    void materializeGroupedCorners(const LasagnaCornerBatch& corners, size_t firstVolume, int parallelThreads, std::vector<FloatNormalSample>& samples) const;
 
 private:
     class Impl;
     std::unique_ptr<Impl> impl_;
 };
 
-} // namespace vc::lasagna
+}  // namespace vc::lasagna

@@ -2,6 +2,7 @@
 
 #include <QDockWidget>
 #include "vc/ui/VCCollection.hpp"
+#include <nlohmann/json.hpp>
 #include <QTreeView>
 #include <QStandardItemModel>
 #include <QPushButton>
@@ -16,6 +17,7 @@
 #include <cmath>
 #include <filesystem>
 #include <unordered_map>
+#include <optional>
 
 
 
@@ -36,7 +38,8 @@ public:
     explicit CPointCollectionWidget(VCCollection *collection, QWidget *parent = nullptr);
     ~CPointCollectionWidget();
 
-    void loadCorrPointsResults(const std::filesystem::path& jsonPath);
+    // Lasagna's results for the surface's correction points (points_list).
+    void loadCorrPointsResults(const nlohmann::json& results);
     void clearCorrPointsResults();
 
     void setAnnotateChecked(bool checked);
@@ -46,14 +49,18 @@ signals:
     void annotateToggled(bool enabled);
     void pointViewToleranceChanged(double tolerance);
     void collectionSelected(uint64_t collectionId);
-    void pointSelected(uint64_t pointId);
-    void pointDoubleClicked(uint64_t pointId);
-    void convertPointToAnchorRequested(uint64_t pointId, uint64_t collectionId);
-    void focusViewsRequested(uint64_t collectionId, uint64_t pointId);
+    void collectionSelectionCleared();
+    void pointSelected(vc::PointRef point);
+    void pointSelectionCleared();
+    void pointDoubleClicked(vc::PointRef point);
+    void convertPointToAnchorRequested(vc::PointRef point);
+    void focusCollectionRequested(uint64_t collectionId);
+    void focusPointRequested(vc::PointRef point);
 
 public slots:
     void selectCollection(uint64_t collectionId);
-    void selectPoint(uint64_t pointId);
+    void clearSelection();
+    void selectPoint(vc::PointRef point);
 
 private slots:
     void refreshTree();
@@ -63,7 +70,7 @@ private slots:
     void onPointAdded(const ColPoint& point);
     void onPointsAdded(const std::vector<ColPoint>& points);
     void onPointChanged(const ColPoint& point);
-    void onPointRemoved(uint64_t pointId);
+    void onPointRemoved(vc::PointRef point);
 
     void onResetClicked();
     void onResetWindingClicked();
@@ -77,8 +84,6 @@ private slots:
     void onFillWindingPlusClicked();
     void onFillWindingMinusClicked();
     void onFillWindingEqualsClicked();
-    void onSaveClicked();
-    void onLoadClicked();
     void onConvertToAnchorClicked();
     void onClearAnchorClicked();
     void showContextMenu(const QPoint& pos);
@@ -86,12 +91,13 @@ private slots:
  private:
     void keyPressEvent(QKeyEvent *event) override;
     void setupUi();
+    void clearTreeModel();
     void updateMetadataWidgets();
     QStandardItem* findCollectionItem(uint64_t collectionId);
 
     VCCollection *_point_collection = nullptr;
-    uint64_t _selected_collection_id = 0;
-    uint64_t _selected_point_id = 0;
+    std::optional<uint64_t> _selected_collection_id;
+    std::optional<vc::PointRef> _selected_point;
 
     QCheckBox *_chkAnnotate{nullptr};
     QDoubleSpinBox *_pointViewToleranceSpinbox{nullptr};
@@ -99,8 +105,6 @@ private slots:
     QTreeView *_tree_view;
     QStandardItemModel *_model;
  
-    QPushButton *_load_button;
-    QPushButton *_save_button;
     QPushButton *_reset_button;
     QPushButton *_reset_winding_button;
 
@@ -122,6 +126,6 @@ private slots:
     QDoubleSpinBox* _winding_spinbox;
     QPushButton *_convert_to_anchor_button;
 
-    std::unordered_map<uint64_t, CorrPointResult> _corr_point_results;
+    std::unordered_map<vc::PointRef, CorrPointResult> _corr_point_results;
     std::unordered_map<uint64_t, float> _corr_collection_avgs;
 };

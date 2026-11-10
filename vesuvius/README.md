@@ -6,7 +6,7 @@ From [Vesuvius Challenge](https://scrollprize.org), a Python library for :
 - Inferring with models trained with the trainers provided in the package or with pretrained nnUNetv2 models
   - Inference can be performed on remote data (http, s3) stored as Zarr arrays
 - Rendering .obj segments with local or remote data
-- Voxelizing large .obj segmentations for use as 3d labels
+- Voxelizing tifxyz surfaces for use as 3d labels
 - Preprocessing labels of fiber-like structures
 - Interactive labeling and model training through a Napari based trainer
 - Proofreading large arrays of image/label pairs and saving approved chunks
@@ -26,26 +26,60 @@ _this package is in active development_
 | `vesuvius.predict`            | `models.run.inference`             | outputs logits from a pretrained nnUNet-v2 model or one trained within the Vesuvius training framework; currently only works on Zarr data and can be fully distributed with `--num_parts` and `--part_id` |
 | `vesuvius.blend_logits`       | `models.run.blending`              | blends the logits from `vesuvius.predict` using Gaussian blending                                                                                                                                         |
 | `vesuvius.finalize_outputs`   | `models.run.finalize_outputs`      | performs softmax / argmax / none on the blended array and writes a final `uint8` volume                                                                                                                   |
+| `vesuvius.fiber_spline_generator` | `fiber_spline_generator.cli`       | [predicts fibers](docs/fiber_spline_generator.md) in a zone of a Zarr volume and writes their polylines in a fiber object store (`.vcobj`) for VC3D                                                       |
 | `vesuvius.compute_st`         | `structure_tensor.run_create_st`   | computes structure tensors on input data and derives eigen-values/vectors                                                                                                                                 |
 | `vesuvius.napari_trainer`     | `napari_trainer.main_window`       | launches a Napari window for interactive training and inference                                                                                                                                           |
-| `vesuvius.proofreader`        | `utils.vc_proofreader.main`        | opens a Napari window that loads local / remote image-label arrays and extracts training patches                                                                                                          |
-| `vesuvius.voxelize_obj`       | `scripts.voxelize_objs`            | converts input `.obj` meshes to voxel grids and outputs `.tif` stacks                                                                                                                                     |
-| `vesuvius.refine_labels`      | `scripts.edt_frangi_label`         | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
-| `vesuvius.render_obj`         | `rendering.mesh_to_surface`        | renders `.obj` meshes and outputs their surface-volume layers                                                                                                                                             |
-| `vesuvius.flatten_obj`        | `rendering.slim_uv`                | flattens an `.obj` mesh using `slim_uv`                                                                                                                                                                   |
-| `vesuvius.train`              | `models.run.train`                 | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.voxelize_obj`       | `label_processing.voxelize_objs`     | voxelizes tifxyz surfaces with bicubic interpolation into OME-Zarr pyramids or TIFF stacks |
+| `vesuvius.refine_labels`      | `label_processing.refine_labels`  | refines surface or fibre labels with a custom Frangi-based filter                                                                                                                                         |
+| `vesuvius.train`              | `models.training.train`            | main entry point for training models                                                                                                                                                                      |
+| `vesuvius.accept_terms`       | `install.accept_terms`             | accepts the data terms and conditions; pass `--yes` to accept non-interactively |
+| `vesuvius.blend_and_finalize` | `models.run.blending`              | fused `vesuvius.blend_logits` + `vesuvius.finalize_outputs` in a single pass |
+| `vesuvius.find_patches`       | `models.preprocessing.patches.cli` | scans a Zarr dataset and writes the valid-patch cache used by training |
 
 
 
+
+### Tifxyz voxelization
+
+The historical `vesuvius.voxelize_obj` command now accepts a tifxyz directory
+(`x.tif`, `y.tif`, `z.tif`, `meta.json`) or a folder of those directories.
+Use `--recursive` to include nested directories. It reads geometry and optional
+masks with `vc_reader.tifxyz`, sampling bicubic patches without triangulation.
+Use a current `vc_reader` build with `Surface.points_at(..., tangents=True)`.
+
+```bash
+python -m vesuvius.label_processing.voxelize_objs /data/surfaces \
+  --spatial-shape 1000 2000 2000 --output_path labels.zarr --num_workers 4
+```
+
+`--format tifs` writes a complete TIFF stack. Existing affine, normals, surface
+frame, dtype and chunk options remain available; output filename defaults retain
+their historical `mesh_` prefix. Normals and frames use XYZ components, with
+increasing stored columns defining `t_u` and increasing rows defining `t_v`.
+Frames are orthonormalized from the transformed bicubic derivatives; normals
+follow `dP/du × dP/dv`, including under reflections.
+
+Sorted surface paths receive labels 1 through N. Later surfaces win overlaps,
+including their normal/frame values. Within each surface, the nearest sampled
+point to the voxel centre wins, with deterministic ties. Points round to the
+nearest voxel, with half ties upward. Sampling density is estimated from the
+longest transformed grid edge along each axis, targeting quarter-voxel spacing.
+This approximates coverage and can miss small corner intersections; it is not an
+exact patch/voxel intersection. Invalid patches and out-of-volume points are
+discarded. UV metadata scale does not rescale XYZ coordinates. Surface grids and
+sparse voxel results must fit in memory; interpolation queries are batched.
+
+Regression checks use synthetic planes, curved patches, masks and affines:
+`python -m pytest tests/test_voxelize_tifxyz.py` from `vesuvius/`.
 
 ## 📓 Introductory notebooks
 To get started, we recommend these notebooks that jump right in:
 
-1. 📊 [Scroll Data Access](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example1_data_access.ipynb): an introduction to accessing scroll data using a few lines of Python!
+1. 📊 [Scroll Data Access](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example1_data_access.ipynb): an introduction to accessing scroll data using a few lines of Python!
 
-2. ✒️ [Ink Detection](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example2_ink_detection.ipynb): load and visualize segments with ink labels, and train models to detect ink in CT.
+2. ✒️ [Ink Detection](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example2_ink_detection.ipynb): load and visualize segments with ink labels, and train models to detect ink in CT.
 
-3. 🧩 [Volumetric instance segmentation cubes](https://colab.research.google.com/github/ScrollPrize/vesuvius/blob/main/notebooks/example3_cubes_bootstrap.ipynb): how to access instance-annotated cubes with the `Cube` class, used for volumetric segmentation approaches.
+3. 🧩 [Volumetric instance segmentation cubes](https://colab.research.google.com/github/ScrollPrize/villa/blob/main/vesuvius/src/vesuvius/examples/notebooks/example3_cubes_bootstrap.ipynb): how to access instance-annotated cubes with the `Cube` class, used for volumetric segmentation approaches.
 
 ## `vesuvius` does:
 - **Data retrieval**: Fetches volumetric scroll data, surface volumes of scroll segments, and annotated volumetric instance segmentation labels. Remote repositories and local files are supported.
@@ -61,22 +95,55 @@ To get started, we recommend these notebooks that jump right in:
 ## Installation
 
 `vesuvius` can be installed with `pip`.
-Then, before using the library for the first time, accept the license terms:
 ```sh
 $ pip install vesuvius
-$ vesuvius.accept_terms --yes
 ```
+
+For monorepo development, `uv sync --extra models`, `uv sync --extra all`, and
+`uv sync --all-extras` build the local `volume-cartographer` and `vc-object-store`
+Python bindings from C++ source. Install their [native build prerequisites](../volume-cartographer/README.md#python-source-builds)
+first, including **Qt6 Core development files** (`qt6-base-dev` on Ubuntu/Debian,
+`qt` in Homebrew), even for headless use. `uv` does not install these system
+libraries. This requirement does not apply to the base `vesuvius` installation
+shown above.
+
+To run the neural Copy script (`vesuvius.neural_tracing.inference.infer_rowcol_triplet_wraps`)
+without building `volume-cartographer` (for example on Windows), skip that package:
+`uv sync --frozen --extra models --no-install-package volume-cartographer`. The script then
+reads the volume with zarr-python and keeps no disk chunk cache (`--volume-cache-dir` and
+`--volume-chunk-cache-gb` are not used). Without uv's monorepo sources, `vesuvius[models]`
+does not resolve, because `volume-cartographer` is not on PyPI.
+
+## Data licence
+
+Using the data that `vesuvius` reads means agreeing to these terms:
+
+All Vesuvius Challenge datasets are released under CC BY-NC 4.0 (https://creativecommons.org/licenses/by-nc/4.0/legalcode.txt), except Scrolls 1–4 and Fragments 1–6, which are bound by the following terms:
+
+By registering for downloads from the EduceLab-Scrolls Dataset and Vesuvius Challenge Discord Server, I agree to license the data from Vesuvius Challenge* under the following licensing terms:
+- I agree that all points below apply to both the EduceLab-Scrolls Dataset downloaded from our webserver, as well as any data (e.g. text, pictures, code) downloaded from the Vesuvius Challenge Discord Server.
+- I will not redistribute the data without the written approval of Vesuvius Challenge (if I am working in a team, every team member will sign this form separately).
+Vesuvius Challenge reserves the right to use in any way, including in an academic or other publication, all submissions or results produced from this dataset.
+- I will not make public (outside of Discord) any revelation of hidden text (or associated code) without the written approval of Vesuvius Challenge.
+- I agree all publications and presentations resulting from any use of the EduceLab-Scrolls Dataset must cite use of the EduceLab-Scrolls Dataset as follows:
+- In any published abstract, I will cite "EduceLab-Scrolls" as the source of the data in the abstract.
+- In any published manuscripts using data from EduceLab-Scrolls, I will reference the following paper: Parsons, S., Parker, C. S., Chapman, C., Hayashida, M., & Seales, W. B. (2023). EduceLab-Scrolls: Verifiable Recovery of Text from Herculaneum Papyri using X-ray CT. ArXiv [Cs.CV]. https://doi.org/10.48550/arXiv.2304.02084.
+- I will include language similar to the following in the methods section of my manuscripts in order to accurately acknowledge the data source: "Data used in the preparation of this article were obtained from the EduceLab-Scrolls dataset [above citation]."
+- I understand that all submissions will be reviewed by the Vesuvius Challenge Review Team, and that prizes will be awarded as the sole discretion of Vesuvius Challenge.
+When I post or upload data in Discord (e.g. text, pictures, code), I agree to license it to other participants under these same terms.
+
+* All EduceLab-Scrolls data is copyrighted by EduceLab/The University of Kentucky. Permission to use the data linked herein according to the terms outlined above is granted to Vesuvius Challenge.
 
 ___
 **Note:** 
 
 The model framework utilized by `vesuvius` is _heavily_ inspired by [nnUNetv2](https://github.com/MIC-DKFZ/nnUNet). The default configuration will use the same blocks and construct the same encoders/decoders as the default nnUNetv2 ResEncUNet. As such, a significant portion of the code from the nnUNetv2 repository is duplicated here, with modifications to enable multi-task support with dynamic decoder branches, as well as other data formats. 
 
-Additionally, the augmentations provided within this package are from another of [MIC-DKFZ's](https://github.com/MIC-DKFZ) fantastic array of machine learning libraries, in this case [batchgeneratorsv2](https://github.com/MIC-DKFZ/batchgeneratorsv2). 
+Training augmentations come from `vc_reader.transforms`.
 
 Copying the modules directly into `vesuvius` was a choice of end-user friendliness, as we were using highly modified branches of both libraries, which created conflicts if an end user were to attempt to run any of our models.
 
-_**Detailed documentation for training and inference are located in [the docs folder](docs/docs)**_
+_**Detailed documentation for training and inference are located in [the docs folder](docs)**_
 ___
 
 
@@ -90,21 +157,21 @@ ___
 6. Infer on the same layer, or another by importing an image, selecting it in the inference widget, and hitting `Run Inference`
 
 
-![alt text](docs/docs/images/napari_trainer.png)
+![alt text](docs/images/napari_trainer.png)
 
 ___
 
 ### Proofreading labels
 
-1. Update the config in `/utils/vc_proofreader/config.py` with the proper paths
-2. Run `vesuvius.proofreader`
+1. The proofreader is no longer a `vesuvius` entrypoint; it lives in [`segmentation/vc_proofreader`](../segmentation/vc_proofreader/main.py)
+2. Run `python segmentation/vc_proofreader/main.py --config <config.json or config.py>` from the repository root
 3. Select your desired patch size and min labeled percentage 
 4. Click `run` 
 5. Approve patches with `a` or by checking the box
 6. Skip patches or continue with `spacebar` or `next pair`
 7. Patches are saved in the output dir, and their locations in the .json progress file
 
-![alt text](docs/docs/images/proofreader.png)
+![alt text](docs/images/proofreader.png)
 
 ### Training with `vesuvius.train`
 

@@ -36,12 +36,13 @@ GPU-accelerated, containerized inference for ink detection models. The GPU image
 | `USE_ZARR_COMPRESSION` | Enable zarr compression | `false` |
 | `COMPILE` | Enable torch.compile | `1` |
 | `COMPILE_MODE` | torch.compile mode | `reduce-overhead` |
+| `PAD_LAST_BATCH` | Zero-pad the final partial batch to `BATCH_SIZE` so torch.compile and cudnn see one shape (avoids a recompile; tiles in that batch may change at fp16 noise level) | `false` |
 
 **Inference Configuration Notes:**
 - `TILE_SIZE`: Sets both the tile extraction size and network input size. Larger values = more context but more memory. Should match training size for best results (typically 64)
 - `STRIDE`: Controls overlap between tiles. Smaller stride = more overlap = smoother blending but slower inference
 - `BATCH_SIZE`: Number of tiles to process in parallel. Larger values = faster but more GPU memory. Reduce if you encounter OOM errors
-- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window such as `START_LAYER=1`, `END_LAYER=63`
+- `resnet3d-152-3d-decoder`: Best aligned with the tracked 3D-decoder checkpoints when using `TILE_SIZE=256` and a 62-layer window centred on the segment surface, which is the middle slice of the published surface volumes: for a 109-layer volume (e.g. PHerc0139 at 2.4 um) use `START_LAYER=23`, `END_LAYER=85`, the window that reproduces the published predictions. `START_LAYER=1`, `END_LAYER=63` is centred only on a 65-layer volume
 
 ### S3 layout (expected)
 
@@ -87,16 +88,19 @@ The `Dockerfile` builds a slim runtime with a prebuilt virtualenv layer.
 
 ### Build
 
+Both images build `vc_reader` from this monorepo, passed as the `vc_reader` build context
+(BuildKit; `build.sh` does this):
+
 ```bash
 # GPU inference image
-docker build --target gpu -t ink-detection-optimized-inference:gpu .
+docker build --build-context vc_reader=../../vc_reader --target gpu -t ink-detection-optimized-inference:gpu .
 
 # CPU utility image
-docker build --target cpu -t ink-detection-optimized-inference:cpu .
+docker build --build-context vc_reader=../../vc_reader --target cpu -t ink-detection-optimized-inference:cpu .
 
 # Agent mode with explicit opt-in
-AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --target gpu -t ink-detection-optimized-inference:gpu .
-AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --target cpu -t ink-detection-optimized-inference:cpu .
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --build-context vc_reader=../../vc_reader --target gpu -t ink-detection-optimized-inference:gpu .
+AGENTS_AGENT_MODE=1 AGENTS_ALLOW_INSTALL=1 docker build --build-context vc_reader=../../vc_reader --target cpu -t ink-detection-optimized-inference:cpu .
 ```
 
 Notes:
@@ -121,7 +125,7 @@ docker run --rm --gpus all \
 
 Authentication options:
 - In AWS/Kubernetes, prefer IAM roles (IRSA) for S3 access.
-- For local runs, standard AWS env vars/credentials are supported by `boto3`.
+- For local runs, AWS credentials come from the environment and the shared AWS files (vc_reader); SSO, assumed roles and instance metadata are not supported.
 
 ### CPU utility-only run
 
@@ -319,6 +323,7 @@ argo submit wf.yaml \
 
 Tip:
 - `END_LAYER` is exclusive. For layers `00.tif` through `25.tif`, use `START_LAYER=0`, `END_LAYER=26`.
+- Centre the window on the surface. For a volume of `N` layers with the surface in the middle slice and a window of `W` layers, use `START_LAYER` = (N - W) / 2 rounded down and `END_LAYER` = `START_LAYER` + W (109 layers: 23 and 85; 65 layers: 1 and 63).
 
 ## Notes on models
 

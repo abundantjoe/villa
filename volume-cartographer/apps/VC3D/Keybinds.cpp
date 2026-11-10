@@ -12,12 +12,16 @@ constexpr const char* kSectionNavigation = "Navigation";
 constexpr const char* kSectionSegments = "Segments";
 constexpr const char* kSectionSurfaceTags = "Surface Tags";
 constexpr const char* kSectionSegEditing = "Segmentation Editing";
-constexpr const char* kSectionApprovalMask = "Approval Mask";
 constexpr const char* kSectionSegGrowth = "Segmentation Growth";
 constexpr const char* kSectionPushPull = "Push/Pull";
 constexpr const char* kSectionPointCollection = "Point Collection";
 constexpr const char* kSectionMouseControls = "Mouse Controls";
-constexpr const char* kSectionSliceStep = "Slice Step Size";
+constexpr const char* kSectionSliceStep = "Z-Scroll Sensitivity";
+// The line annotation workspace owns its panes' keyboard handling, so these
+// keys shadow the global bindings above while that workspace has focus. They
+// are listed as literals because the dialog binds them directly rather than
+// through the ShortcutDef/KeyPressDef registry.
+constexpr const char* kSectionLineAnnotation = "Line Annotation Workspace (overrides global keys)";
 
 enum class HelpKeyType {
     Shortcut,
@@ -66,14 +70,6 @@ const ShortcutDef SurfaceNormals{
     "Ctrl+N",
     QKeySequence::Open
 };
-const ShortcutDef DirectionHints{
-    "direction_hints",
-    kSectionViewMenu,
-    "Toggle direction hints (flip_x arrows)",
-    ShortcutKind::Text,
-    "Ctrl+T",
-    QKeySequence::Open
-};
 const ShortcutDef CompositeView{
     "composite_view",
     kSectionViewMenu,
@@ -112,6 +108,14 @@ const ShortcutDef ResetView{
     "Reset view (fit surface and reset Z offset)",
     ShortcutKind::Text,
     "m",
+    QKeySequence::Open
+};
+const ShortcutDef ZoomToFit{
+    "zoom_to_fit",
+    kSectionViewerControls,
+    "Zoom to fit segment (flattened segmentation viewer)",
+    ShortcutKind::Text,
+    "Ctrl+0",
     QKeySequence::Open
 };
 const ShortcutDef WorldOffsetZPos{
@@ -208,7 +212,7 @@ const KeyPressDef RecenterFocus{
 const KeyPressDef SliceStepDecrease{
     "slice_step_decrease",
     kSectionSliceStep,
-    "Decrease slice step size",
+    "Decrease Z-scroll sensitivity",
     Qt::Key_G,
     Qt::ShiftModifier,
     false
@@ -216,40 +220,16 @@ const KeyPressDef SliceStepDecrease{
 const KeyPressDef SliceStepIncrease{
     "slice_step_increase",
     kSectionSliceStep,
-    "Increase slice step size",
+    "Increase Z-scroll sensitivity",
     Qt::Key_H,
     Qt::ShiftModifier,
     false
 };
 
-const KeyPressDef ApprovalPaintToggle{
-    "approval_paint_toggle",
-    kSectionApprovalMask,
-    "Toggle approval painting (when mask is shown)",
-    Qt::Key_B,
-    Qt::NoModifier,
-    true
-};
-const KeyPressDef UnapprovalPaintToggle{
-    "unapproval_paint_toggle",
-    kSectionApprovalMask,
-    "Toggle unapproval painting (when mask is shown)",
-    Qt::Key_N,
-    Qt::NoModifier,
-    true
-};
-const KeyPressDef ApprovalUndo{
-    "approval_undo",
-    kSectionApprovalMask,
-    "Undo last approval mask stroke",
-    Qt::Key_B,
-    Qt::ControlModifier,
-    true
-};
 const KeyPressDef SegmentationUndo{
     "segmentation_undo",
     kSectionSegEditing,
-    "Undo last change (segmentation or approval mask)",
+    "Undo last segmentation change",
     Qt::Key_Z,
     Qt::ControlModifier,
     true
@@ -260,14 +240,6 @@ const KeyPressDef ManualAddToggle{
     "Toggle Manual Add mode",
     Qt::Key_E,
     Qt::ShiftModifier,
-    true
-};
-const KeyPressDef LineDrawHold{
-    "line_draw_hold",
-    kSectionSegEditing,
-    "Line draw mode (hold)",
-    Qt::Key_S,
-    Qt::NoModifier,
     true
 };
 const KeyPressDef GrowSegmentation{
@@ -487,7 +459,6 @@ QString buildKeybindsHelpText()
         { kSectionFileMenu, shortcuts::OpenVolpkg.description, HelpKeyType::Shortcut, &shortcuts::OpenVolpkg, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::AxisAlignedSlices.description, HelpKeyType::Shortcut, &shortcuts::AxisAlignedSlices, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::SurfaceNormals.description, HelpKeyType::Shortcut, &shortcuts::SurfaceNormals, nullptr, nullptr },
-        { kSectionViewMenu, shortcuts::DirectionHints.description, HelpKeyType::Shortcut, &shortcuts::DirectionHints, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::CompositeView.description, HelpKeyType::Shortcut, &shortcuts::CompositeView, nullptr, nullptr },
         { kSectionViewMenu, shortcuts::RawPointsOverlay.description, HelpKeyType::Shortcut, &shortcuts::RawPointsOverlay, nullptr, nullptr },
         { kSectionViewMenu, keypress::ToggleVolumeOverlay.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleVolumeOverlay, nullptr },
@@ -497,6 +468,7 @@ QString buildKeybindsHelpText()
         { kSectionViewerControls, shortcuts::ZoomIn.description, HelpKeyType::Shortcut, &shortcuts::ZoomIn, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::ZoomOut.description, HelpKeyType::Shortcut, &shortcuts::ZoomOut, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::ResetView.description, HelpKeyType::Shortcut, &shortcuts::ResetView, nullptr, nullptr },
+        { kSectionViewerControls, shortcuts::ZoomToFit.description, HelpKeyType::Shortcut, &shortcuts::ZoomToFit, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::WorldOffsetZPos.description, HelpKeyType::Shortcut, &shortcuts::WorldOffsetZPos, nullptr, nullptr },
         { kSectionViewerControls, shortcuts::WorldOffsetZNeg.description, HelpKeyType::Shortcut, &shortcuts::WorldOffsetZNeg, nullptr, nullptr },
         { kSectionViewerControls, "Pan view", HelpKeyType::Literal, nullptr, nullptr, "Arrow Keys" },
@@ -512,7 +484,8 @@ QString buildKeybindsHelpText()
 
         { kSectionSegEditing, keypress::SegmentationUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::SegmentationUndo, nullptr },
         { kSectionSegEditing, keypress::ManualAddToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ManualAddToggle, nullptr },
-        { kSectionSegEditing, keypress::LineDrawHold.description, HelpKeyType::KeyPress, nullptr, &keypress::LineDrawHold, nullptr },
+        { kSectionSegEditing, "Manual Add: extend left / up / down / right (again: apply and continue)", HelpKeyType::Literal, nullptr, nullptr, "  1 / 2 / 3 / 4" },
+        { kSectionSegEditing, "Manual Add: extend only part of an edge", HelpKeyType::Literal, nullptr, nullptr, "  Shift+Drag along it" },
         { kSectionSegEditing, keypress::ToggleAnnotation.description, HelpKeyType::KeyPress, nullptr, &keypress::ToggleAnnotation, nullptr },
         { kSectionSegEditing, "Anchor correction drag", HelpKeyType::Literal, nullptr, nullptr, "Hold G + Drag" },
         { kSectionSegEditing, "Add correction point", HelpKeyType::Literal, nullptr, nullptr, "  Click" },
@@ -521,9 +494,6 @@ QString buildKeybindsHelpText()
         { kSectionSegEditing, keypress::EnableEditing.description, HelpKeyType::KeyPress, nullptr, &keypress::EnableEditing, nullptr },
         { kSectionSegEditing, keypress::CancelOperation.description, HelpKeyType::KeyPress, nullptr, &keypress::CancelOperation, nullptr },
 
-        { kSectionApprovalMask, keypress::ApprovalPaintToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::ApprovalPaintToggle, nullptr },
-        { kSectionApprovalMask, keypress::UnapprovalPaintToggle.description, HelpKeyType::KeyPress, nullptr, &keypress::UnapprovalPaintToggle, nullptr },
-        { kSectionApprovalMask, keypress::ApprovalUndo.description, HelpKeyType::KeyPress, nullptr, &keypress::ApprovalUndo, nullptr },
 
         { kSectionSegGrowth, keypress::GrowSegmentation.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowSegmentation, nullptr },
         { kSectionSegGrowth, keypress::GrowthLeft.description, HelpKeyType::KeyPress, nullptr, &keypress::GrowthLeft, nullptr },
@@ -552,6 +522,19 @@ QString buildKeybindsHelpText()
 
         { kSectionSliceStep, keypress::SliceStepDecrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepDecrease, nullptr },
         { kSectionSliceStep, keypress::SliceStepIncrease.description, HelpKeyType::KeyPress, nullptr, &keypress::SliceStepIncrease, nullptr },
+
+        { kSectionLineAnnotation, "Rotate the current cut about the horizontal axis", HelpKeyType::Literal, nullptr, nullptr, "W / S" },
+        { kSectionLineAnnotation, "Rotate the current cut about the vertical axis", HelpKeyType::Literal, nullptr, nullptr, "A / D" },
+        { kSectionLineAnnotation, "Jump to the previous control point", HelpKeyType::Literal, nullptr, nullptr, "E" },
+        { kSectionLineAnnotation, "Jump to the next control point", HelpKeyType::Literal, nullptr, nullptr, "T" },
+        { kSectionLineAnnotation, "Pan to the previous/next control point (hold to cruise through)", HelpKeyType::Literal, nullptr, nullptr, "Left / Right" },
+        { kSectionLineAnnotation, "Adjust the arrow-pan cruise speed", HelpKeyType::Literal, nullptr, nullptr, "Up / Down" },
+        { kSectionLineAnnotation, "Place a control point at the current-position dot", HelpKeyType::Literal, nullptr, nullptr, "/ or 0" },
+        { kSectionLineAnnotation, "Snap the panes to the overview-bar cursor", HelpKeyType::Literal, nullptr, nullptr, "R" },
+        { kSectionLineAnnotation, "Reset the side cut and strip normal offsets", HelpKeyType::Literal, nullptr, nullptr, "B" },
+        { kSectionLineAnnotation, "Toggle the current cut following the strip mouse", HelpKeyType::Literal, nullptr, nullptr, "Space" },
+        { kSectionLineAnnotation, "Close the workspace", HelpKeyType::Literal, nullptr, nullptr, "Esc" },
+        { kSectionLineAnnotation, "Step along the line (current cut) or the normal offset (side cut, strips)", HelpKeyType::Literal, nullptr, nullptr, "Shift+Scroll Wheel" },
     };
 
     QString result;

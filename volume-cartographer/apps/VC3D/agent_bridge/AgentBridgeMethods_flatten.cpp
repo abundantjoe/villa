@@ -1,0 +1,73 @@
+#include "agent_bridge/AgentBridgeServer.hpp"
+
+namespace Params = AgentBridgeParams;
+namespace Mcp = AgentBridgeMcpTools;
+
+namespace {
+
+AgentBridgeParam integerAtLeast(
+    const QString& name,
+    int defaultValue,
+    int minimum)
+{
+    AgentBridgeParam param = Params::optionalInteger(name, defaultValue);
+    param.minimum = minimum;
+    return param;
+}
+
+AgentBridgeParam numberAtLeast(
+    const QString& name,
+    double defaultValue,
+    double minimum)
+{
+    AgentBridgeParam param = Params::optionalNumber(name, defaultValue);
+    param.minimum = minimum;
+    return param;
+}
+
+AgentBridgeParam keepPercent()
+{
+    AgentBridgeParam param =
+        Params::optionalNumber(QStringLiteral("keepPercent"), 100.0);
+    param.minimum = 0.0;
+    param.exclusiveMinimum = true;
+    param.maximum = 100.0;
+    return param;
+}
+
+}  // namespace
+
+void AgentBridgeServer::registerFlattenHandlers()
+{
+    registerMethod(
+        {
+            .name = QStringLiteral("flatten.slim"),
+            .params = {
+                Params::requiredString(QStringLiteral("segmentId")),
+                integerAtLeast(QStringLiteral("iterations"), 50, 1),
+                numberAtLeast(QStringLiteral("tolerance"), 0.0, 0.0),
+                Params::nullable(
+                    Params::optionalStringEnum(
+                        QStringLiteral("energyType"),
+                        {
+                            QStringLiteral("symmetric_dirichlet"),
+                            QStringLiteral("conformal"),
+                        },
+                        QStringLiteral("symmetric_dirichlet"))),
+                keepPercent(),
+                Params::optionalBoolean(
+                    QStringLiteral("inpaintHoles"),
+                    false),
+                Params::optionalString(QStringLiteral("outputName")),
+            },
+            .errors = {
+                -32602, -32000, -32001, -32004, -32005, -32006, -32007,
+                -32009,
+            },
+            .mcp = Mcp::snakeCase(
+                QStringLiteral("vc3d_flatten_slim"),
+                {QStringLiteral("wait")}),
+        },
+        [this](const QJsonValue& p) { return handleFlattenSlim(p); });
+
+}

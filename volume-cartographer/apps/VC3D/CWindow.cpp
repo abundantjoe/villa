@@ -1,31 +1,43 @@
 #include "CWindow.hpp"
 
-#include "RenderBenchRecorder.hpp"
-#include "RenderBenchReplay.hpp"
+#include <vc_reader/array.hpp>
+#include <vc_reader/zarr.hpp>
+#include "VolumeComboTooltip.hpp"
+
+#include "FiberLengthDisplay.hpp"
+#include "VolumeDisplayNames.hpp"
+#include <vc_object_store/objects/GeometryCoordinates.hpp>
+#include <vc_object_store/objects/VolumeTransforms.hpp>
+#include "vc/core/util/RemoteUrl.hpp"
+
+#include "StatusDockPanelHost.hpp"
 
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/SurfacePatchIndex.hpp"
-#include "vc/atlas/Atlas.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
 
 #include <iostream>
 
+#include <array>
 #include <functional>
+#include <optional>
 
 #include "VCSettings.hpp"
+#include "SessionDrafts.hpp"
 #include "Keybinds.hpp"
-#include <QGridLayout>
+#include "OpenDataNormalGrids.hpp"
+#include "viewer_controls/panels/ViewerCompositePanel.hpp"
+#include "viewer_controls/panels/ViewerInkDetectionPanel.hpp"
+#include <QLoggingCategory>
 #include <QAction>
 #include <QVBoxLayout>
-#include <QCursor>
 #include <QEvent>
 #include <QKeyEvent>
 #include <QResizeEvent>
 #include <QSettings>
+#include <QDateTime>
+#include <QStandardPaths>
 #include <QMdiArea>
 #include <QMdiSubWindow>
 #include <QApplication>
@@ -33,18 +45,13 @@
 #include <QStyleHints>
 #include <QWindow>
 #include <QScreen>
-#include <QDesktopServices>
 #include <QUrl>
 #include <QClipboard>
 #include <QFileDialog>
 #include <QFileInfo>
-#include <QJsonDocument>
-#include <QJsonObject>
 #include <QPointF>
 #include <QMessageBox>
-#include <QtConcurrent/QtConcurrent>
 #include <QComboBox>
-#include <QFutureWatcher>
 #include <QRegularExpression>
 #include <QRegularExpressionValidator>
 #include <QDockWidget>
@@ -52,90 +59,79 @@
 #include <QLineEdit>
 #include <QDoubleSpinBox>
 #include <QSpinBox>
+#include <QStatusBar>
 #include <QSizePolicy>
 #include <QTimer>
 #include <QSize>
 #include <QVector>
-#include <QLoggingCategory>
-#include <QDebug>
+#include <QVector3D>
+#include <QFrame>
 #include <QScrollArea>
 #include <QSignalBlocker>
 #include <QMenu>
 #include <QMainWindow>
+#include <QTabBar>
 #include <QTabWidget>
 #include <QTreeWidget>
-#include <QHeaderView>
-#include <QFormLayout>
-#include <QProgressBar>
+#include <QStandardItemModel>
 #include <QPushButton>
-#include <QItemSelectionModel>
-#include <QItemSelection>
-#include <QUnhandledException>
-#include "utils/Json.hpp"
+#include <nlohmann/json.hpp>
 #include <QPointer>
-#include <QListView>
 #include <algorithm>
+#include <set>
 #include <chrono>
 #include <cmath>
 #include <cstdlib>
-#include "vc/core/types/Segmentation.hpp"
-#include <limits>
 #include <optional>
-#include <sstream>
-#include <cctype>
-#include <string_view>
 #include <utility>
 #include <filesystem>
 #include <system_error>
-#include <unordered_map>
 #include <vector>
-#include <opencv2/imgproc.hpp>
-#include <opencv2/imgcodecs.hpp>
 #include <QStringList>
+#include <array>
 
 #include "volume_viewers/CVolumeViewerView.hpp"
 #include "viewer_controls/ViewerControlsPanel.hpp"
-#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
+#include "viewer_controls/panels/VolumeRegistrationsPanel.hpp"
 #include "volume_viewers/CChunkedVolumeViewer.hpp"
-#include "SettingsDialog.hpp"
 #include "elements/VolumeSelector.hpp"
+#include "elements/ViewerSplitGrid.hpp"
 #include "CPointCollectionWidget.hpp"
 #include "WrapAnnotationWidget.hpp"
-#include "AtlasControlPointsDock.hpp"
 #include "CFiberWidget.hpp"
-#include "FiberAnnotationController.hpp"
+#include "FiberCollectionController.hpp"
+#include "fibers3d/Fiber3DPanel.hpp"
+#include "scene3d/Scene3DPanel.hpp"
 #include "LineAnnotationController.hpp"
+#include "LineAnnotationDialog.hpp"
 #include "SurfaceTreeWidget.hpp"
 #include "SeedingWidget.hpp"
 #include "CommandLineToolRunner.hpp"
 #include "segmentation/SegmentationModule.hpp"
 #include "segmentation/growth/SegmentationGrowth.hpp"
 #include "segmentation/growth/SegmentationGrower.hpp"
+#include "SurfaceCatalog.hpp"
+#include "overlays/StoreSurfaceOverlayController.hpp"
 #include "SurfacePanelController.hpp"
+#include "elements/GrowOnlyLabel.hpp"
 #include "MenuActionController.hpp"
-#include "FileWatcherService.hpp"
+#include "StoreImportController.hpp"
+#include "VolumeAttachmentController.hpp"
 #include "AxisAlignedSliceController.hpp"
-#include "SurfaceAreaCalculator.hpp"
 #include "SegmentationCommandHandler.hpp"
 #include "LasagnaServiceManager.hpp"
+#include <vc_object_store/objects/AttachedDocument.hpp>
+#include "FiberMapWorkspace.hpp"
+#include "SpiralWorkspace.hpp"
+#include "ProjectWorkspace.hpp"
 #include "segmentation/panels/SegmentationLasagnaPanel.hpp"
 #include "vc/core/Version.hpp"
 #include "vc/core/util/Logging.hpp"
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/types/VolumePkg.hpp"
-#include "vc/core/util/DateTime.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
-#include "vc/core/util/Render.hpp"
-#include "vc/core/util/Tiff.hpp"
-#include "vc/atlas/Atlas.hpp"
-#include "FiberSliceGeometry.hpp"
-#include "vc/atlas/FiberIntersections.hpp"
-#include "vc/lasagna/Dataset.hpp"
-#include "vc/lasagna/LasagnaNormalSampler.hpp"
-#include <utils/zarr.hpp>
 
 
 
@@ -148,33 +144,13 @@ using PathBrushShape = ViewerOverlayControllerBase::PathBrushShape;
 namespace
 {
 constexpr auto WORKSPACE_TAB_SETTING = "mainWin/workspace_tab";
-constexpr auto ATLAS_INTERNAL_SURFACE_NAME = "__atlas_workspace_base_mesh";
-constexpr int ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS = 0;
-constexpr int ATLAS_SEARCH_MODE_NON_ATLAS_ONLY = 1;
-constexpr int ATLAS_SEARCH_PHASE_COUNT = 5;
-constexpr int ATLAS_SEARCH_RESULT_INDEX_ROLE = Qt::UserRole;
-constexpr int ATLAS_SEARCH_FIBER_ID_ROLE = Qt::UserRole + 1;
-constexpr int ATLAS_FIBER_ID_ROLE = Qt::UserRole;
-constexpr int ATLAS_FIBER_PATH_KEY_ROLE = Qt::UserRole + 1;
-constexpr int ATLAS_CONTROL_INDEX_ROLE = Qt::UserRole + 2;
-constexpr int ATLAS_CONTROL_SOURCE_INDEX_ROLE = Qt::UserRole + 3;
-constexpr int ATLAS_SURFACE_X_ROLE = Qt::UserRole + 4;
-constexpr int ATLAS_SURFACE_Y_ROLE = Qt::UserRole + 5;
-constexpr double ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD = 0.5;
+constexpr auto WORKSPACE_ID_SETTING = "mainWin/workspace_id";
+constexpr auto MAIN_VIEWER_SPLIT_X_SETTING = "mainWin/main_viewer_split_x";
+constexpr auto MAIN_VIEWER_SPLIT_Y_SETTING = "mainWin/main_viewer_split_y";
+constexpr auto MAIN_VIEWER_LAYOUT_SURFACES_SETTING = "mainWin/main_viewer_layout_surfaces";
+constexpr auto MAIN_VIEWER_LAYOUT_HIDDEN_SETTING = "mainWin/main_viewer_layout_hidden";
 
-QString formatAtlasCoveredSize(const vc::atlas::AtlasCoveredSize& size)
-{
-    if (!size.valid) {
-        return QObject::tr("No valid footprint");
-    }
-    auto formatValue = [](double value) {
-        if (std::abs(value - std::round(value)) < 1.0e-6) {
-            return QString::number(static_cast<qint64>(std::llround(value)));
-        }
-        return QString::number(value, 'f', 2);
-    };
-    return QStringLiteral("%1 x %2 vx").arg(formatValue(size.width), formatValue(size.height));
-}
+VolumeViewerBase* baseViewerFromWidget(QWidget* widget);
 
 class DockMenuMainWindow : public QMainWindow
 {
@@ -205,708 +181,167 @@ private:
     DockMenuBuilder _dockMenuBuilder;
 };
 
-QString atlasSearchIdListString(const std::vector<uint64_t>& ids)
-{
-    QStringList parts;
-    parts.reserve(static_cast<int>(ids.size()));
-    for (uint64_t id : ids) {
-        parts.push_back(QString::number(id));
-    }
-    return parts.join(QStringLiteral(","));
-}
+struct MainViewerSpec {
+    std::string surfaceName;
+    QString title;
+    std::set<std::string> intersects;
+};
 
-bool atlasSearchDebugEnabled()
-{
-    const char* value = std::getenv("VC_ATLAS_SEARCH_DEBUG");
-    return value && *value != '\0' && std::string_view(value) != "0";
-}
+const std::array<const char*, 4> kDefaultMainViewerSurfaces{
+    "segmentation",
+    "xy plane",
+    "seg xz",
+    "seg yz",
+};
 
-QString extractFutureExceptionMessage(const std::exception& e)
-{
-    if (auto* unhandled = dynamic_cast<const QUnhandledException*>(&e)) {
-        const std::exception_ptr ptr = unhandled->exception();
-        if (ptr) {
-            try {
-                std::rethrow_exception(ptr);
-            } catch (const std::exception& inner) {
-                return QString::fromStdString(inner.what());
-            } catch (...) {
-                return QObject::tr("Unknown non-standard exception");
-            }
-        }
-    }
-    return QString::fromStdString(e.what());
-}
+const std::array<bool, 4> kDefaultMainViewerHidden{
+    false,
+    false,
+    true,
+    false,
+};
 
-QString formatOptionalDouble(std::optional<double> value, int precision = 3)
-{
-    return (value && std::isfinite(*value))
-        ? QString::number(*value, 'f', precision)
-        : QStringLiteral("-");
-}
+const std::array<const char*, 4> kMainViewerPaneLabels{
+    "Top left",
+    "Top right",
+    "Bottom left",
+    "Bottom right",
+};
 
-QString formatAtlasVec3(const cv::Vec3d& point, int precision = 1)
+std::optional<MainViewerSpec> mainViewerSpecForSurface(const std::string& surfaceName)
 {
-    if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
-        return QStringLiteral("-");
+    if (surfaceName == "segmentation") {
+        return MainViewerSpec{surfaceName, QObject::tr("Surface"), {"seg xz", "seg yz"}};
     }
-    return QStringLiteral("%1, %2, %3")
-        .arg(point[0], 0, 'f', precision)
-        .arg(point[1], 0, 'f', precision)
-        .arg(point[2], 0, 'f', precision);
-}
-
-QString predSnapDirectionLabel(std::optional<vc::atlas::AtlasPredSnapDirection> direction)
-{
-    if (!direction) {
-        return QStringLiteral("-");
+    if (surfaceName == "xy plane") {
+        return MainViewerSpec{surfaceName, QObject::tr("XY"), {"segmentation"}};
     }
-    return *direction == vc::atlas::AtlasPredSnapDirection::Inside
-        ? QObject::tr("inside")
-        : QObject::tr("outside");
-}
-
-bool isResolvedAtlasPredSnap(const vc::atlas::AtlasPredSnapPoint& point)
-{
-    return point.predSnapPoint.has_value() &&
-           (point.source == vc::atlas::AtlasPredSnapSource::Manual ||
-            point.source == vc::atlas::AtlasPredSnapSource::Optimized);
-}
-
-const vc::atlas::AtlasPredSnapPoint* predSnapPointForAnchor(
-    const std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*>& snapsByControl,
-    const vc::atlas::AtlasAnchor& anchor)
-{
-    const auto it = snapsByControl.find(vc::atlas::atlasPredSnapControlPointKey(anchor.world));
-    return it == snapsByControl.end() ? nullptr : it->second;
-}
-
-std::optional<double> predSnapDisplayWinding(const vc::atlas::AtlasPredSnapPoint& point)
-{
-    if (point.selectedCandidateIndex &&
-        *point.selectedCandidateIndex >= 0 &&
-        *point.selectedCandidateIndex < static_cast<int>(point.candidates.size())) {
-        const auto& candidate = point.candidates[static_cast<size_t>(*point.selectedCandidateIndex)];
-        if (candidate.windingDistance) {
-            return candidate.windingDistance;
-        }
+    if (surfaceName == "seg xz") {
+        return MainViewerSpec{surfaceName, QObject::tr("XZ"), {"segmentation"}};
     }
-    return point.weightedFirstHitWindingDistance;
-}
-
-QString predSnapStatusLabel(const vc::atlas::AtlasPredSnapPoint* point)
-{
-    if (!point) {
-        return QObject::tr("missing");
-    }
-    if (!point->status.empty()) {
-        return QString::fromStdString(point->status);
-    }
-    if (isResolvedAtlasPredSnap(*point)) {
-        return point->source == vc::atlas::AtlasPredSnapSource::Manual
-            ? QObject::tr("manual")
-            : QObject::tr("optimized");
-    }
-    if (point->candidates.empty()) {
-        return QObject::tr("no_candidates");
-    }
-    return QObject::tr("unassigned");
-}
-
-QString predSnapStatusReason(const vc::atlas::AtlasPredSnapPoint* point)
-{
-    if (!point) {
-        return QObject::tr("No pred-snap attachment record for this control point.");
-    }
-    if (!point->statusReason.empty()) {
-        return QString::fromStdString(point->statusReason);
-    }
-    if (isResolvedAtlasPredSnap(*point)) {
-        return QObject::tr("Snap point is assigned.");
-    }
-    return QObject::tr("Snap point is not assigned.");
-}
-
-std::set<std::string> atlasSelectedFiberPathKeys(QTreeWidget* tree)
-{
-    std::set<std::string> pathKeys;
-    if (!tree) {
-        return pathKeys;
-    }
-    for (QTreeWidgetItem* item : tree->selectedItems()) {
-        while (item && item->data(0, ATLAS_FIBER_PATH_KEY_ROLE).toString().isEmpty()) {
-            item = item->parent();
-        }
-        if (!item) {
-            continue;
-        }
-        const QString key = item->data(0, ATLAS_FIBER_PATH_KEY_ROLE).toString();
-        if (!key.isEmpty()) {
-            pathKeys.insert(key.toStdString());
-        }
-    }
-    return pathKeys;
-}
-
-QJsonObject toQtJsonObject(const nlohmann::json& json)
-{
-    QJsonParseError parseError;
-    const QJsonDocument doc = QJsonDocument::fromJson(
-        QByteArray::fromStdString(json.dump()), &parseError);
-    if (parseError.error != QJsonParseError::NoError || !doc.isObject()) {
-        throw std::runtime_error("failed to convert JSON object for Qt");
-    }
-    return doc.object();
-}
-
-nlohmann::json fromQtJsonObject(const QJsonObject& object)
-{
-    const QByteArray bytes = QJsonDocument(object).toJson(QJsonDocument::Compact);
-    return nlohmann::json::parse(bytes.constData());
-}
-
-QString atlasSearchModeName(int searchMode)
-{
-    return searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
-        ? QStringLiteral("non_atlas_only")
-        : QStringLiteral("atlas_to_non_atlas");
-}
-
-int atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase phase)
-{
-    return static_cast<int>(phase) + 1;
-}
-
-QString atlasSearchPhaseAction(vc::atlas::AtlasSearchProgressPhase phase)
-{
-    switch (phase) {
-    case vc::atlas::AtlasSearchProgressPhase::PrepareInputs:
-        return QObject::tr("Preparing inputs");
-    case vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex:
-        return QObject::tr("Building spatial index");
-    case vc::atlas::AtlasSearchProgressPhase::SearchPairs:
-        return QObject::tr("Searching pairs");
-    case vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface:
-        return QObject::tr("Preparing signing surface");
-    case vc::atlas::AtlasSearchProgressPhase::FinishResults:
-        return QObject::tr("Finishing results");
-    }
-    return QObject::tr("Searching");
-}
-
-QStringList atlasSearchTagList(const QString& text)
-{
-    QStringList tags;
-    const auto parts = text.split(QRegularExpression(QStringLiteral("[,\\s]+")),
-                                  Qt::SkipEmptyParts);
-    for (const QString& part : parts) {
-        const QString tag = part.trimmed();
-        if (!tag.isEmpty() && !tags.contains(tag)) {
-            tags.push_back(tag);
-        }
-    }
-    tags.sort();
-    return tags;
-}
-
-bool atlasSearchFiberMatchesTags(const std::vector<std::string>& fiberTags,
-                                 const QStringList& requiredTags)
-{
-    if (requiredTags.isEmpty()) {
-        return true;
-    }
-    std::set<QString> normalizedFiberTags;
-    for (const auto& tag : fiberTags) {
-        normalizedFiberTags.insert(QString::fromStdString(tag).trimmed());
-    }
-    for (const QString& tag : requiredTags) {
-        if (normalizedFiberTags.find(tag) == normalizedFiberTags.end()) {
-            return false;
-        }
-    }
-    return true;
-}
-
-bool atlasSearchFiberHasAnyTag(const std::vector<std::string>& fiberTags,
-                               const QStringList& excludedTags)
-{
-    if (excludedTags.isEmpty()) {
-        return false;
-    }
-    std::set<QString> normalizedFiberTags;
-    for (const auto& tag : fiberTags) {
-        normalizedFiberTags.insert(QString::fromStdString(tag).trimmed());
-    }
-    for (const QString& tag : excludedTags) {
-        if (normalizedFiberTags.find(tag) != normalizedFiberTags.end()) {
-            return true;
-        }
-    }
-    return false;
-}
-
-std::optional<int> atlasSearchResultIndexForItem(const QTreeWidgetItem* item)
-{
-    if (!item) {
-        return std::nullopt;
-    }
-    bool ok = false;
-    const int resultIndex = item->data(0, ATLAS_SEARCH_RESULT_INDEX_ROLE).toInt(&ok);
-    return ok ? std::optional<int>(resultIndex) : std::nullopt;
-}
-
-std::optional<uint64_t> atlasSearchFiberIdForItem(QTreeWidgetItem* item)
-{
-    while (item) {
-        bool ok = false;
-        const qulonglong fiberId = item->data(0, ATLAS_SEARCH_FIBER_ID_ROLE).toULongLong(&ok);
-        if (ok && fiberId != 0) {
-            return static_cast<uint64_t>(fiberId);
-        }
-        item = item->parent();
+    if (surfaceName == "seg yz") {
+        return MainViewerSpec{surfaceName, QObject::tr("YZ"), {"segmentation"}};
     }
     return std::nullopt;
 }
 
-template <typename Fn>
-void forEachAtlasSearchResultItem(QTreeWidget* tree, Fn&& fn)
+QString mainViewerDisplayName(const std::string& surfaceName)
 {
-    if (!tree) {
+    if (surfaceName == "segmentation") {
+        return QObject::tr("Surface");
+    }
+    if (surfaceName == "xy plane") {
+        return QObject::tr("XY");
+    }
+    if (surfaceName == "seg xz") {
+        return QObject::tr("XZ");
+    }
+    if (surfaceName == "seg yz") {
+        return QObject::tr("YZ");
+    }
+    return QString::fromStdString(surfaceName);
+}
+
+std::array<std::string, 4> readMainViewerSurfaceLayout()
+{
+    std::array<std::string, 4> layout{};
+    for (int i = 0; i < 4; ++i) {
+        layout[i] = kDefaultMainViewerSurfaces[i];
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_SURFACES_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return layout;
+    }
+
+    std::set<std::string> seen;
+    std::array<std::string, 4> candidate{};
+    for (int i = 0; i < 4; ++i) {
+        const std::string name = saved[i].toStdString();
+        if (!mainViewerSpecForSurface(name) || !seen.insert(name).second) {
+            return layout;
+        }
+        candidate[i] = name;
+    }
+    return candidate;
+}
+
+std::array<bool, 4> readMainViewerHiddenLayout()
+{
+    std::array<bool, 4> hidden = kDefaultMainViewerHidden;
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const QStringList saved = settings.value(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING).toStringList();
+    if (saved.size() != 4) {
+        return hidden;
+    }
+
+    int visibleCount = 0;
+    for (int i = 0; i < 4; ++i) {
+        hidden[i] = saved[i].toInt() != 0;
+        if (!hidden[i]) {
+            ++visibleCount;
+        }
+    }
+    if (visibleCount == 0) {
+        hidden[0] = false;
+    }
+    return hidden;
+}
+
+void persistMainViewerLayout(ViewerSplitGrid* grid)
+{
+    if (!grid) {
         return;
     }
-    std::vector<QTreeWidgetItem*> stack;
-    stack.reserve(static_cast<size_t>(tree->topLevelItemCount()));
-    for (int i = 0; i < tree->topLevelItemCount(); ++i) {
-        stack.push_back(tree->topLevelItem(i));
-    }
-    while (!stack.empty()) {
-        QTreeWidgetItem* item = stack.back();
-        stack.pop_back();
-        if (!item) {
-            continue;
+
+    QStringList surfaces;
+    QStringList hidden;
+    for (int i = 0; i < 4; ++i) {
+        std::string surfaceName = kDefaultMainViewerSurfaces[i];
+        if (auto* viewer = baseViewerFromWidget(grid->viewer(i))) {
+            surfaceName = viewer->surfName();
         }
-        if (atlasSearchResultIndexForItem(item)) {
-            fn(item);
-        }
-        for (int i = 0; i < item->childCount(); ++i) {
-            stack.push_back(item->child(i));
-        }
+        surfaces.push_back(QString::fromStdString(surfaceName));
+        hidden.push_back(grid->paneHidden(i) ? QStringLiteral("1") : QStringLiteral("0"));
     }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(MAIN_VIEWER_LAYOUT_SURFACES_SETTING, surfaces);
+    settings.setValue(MAIN_VIEWER_LAYOUT_HIDDEN_SETTING, hidden);
 }
 
-std::vector<cv::Vec3d> linePointsFromPolyline(const vc::atlas::FiberPolyline& fiber)
+ViewerSplitGrid* mainViewerSplitGrid(QWidget* parent)
 {
-    std::vector<cv::Vec3d> points;
-    points.reserve(fiber.points.size());
-    for (const auto& point : fiber.points) {
-        points.push_back(point.position);
-    }
-    return points;
+    auto* widget = parent
+        ? parent->findChild<QWidget*>(QStringLiteral("mainViewerSplitGrid"))
+        : nullptr;
+    return dynamic_cast<ViewerSplitGrid*>(widget);
 }
 
-vc::atlas::FiberInput fiberInputFromSnapshot(const std::filesystem::path& fiberPath,
-                                             const vc::atlas::FiberPolyline& fiber)
+void applyMainViewerLayout(ViewerSplitGrid* grid, ViewerManager* manager)
 {
-    vc::atlas::FiberInput input;
-    input.fiberPath = fiberPath;
-    input.controlPoints = fiber.controlPoints;
-    input.linePoints = linePointsFromPolyline(fiber);
-    vc::atlas::validateFiberInputControlPoints(input);
-    return input;
-}
-
-const vc::atlas::FiberMapping* findAtlasMappingForPath(
-    const vc::atlas::Atlas& atlas,
-    const std::filesystem::path& fiberPath)
-{
-    const std::string pathKey = vc::atlas::atlasFiberPathKey(fiberPath);
-    for (const auto& mapping : atlas.fibers) {
-        if (vc::atlas::atlasFiberPathKey(mapping.fiberPath) == pathKey) {
-            return &mapping;
-        }
-    }
-    return nullptr;
-}
-
-vc::atlas::FiberMapping* findAtlasMappingForPath(
-    vc::atlas::Atlas& atlas,
-    const std::filesystem::path& fiberPath)
-{
-    const std::string pathKey = vc::atlas::atlasFiberPathKey(fiberPath);
-    for (auto& mapping : atlas.fibers) {
-        if (vc::atlas::atlasFiberPathKey(mapping.fiberPath) == pathKey) {
-            return &mapping;
-        }
-    }
-    return nullptr;
-}
-
-const vc::atlas::AtlasAnchor* nearestLineAnchorForPosition(
-    const vc::atlas::FiberMapping& mapping,
-    double linePosition)
-{
-    if (!std::isfinite(linePosition)) {
-        return nullptr;
-    }
-    const vc::atlas::AtlasAnchor* best = nullptr;
-    double bestDelta = std::numeric_limits<double>::infinity();
-    for (const auto& anchor : mapping.lineAnchors) {
-        const double delta = std::abs(static_cast<double>(anchor.sourceIndex) - linePosition);
-        if (delta < bestDelta) {
-            best = &anchor;
-            bestDelta = delta;
-        }
-    }
-    return best;
-}
-
-std::optional<cv::Vec2f> atlasSearchCandidateSurfaceCoord(
-    const vc::atlas::Atlas& atlas,
-    const QuadSurface& displaySurface,
-    const vc::atlas::AtlasDisplayRange& displayRange,
-    const vc::atlas::FiberIntersectionResult& result,
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById)
-{
-    const auto sourceIt = snapshotsById.find(result.sourceFiberId);
-    if (sourceIt == snapshotsById.end()) {
-        return std::nullopt;
-    }
-    const auto* mapping = findAtlasMappingForPath(atlas, sourceIt->second.fiberPath);
-    if (!mapping) {
-        return std::nullopt;
-    }
-    const auto linePoints = linePointsFromPolyline(sourceIt->second.fiber);
-    const auto sample = vc3d::fiber_slice::samplePolylineAtArclength(linePoints,
-                                                                     result.sourceArclength);
-    if (!sample.valid) {
-        return std::nullopt;
-    }
-    const auto* anchor = nearestLineAnchorForPosition(*mapping, sample.linePosition);
-    if (!anchor) {
-        return std::nullopt;
-    }
-    const double atlasU = vc::atlas::actualAtlasU(*anchor, *mapping, displayRange.baseColumns);
-    const cv::Vec2f surfaceCoord =
-        vc::atlas::atlasGridToSurfaceCoords(atlasU,
-                                            anchor->atlasV,
-                                            displaySurface,
-                                            displayRange.atlasUOffset);
-    if (!std::isfinite(surfaceCoord[0]) || !std::isfinite(surfaceCoord[1])) {
-        return std::nullopt;
-    }
-    return surfaceCoord;
-}
-
-struct AtlasSearchSignedWindingRow {
-    double signedWinding = 0.0;
-    uint64_t hFiberId = 0;
-    uint64_t vFiberId = 0;
-    QString orientationSource;
-};
-
-struct AtlasSearchSigningContext {
-    vc::atlas::Atlas atlas;
-    bool haveAtlas = false;
-    vc::atlas::AtlasBaseMappingContext baseMapping;
-    QString orientationSource;
-};
-
-struct AtlasSearchSignedResult {
-    vc::atlas::FiberIntersectionResult result;
-    AtlasSearchSignedWindingRow row;
-};
-
-struct AtlasSearchWorkerResult {
-    std::vector<vc::atlas::FiberIntersectionResult> results;
-    std::vector<double> signedWindings;
-    std::size_t rawResultCount = 0;
-    std::size_t skippedSigningCount = 0;
-};
-
-uint64_t atlasSearchTieBreakFiberId(const AtlasSearchFiberSnapshot& snapshot,
-                                    uint64_t runtimeFiberId)
-{
-    return snapshot.storedFiberId != 0 ? snapshot.storedFiberId : runtimeFiberId;
-}
-
-const AtlasSearchFiberSnapshot& atlasSearchSnapshotFor(
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById,
-    uint64_t runtimeFiberId)
-{
-    const auto it = snapshotsById.find(runtimeFiberId);
-    if (it == snapshotsById.end()) {
-        throw std::runtime_error("Atlas search result refers to a fiber snapshot that is no longer available");
-    }
-    return it->second;
-}
-
-bool atlasSearchSourceDisplaysAsH(
-    const vc::atlas::FiberIntersectionResult& result,
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById)
-{
-    const auto& source = atlasSearchSnapshotFor(snapshotsById, result.sourceFiberId);
-    const auto& target = atlasSearchSnapshotFor(snapshotsById, result.targetFiberId);
-    return vc3d::line_annotation::firstFiberDisplaysAsH(
-        source.hvClassification,
-        source.manualHvTag,
-        target.hvClassification,
-        target.manualHvTag,
-        atlasSearchTieBreakFiberId(source, result.sourceFiberId) <
-            atlasSearchTieBreakFiberId(target, result.targetFiberId));
-}
-
-AtlasSearchSigningContext prepareAtlasSearchSigningContext(
-    const std::vector<vc::atlas::FiberIntersectionResult>& seedOrderedResults,
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById,
-    const std::optional<std::filesystem::path>& atlasDir,
-    const vc::lasagna::LasagnaDataset& dataset,
-    vc::lasagna::LasagnaNormalSampler& sampler,
-    const vc::atlas::FiberIntersectionProgressCallback& progressCallback)
-{
-    AtlasSearchSigningContext context;
-    if (seedOrderedResults.empty()) {
-        return context;
+    if (!grid || !manager) {
+        return;
     }
 
-    if (atlasDir) {
-        constexpr std::size_t total = 2;
-        if (progressCallback) {
-            progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 0, total);
-        }
-        context.atlas = vc::atlas::Atlas::load(*atlasDir);
-        if (progressCallback) {
-            progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
-        }
-        context.baseMapping = vc::atlas::loadAtlasBaseMappingContext(*atlasDir, context.atlas);
-        context.haveAtlas = true;
-        context.orientationSource = QStringLiteral("selected_atlas");
-        if (progressCallback) {
-            progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, total, total);
-        }
-        return context;
-    }
-
-    constexpr std::size_t total = 3;
-    if (progressCallback) {
-        progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 0, total);
-    }
-    const auto initShellDir = vc::atlas::initShellDirectoryFromManifest(dataset.manifest());
-    auto surfaces = vc::atlas::loadInitShellCandidates(initShellDir);
-    if (progressCallback) {
-        progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, total);
-    }
-    std::vector<std::shared_ptr<QuadSurface>> shellSurfaces;
-    shellSurfaces.reserve(surfaces.size());
-    for (const auto& candidate : surfaces) {
-        if (candidate.surface) {
-            shellSurfaces.push_back(candidate.surface);
-        }
-    }
-    if (shellSurfaces.empty()) {
-        throw std::runtime_error("Lasagna init shells contain no loadable base surfaces");
-    }
-    SurfacePatchIndex shellIndex;
-    shellIndex.rebuild(shellSurfaces);
-    if (progressCallback) {
-        progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 2, total);
-    }
-
-    const auto& seedResult = seedOrderedResults.front();
-    const bool seedSourceIsH = atlasSearchSourceDisplaysAsH(seedResult, snapshotsById);
-    const auto& seedSnapshot = atlasSearchSnapshotFor(
-        snapshotsById,
-        seedSourceIsH ? seedResult.sourceFiberId : seedResult.targetFiberId);
-    const vc::atlas::FiberInput seedInput =
-        fiberInputFromSnapshot(seedSnapshot.fiberPath, seedSnapshot.fiber);
-    const auto selection =
-        vc::atlas::selectBaseSurfaceBySeedRay(seedInput, surfaces, shellIndex, sampler);
-    if (selection.surfaceIndex < 0 ||
-        selection.surfaceIndex >= static_cast<int>(surfaces.size()) ||
-        !surfaces[static_cast<size_t>(selection.surfaceIndex)].surface) {
-        throw std::runtime_error("Lasagna init-shell base selection did not return a surface");
-    }
-    context.baseMapping = vc::atlas::atlasBaseMappingContextFromSurface(
-        surfaces[static_cast<size_t>(selection.surfaceIndex)].surface);
-    context.orientationSource = QStringLiteral("init_shell:%1")
-        .arg(QString::fromStdString(selection.surfaceName));
-    if (progressCallback) {
-        progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, total, total);
-    }
-    return context;
-}
-
-std::vector<AtlasSearchSignedResult> signAtlasSearchResults(
-    const std::vector<vc::atlas::FiberIntersectionResult>& results,
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById,
-    AtlasSearchSigningContext& context,
-    vc::lasagna::LasagnaNormalSampler& sampler,
-    std::size_t& skippedSigningCount)
-{
-    std::vector<AtlasSearchSignedResult> signedResults;
-    signedResults.reserve(results.size());
-    skippedSigningCount = 0;
-    if (results.empty()) {
-        return signedResults;
-    }
-    if (!context.baseMapping.baseSurface || !context.baseMapping.baseIndex) {
-        skippedSigningCount = results.size();
-        qWarning().noquote() << QStringLiteral("[atlas-search] signing_skipped_all reason=no signing base surface/index");
-        return signedResults;
-    }
-
-    std::map<uint64_t, vc::atlas::FiberMapping> temporaryMappings;
-    std::map<uint64_t, std::string> mappingFailures;
-    auto mappingFor = [&](uint64_t runtimeFiberId) -> const vc::atlas::FiberMapping& {
-        const auto& snapshot = atlasSearchSnapshotFor(snapshotsById, runtimeFiberId);
-        if (context.haveAtlas) {
-            if (const auto* mapping = findAtlasMappingForPath(context.atlas, snapshot.fiberPath)) {
-                return *mapping;
+    const auto surfaces = readMainViewerSurfaceLayout();
+    const auto hidden = readMainViewerHiddenLayout();
+    for (int pane = 0; pane < 4; ++pane) {
+        QWidget* widget = nullptr;
+        for (auto* viewer : manager->baseViewers()) {
+            if (!viewer || viewer->surfName() != surfaces[pane]) {
+                continue;
             }
-        }
-        if (const auto failed = mappingFailures.find(runtimeFiberId);
-            failed != mappingFailures.end()) {
-            throw std::runtime_error(failed->second);
-        }
-        const auto cached = temporaryMappings.find(runtimeFiberId);
-        if (cached != temporaryMappings.end()) {
-            return cached->second;
-        }
-        try {
-            const vc::atlas::FiberInput input =
-                fiberInputFromSnapshot(snapshot.fiberPath, snapshot.fiber);
-            auto mapping = vc::atlas::mapFiberToBaseSurface(
-                input,
-                *context.baseMapping.baseSurface,
-                *context.baseMapping.baseIndex,
-                sampler);
-            const auto [it, inserted] =
-                temporaryMappings.emplace(runtimeFiberId, std::move(mapping));
-            (void)inserted;
-            return it->second;
-        } catch (const std::exception& ex) {
-            const std::string reason = ex.what();
-            mappingFailures.emplace(runtimeFiberId, reason);
-            throw std::runtime_error(reason);
-        }
-    };
-
-    for (const auto& result : results) {
-        try {
-            const auto& sourceSnapshot = atlasSearchSnapshotFor(snapshotsById, result.sourceFiberId);
-            const auto& targetSnapshot = atlasSearchSnapshotFor(snapshotsById, result.targetFiberId);
-            const auto sourceSample = vc3d::fiber_slice::samplePolylineAtArclength(
-                linePointsFromPolyline(sourceSnapshot.fiber),
-                result.sourceArclength);
-            const auto targetSample = vc3d::fiber_slice::samplePolylineAtArclength(
-                linePointsFromPolyline(targetSnapshot.fiber),
-                result.targetArclength);
-            if (!sourceSample.valid || !targetSample.valid) {
-                throw std::runtime_error("Could not sample atlas search intersection arclengths");
+            widget = qobject_cast<QWidget*>(viewer->asQObject());
+            if (widget && widget->parentWidget() == grid) {
+                break;
             }
-
-            const bool sourceIsH = atlasSearchSourceDisplaysAsH(result, snapshotsById);
-            const auto display = vc::atlas::signedAtlasSearchWindingDisplay(
-                result.windingDistance,
-                sourceIsH,
-                sourceSample.linePosition,
-                targetSample.linePosition,
-                result.sourcePoint,
-                result.targetPoint,
-                mappingFor(result.sourceFiberId),
-                mappingFor(result.targetFiberId),
-                *context.baseMapping.baseSurface);
-            signedResults.push_back(AtlasSearchSignedResult{
-                result,
-                AtlasSearchSignedWindingRow{
-                    display.signedWindingDistance,
-                    sourceIsH ? result.sourceFiberId : result.targetFiberId,
-                    sourceIsH ? result.targetFiberId : result.sourceFiberId,
-                    context.orientationSource,
-                },
-            });
-        } catch (const std::exception& ex) {
-            ++skippedSigningCount;
-            qWarning().noquote() << QStringLiteral("[atlas-search] signing_skipped source_id=%1 target_id=%2 raw_winding=%3 reason=%4 orientation_source=%5")
-                .arg(QString::number(result.sourceFiberId),
-                     QString::number(result.targetFiberId),
-                     QString::number(result.windingDistance, 'g', 12),
-                     QString::fromStdString(ex.what()),
-                     context.orientationSource);
+            widget = nullptr;
         }
+        grid->setViewer(pane, widget);
+        grid->setPaneHidden(pane, hidden[pane]);
     }
-    return signedResults;
-}
-
-AtlasSearchWorkerResult buildSignedAtlasSearchResults(
-    std::vector<vc::atlas::FiberIntersectionResult> rawResults,
-    const std::unordered_map<uint64_t, AtlasSearchFiberSnapshot>& snapshotsById,
-    const std::optional<std::filesystem::path>& atlasDir,
-    const std::filesystem::path& lasagnaManifestPath,
-    const vc::atlas::FiberIntersectionProgressCallback& progressCallback,
-    bool debugSearch)
-{
-    AtlasSearchWorkerResult workerResult;
-    workerResult.rawResultCount = rawResults.size();
-    std::sort(rawResults.begin(), rawResults.end(), [&](const auto& a, const auto& b) {
-        const double da = std::abs(a.windingDistance);
-        const double db = std::abs(b.windingDistance);
-        if (da != db) return da < db;
-        if (a.sourceFiberId != b.sourceFiberId) return a.sourceFiberId < b.sourceFiberId;
-        return a.targetFiberId < b.targetFiberId;
-    });
-    if (rawResults.empty()) {
-        return workerResult;
-    }
-
-    try {
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        auto context = prepareAtlasSearchSigningContext(
-            rawResults, snapshotsById, atlasDir, dataset, sampler, progressCallback);
-        std::vector<AtlasSearchSignedResult> signedResults = signAtlasSearchResults(
-            rawResults, snapshotsById, context, sampler, workerResult.skippedSigningCount);
-        std::sort(signedResults.begin(), signedResults.end(), [](const auto& a, const auto& b) {
-            const double da = a.row.signedWinding;
-            const double db = b.row.signedWinding;
-            if (da != db) return da < db;
-            const double rawA = std::abs(a.result.windingDistance);
-            const double rawB = std::abs(b.result.windingDistance);
-            if (rawA != rawB) return rawA < rawB;
-            if (a.result.sourceFiberId != b.result.sourceFiberId) {
-                return a.result.sourceFiberId < b.result.sourceFiberId;
-            }
-            return a.result.targetFiberId < b.result.targetFiberId;
-        });
-        workerResult.results.reserve(signedResults.size());
-        workerResult.signedWindings.reserve(signedResults.size());
-        for (int row = 0; row < static_cast<int>(signedResults.size()); ++row) {
-            const auto& signedResult = signedResults[static_cast<size_t>(row)];
-            if (debugSearch) {
-                qInfo().noquote() << QStringLiteral("[atlas-search] signed_result row=%1 source_id=%2 target_id=%3 raw_winding=%4 signed_winding=%5 h_id=%6 v_id=%7 orientation_source=%8")
-                    .arg(row)
-                    .arg(QString::number(signedResult.result.sourceFiberId),
-                         QString::number(signedResult.result.targetFiberId),
-                         QString::number(signedResult.result.windingDistance, 'g', 12),
-                         QString::number(signedResult.row.signedWinding, 'g', 12),
-                         QString::number(signedResult.row.hFiberId),
-                         QString::number(signedResult.row.vFiberId),
-                         signedResult.row.orientationSource);
-            }
-            workerResult.results.push_back(signedResult.result);
-            workerResult.signedWindings.push_back(signedResult.row.signedWinding);
-        }
-    } catch (const std::exception& ex) {
-        workerResult.skippedSigningCount = rawResults.size();
-        qWarning().noquote() << QStringLiteral("[atlas-search] signing_skipped_all count=%1 reason=%2 atlas_mode=%3")
-            .arg(static_cast<qulonglong>(rawResults.size()))
-            .arg(QString::fromStdString(ex.what()),
-                 atlasDir ? QStringLiteral("selected_atlas") : QStringLiteral("init_shell"));
-        if (progressCallback) {
-            progressCallback(vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface, 1, 1);
-        }
-    }
-    return workerResult;
 }
 
 class FunctionEventFilter final : public QObject
@@ -938,69 +373,11 @@ VolumeViewerBase* baseViewerFromWidget(QWidget* widget)
     return nullptr;
 }
 
-bool isChunkedViewer(VolumeViewerBase* viewer)
-{
-    return viewer && qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject());
-}
-
-bool isAnnotationViewer(VolumeViewerBase* viewer)
-{
-    return viewer &&
-           viewer->asQObject() &&
-           viewer->asQObject()->property("vc_viewer_role").toString() == QStringLiteral("annotation");
-}
-
 bool moveOnSurfaceChangeEnabled()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     return settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
                           vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-}
-
-void centerViewerOnVolumePointForNavigation(VolumeViewerBase* viewer, const cv::Vec3f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnVolumePoint(position, !isChunkedViewer(viewer));
-}
-
-void centerViewerOnSurfacePointForNavigation(VolumeViewerBase* viewer, const cv::Vec2f& position)
-{
-    if (!viewer) {
-        return;
-    }
-    viewer->centerOnSurfacePoint(position, !isChunkedViewer(viewer));
-}
-
-std::optional<cv::Vec2f> atlasControlGridToSurface(VolumeViewerBase* viewer,
-                                                   const AtlasControlPointResult& point)
-{
-    auto* quad = viewer ? dynamic_cast<QuadSurface*>(viewer->currentSurface()) : nullptr;
-    if (!quad ||
-        !std::isfinite(point.modelH) ||
-        !std::isfinite(point.modelW)) {
-        return std::nullopt;
-    }
-    const cv::Vec2f scale = quad->scale();
-    if (std::abs(scale[0]) < 1e-6f || std::abs(scale[1]) < 1e-6f) {
-        return std::nullopt;
-    }
-    const float modelH = point.snapValid && std::isfinite(point.snapModelH)
-        ? point.snapModelH
-        : point.modelH;
-    const float modelW = point.snapValid && std::isfinite(point.snapModelW)
-        ? point.snapModelW
-        : point.modelW;
-    const cv::Vec3f center = quad->center();
-    const cv::Vec2f surface{
-        modelW / scale[0] - center[0],
-        modelH / scale[1] - center[1],
-    };
-    if (!std::isfinite(surface[0]) || !std::isfinite(surface[1])) {
-        return std::nullopt;
-    }
-    return surface;
 }
 
 struct SurfaceFocusPoint {
@@ -1009,17 +386,6 @@ struct SurfaceFocusPoint {
     int row = -1;
     int col = -1;
 };
-
-bool isValidSurfacePoint(const cv::Vec3f& point)
-{
-    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
-        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
-}
-
-bool isFiniteVec3(const cv::Vec3f& point)
-{
-    return std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
-}
 
 std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row, int col)
 {
@@ -1033,13 +399,14 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
 
     const cv::Vec3f& point = (*points)(row, col);
-    if (!isValidSurfacePoint(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         return std::nullopt;
     }
 
@@ -1129,6 +496,7 @@ void ensureDockWidgetFeatures(QDockWidget* dock)
 }
 
 QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
+                                        const std::string& loadedVolumeId,
                                         QString* checkedPath)
 {
     if (checkedPath) {
@@ -1145,250 +513,48 @@ QString normalGridDirectoryForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
         qCInfo(lcSegGrowth) << "Normal grid lookup: no normal_grids entries in project";
         return QString();
     }
-    const QString candidateStr = QString::fromStdString(paths.front().string());
-    if (checkedPath) *checkedPath = candidateStr;
-    qCInfo(lcSegGrowth) << "Normal grid resolved to" << candidateStr;
-    return candidateStr;
-}
 
-QStringList normal3dZarrCandidatesForVolumePkg(const std::shared_ptr<VolumePkg>& pkg,
-                                               QString* hint)
-{
-    if (hint) {
-        *hint = QString();
-    }
-    if (!pkg) {
-        if (hint) {
-            *hint = QObject::tr("Normal3D lookup skipped (no volume package loaded)");
+    // A catalog volume pairs with the normal grids the catalog publishes for
+    // its frame (volume and level); other volumes with the first store the
+    // catalog does not publish.
+    const auto view = pkg->catalogView(loadedVolumeId);
+    QString unpublishedFallback;
+    for (const auto& path : paths) {
+        const auto pathStr = path.string();
+        const QString candidateStr = QString::fromStdString(pathStr);
+        const vc::project::Entry* owningEntry = nullptr;
+        for (const auto& entry : pkg->normalGridEntries()) {
+            if (pathStr == entry.location ||
+                pathStr.rfind(entry.location + "/", 0) == 0) {
+                owningEntry = &entry;
+                break;
+            }
         }
-        return {};
-    }
-    auto paths = pkg->normal3dZarrPaths();
-    QStringList candidates;
-    for (const auto& p : paths) candidates.push_back(QString::fromStdString(p.string()));
-    candidates.sort();
-    if (hint) {
-        *hint = candidates.isEmpty()
-            ? QObject::tr("No volumes tagged 'normal3d' in project")
-            : QObject::tr("%1 normal3d zarr(s) tagged").arg(candidates.size());
-    }
-    return candidates;
-}
-
-QString absoluteSegmentPathForClipboard(const std::filesystem::path& segmentPath,
-                                        const std::shared_ptr<VolumePkg>& pkg)
-{
-    auto path = segmentPath;
-    if (!path.is_absolute() && pkg) {
-        const auto projectPath = pkg->path();
-        const auto projectDir = projectPath.has_parent_path()
-            ? projectPath.parent_path()
-            : std::filesystem::current_path();
-        path = projectDir / path;
+        const auto published = owningEntry
+            ? vc3d::opendata::normalGridsCatalogView(*pkg, *owningEntry)
+            : std::nullopt;
+        if (view) {
+            if (published && published->sameGrid(*view)) {
+                if (checkedPath) *checkedPath = candidateStr;
+                qCInfo(lcSegGrowth) << "Normal grid resolved by catalog frame to" << candidateStr;
+                return candidateStr;
+            }
+            continue;
+        }
+        if (!published && unpublishedFallback.isEmpty()) {
+            unpublishedFallback = candidateStr;
+        }
     }
 
-    std::error_code ec;
-    const auto absolutePath = std::filesystem::absolute(path, ec);
-    if (!ec) {
-        path = absolutePath;
+    if (!view && !unpublishedFallback.isEmpty()) {
+        if (checkedPath) *checkedPath = unpublishedFallback;
+        qCInfo(lcSegGrowth) << "Normal grid resolved to" << unpublishedFallback;
+        return unpublishedFallback;
     }
-    return QString::fromStdString(path.lexically_normal().string());
-}
 
-QDockWidget* createAtlasOverviewDock(QWidget* parent)
-{
-    auto* dock = new QDockWidget(QObject::tr("Atlas Overview"), parent);
-    auto* content = new QWidget(dock);
-    auto* layout = new QVBoxLayout(content);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(6);
-
-    auto* actions = new QHBoxLayout();
-    actions->setContentsMargins(0, 0, 0, 0);
-    actions->setSpacing(6);
-
-    auto* remap = new QPushButton(QObject::tr("Remap"), content);
-    remap->setObjectName(QStringLiteral("atlasRemapButton"));
-    remap->setToolTip(QObject::tr(
-        "Rebuild atlas fiber mappings from the saved source fibers using the selected Lasagna dataset."));
-    remap->setEnabled(false);
-    actions->addWidget(remap);
-
-    auto* rankSnap = new QPushButton(QObject::tr("Rank via Fit-Service"), content);
-    rankSnap->setObjectName(QStringLiteral("atlasRankSnapButton"));
-    rankSnap->setToolTip(QObject::tr(
-        "Run atlas pred-snap ranking through the Lasagna fit-service job queue."));
-    rankSnap->setEnabled(false);
-    actions->addWidget(rankSnap);
-
-    layout->addLayout(actions);
-
-    auto* atlasTree = new QTreeWidget(content);
-    atlasTree->setObjectName(QStringLiteral("atlasOverviewTree"));
-    atlasTree->setColumnCount(2);
-    atlasTree->setHeaderLabels({QObject::tr("Atlas"), QObject::tr("Value")});
-    atlasTree->setAlternatingRowColors(true);
-    atlasTree->setRootIsDecorated(true);
-    atlasTree->setSelectionMode(QAbstractItemView::SingleSelection);
-    atlasTree->header()->setStretchLastSection(true);
-    layout->addWidget(atlasTree, 1);
-
-    dock->setWidget(content);
-    return dock;
-}
-
-QDockWidget* createAtlasFiberDock(QWidget* parent)
-{
-    auto* dock = new QDockWidget(QObject::tr("Atlas Fibers"), parent);
-    auto* content = new QWidget(dock);
-    auto* layout = new QVBoxLayout(content);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(6);
-
-    auto* current = new QLabel(QObject::tr("No atlas selected"), content);
-    current->setObjectName(QStringLiteral("atlasFiberCurrentLabel"));
-    current->setWordWrap(true);
-    layout->addWidget(current);
-
-    auto* optimize = new QPushButton(QObject::tr("Optimize snap cands"), content);
-    optimize->setObjectName(QStringLiteral("atlasOptimizeSnapCandidatesButton"));
-    optimize->setEnabled(false);
-    layout->addWidget(optimize);
-
-    auto* tree = new QTreeWidget(content);
-    tree->setObjectName(QStringLiteral("atlasFiberTree"));
-    tree->setColumnCount(9);
-    tree->setHeaderLabels({
-        QObject::tr("Fiber"),
-        QObject::tr("Source"),
-        QObject::tr("Anchor dist"),
-        QObject::tr("Snap"),
-        QObject::tr("Snap wind"),
-        QObject::tr("Snap XYZ"),
-        QObject::tr("Status"),
-        QObject::tr("Reason"),
-        QObject::tr("Saved fiber"),
-    });
-    tree->setAlternatingRowColors(true);
-    tree->setSelectionBehavior(QAbstractItemView::SelectRows);
-    tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    tree->setSortingEnabled(false);
-    tree->setRootIsDecorated(true);
-    tree->setContextMenuPolicy(Qt::CustomContextMenu);
-    tree->header()->setStretchLastSection(false);
-    tree->header()->setSectionResizeMode(QHeaderView::ResizeToContents);
-    tree->header()->setSectionResizeMode(0, QHeaderView::Stretch);
-    layout->addWidget(tree, 1);
-
-    dock->setWidget(content);
-    return dock;
-}
-
-QDockWidget* createAtlasSearchDock(QWidget* parent)
-{
-    auto* dock = new QDockWidget(QObject::tr("Atlas Object Search"), parent);
-    auto* content = new QWidget(dock);
-    content->setObjectName(QStringLiteral("atlasSearchContent"));
-    auto* layout = new QVBoxLayout(content);
-    layout->setContentsMargins(8, 8, 8, 8);
-    layout->setSpacing(6);
-
-    auto* current = new QLabel(QObject::tr("No atlas selected"), content);
-    current->setObjectName(QStringLiteral("atlasSearchCurrentLabel"));
-    current->setWordWrap(true);
-    layout->addWidget(current);
-
-    auto* form = new QFormLayout();
-    form->setContentsMargins(0, 0, 0, 0);
-    auto* searchType = new QComboBox(content);
-    searchType->setObjectName(QStringLiteral("atlasSearchTypeCombo"));
-    searchType->addItem(QObject::tr("Atlas fibers -> non-atlas fibers"),
-                        ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS);
-    searchType->addItem(QObject::tr("Non-atlas fibers only"),
-                        ATLAS_SEARCH_MODE_NON_ATLAS_ONLY);
-    searchType->setToolTip(QObject::tr(
-        "Choose whether to search from mapped atlas fibers to non-atlas fibers, or only between non-atlas fibers."));
-    form->addRow(QObject::tr("Search type"), searchType);
-
-    auto* tagFilter = new QLineEdit(content);
-    tagFilter->setObjectName(QStringLiteral("atlasSearchTagFilterEdit"));
-    tagFilter->setPlaceholderText(QObject::tr("tag-a, tag-b"));
-    tagFilter->setClearButtonEnabled(true);
-    tagFilter->setToolTip(QObject::tr(
-        "Only consider fibers that have all listed tags. Separate tags with commas or spaces."));
-    form->addRow(QObject::tr("Fiber tags"), tagFilter);
-
-    auto* excludeTagFilter = new QLineEdit(content);
-    excludeTagFilter->setObjectName(QStringLiteral("atlasSearchExcludeTagFilterEdit"));
-    excludeTagFilter->setPlaceholderText(QObject::tr("bad, skip"));
-    excludeTagFilter->setClearButtonEnabled(true);
-    excludeTagFilter->setToolTip(QObject::tr(
-        "Exclude fibers that have any listed tag. Separate tags with commas or spaces."));
-    form->addRow(QObject::tr("Exclude tags"), excludeTagFilter);
-
-    auto* maxDistance = new QDoubleSpinBox(content);
-    maxDistance->setObjectName(QStringLiteral("atlasSearchMaxDistanceSpin"));
-    maxDistance->setRange(1.0, 100000.0);
-    maxDistance->setDecimals(2);
-    {
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        maxDistance->setValue(settings.value(
-            vc3d::settings::atlas::SEARCH_MAX_DISTANCE,
-            vc::atlas::FiberIntersectionBroadPhaseOptions{}.maxDistance).toDouble());
-    }
-    maxDistance->setSuffix(QObject::tr(" vx"));
-    maxDistance->setToolTip(QObject::tr(
-        "Broad-phase segment radius in original voxel coordinates. Segment pairs farther apart than this are not sent to Ceres."));
-    form->addRow(QObject::tr("Max straight distance"), maxDistance);
-
-    auto* groupByFiber = new QCheckBox(QObject::tr("Group results by fiber"), content);
-    groupByFiber->setObjectName(QStringLiteral("atlasSearchGroupByFiberCheck"));
-    groupByFiber->setChecked(true);
-    groupByFiber->setToolTip(QObject::tr(
-        "Show each fiber as a group with all matching fiber pairs beneath it."));
-    form->addRow(QString(), groupByFiber);
-    layout->addLayout(form);
-
-    auto* buttons = new QHBoxLayout();
-    auto* run = new QPushButton(QObject::tr("Search"), content);
-    run->setObjectName(QStringLiteral("atlasSearchRunButton"));
-    auto* cancel = new QPushButton(QObject::tr("Cancel"), content);
-    cancel->setObjectName(QStringLiteral("atlasSearchCancelButton"));
-    cancel->setEnabled(false);
-    buttons->addWidget(run);
-    buttons->addWidget(cancel);
-    buttons->addStretch(1);
-    layout->addLayout(buttons);
-
-    auto* progress = new QProgressBar(content);
-    progress->setObjectName(QStringLiteral("atlasSearchProgressBar"));
-    progress->setRange(0, 100);
-    progress->setValue(0);
-    layout->addWidget(progress);
-
-    auto* tree = new QTreeWidget(content);
-    tree->setObjectName(QStringLiteral("atlasSearchResultTree"));
-    tree->setColumnCount(5);
-    tree->setHeaderLabels({
-        QObject::tr("Distance (windings)"),
-        QObject::tr("Source fiber"),
-        QObject::tr("Target fiber"),
-        QObject::tr("Src idx"),
-        QObject::tr("Tgt idx"),
-    });
-    tree->setEditTriggers(QAbstractItemView::NoEditTriggers);
-    tree->setSelectionBehavior(QAbstractItemView::SelectRows);
-    tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    tree->setMouseTracking(true);
-    tree->setAlternatingRowColors(true);
-    tree->setRootIsDecorated(true);
-    tree->setContextMenuPolicy(Qt::CustomContextMenu);
-    tree->header()->setStretchLastSection(true);
-    layout->addWidget(tree, 1);
-
-    dock->setWidget(content);
-    return dock;
+    qCInfo(lcSegGrowth) << "Normal grid lookup: no store paired with volume"
+                        << QString::fromStdString(loadedVolumeId);
+    return QString();
 }
 
 constexpr float kEpsilon = 1e-6f;
@@ -1533,9 +699,8 @@ static bool windowStateMetaMatches(const QSettings& settings,
 }
 
 // Constructor
-CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
+CWindow::CWindow(size_t cacheSizeGB) :
     _cmdRunner(nullptr),
-    _benchOptions(std::move(benchOptions)),
     _seedingWidget(nullptr),
     _point_collection_widget(nullptr)
 {
@@ -1558,7 +723,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _segmentWorkspaceWindow = segmentWorkspaceWindow;
     _segmentWorkspaceWindow->setObjectName(QStringLiteral("segmentWorkspaceWindow"));
     _segmentWorkspaceWindow->setDockOptions(dockOptions());
-    _segmentWorkspaceWindow->setCentralWidget(segmentCentralWidget);
+    _statusDockPanelHost = new StatusDockPanelHost(segmentCentralWidget, _segmentWorkspaceWindow);
+    _segmentWorkspaceWindow->setCentralWidget(_statusDockPanelHost);
 
     auto moveExistingDockToSegment = [this](QDockWidget* dock, Qt::DockWidgetArea area) {
         if (!dock || !_segmentWorkspaceWindow) {
@@ -1571,40 +737,80 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     moveExistingDockToSegment(ui.dockWidgetSegmentation, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetDistanceTransform, Qt::RightDockWidgetArea);
     moveExistingDockToSegment(ui.dockWidgetViewerControls, Qt::LeftDockWidgetArea);
-    for (QDockWidget* dock : {ui.dockWidgetPreprocessing,
-                              ui.dockWidgetNormalVis,
+    for (QDockWidget* dock : {ui.dockWidgetNormalVis,
                               ui.dockWidgetView,
                               ui.dockWidgetOverlay,
-                              ui.dockWidgetRenderSettings,
-                              ui.dockWidgetComposite,
-                              ui.dockWidgetPostprocessing}) {
+                              ui.dockWidgetComposite}) {
         moveExistingDockToSegment(dock, Qt::LeftDockWidgetArea);
     }
 
     _lasagnaWorkspaceWindow = new QMainWindow(this);
     _lasagnaWorkspaceWindow->setObjectName(QStringLiteral("lasagnaWorkspaceWindow"));
 
-    _atlasWorkspaceWindow = new QMainWindow(this);
-    _atlasWorkspaceWindow->setObjectName(QStringLiteral("atlasWorkspaceWindow"));
-    _atlasWorkspaceWindow->setDockOptions(dockOptions());
-
-    _fiberSliceWorkspaceWindow = new QMainWindow(this);
-    _fiberSliceWorkspaceWindow->setObjectName(QStringLiteral("fiberSliceWorkspaceWindow"));
-    _fiberSliceWorkspaceWindow->setDockOptions(dockOptions());
-
-    _intersectionsWorkspaceWindow = new QMainWindow(this);
-    _intersectionsWorkspaceWindow->setObjectName(QStringLiteral("intersectionsWorkspaceWindow"));
-    _intersectionsWorkspaceWindow->setDockOptions(dockOptions());
+    // The real Spiral workspace is installed after Main's CState exists. Keep
+    // an inert shell here so it can be appended without shifting legacy tabs.
+    _spiralWorkspaceWindow = new QMainWindow(this);
+    _spiralWorkspaceWindow->setObjectName(QStringLiteral("spiralWorkspaceShell"));
 
     _workspaceTabs = new QTabWidget(this);
     _workspaceTabs->setObjectName(QStringLiteral("workspaceTabs"));
+    _projectNameLabel = new QLabel(_workspaceTabs);
+    _projectNameLabel->setObjectName(QStringLiteral("currentProjectName"));
+    _projectNameLabel->setTextFormat(Qt::PlainText);
+    _projectNameLabel->setAlignment(Qt::AlignRight | Qt::AlignVCenter);
+    _projectNameLabel->setContentsMargins(8, 0, 8, 0);
+    _workspaceTabs->setCornerWidget(_projectNameLabel, Qt::TopRightCorner);
+    _workspaceTabs->setTabsClosable(true);
     _workspaceTabs->addTab(_segmentWorkspaceWindow, tr("main"));
     _workspaceTabs->addTab(_lasagnaWorkspaceWindow, tr("Lasagna"));
-    _workspaceTabs->addTab(_atlasWorkspaceWindow, tr("Atlas"));
-    _workspaceTabs->addTab(_fiberSliceWorkspaceWindow, tr("Fiber Slice"));
-    _workspaceTabs->addTab(_intersectionsWorkspaceWindow, tr("Intersections"));
-    setCentralWidget(_workspaceTabs);
-    connect(_workspaceTabs, &QTabWidget::currentChanged, this, &CWindow::scheduleWindowStateSave);
+    _workspaceTabs->addTab(_spiralWorkspaceWindow, tr("Spiral"));
+    _segmentWorkspaceWindow->setProperty("workspaceId", QStringLiteral("main"));
+    _lasagnaWorkspaceWindow->setProperty("workspaceId", QStringLiteral("lasagna"));
+    _spiralWorkspaceWindow->setProperty("workspaceId", QStringLiteral("spiral"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        for (int i = 0; i < _workspaceTabs->count(); ++i) {
+            tabBar->setTabButton(i, QTabBar::RightSide, nullptr);
+        }
+    }
+    auto* workspaceContainer = new QWidget(this);
+    workspaceContainer->setObjectName(QStringLiteral("workspaceContainer"));
+    auto* workspaceLayout = new QVBoxLayout(workspaceContainer);
+    workspaceLayout->setContentsMargins(0, 0, 0, 0);
+    workspaceLayout->setSpacing(0);
+    _persistentCacheWarningBanner = new QFrame(workspaceContainer);
+    _persistentCacheWarningBanner->setObjectName(QStringLiteral("persistentCacheWarningBanner"));
+    _persistentCacheWarningBanner->setStyleSheet(
+        QStringLiteral("QFrame#persistentCacheWarningBanner { background: #fff3cd; color: #664d03; border-bottom: 1px solid #ffda6a; }"));
+    auto* warningLayout = new QHBoxLayout(_persistentCacheWarningBanner);
+    warningLayout->setContentsMargins(10, 5, 8, 5);
+    _persistentCacheWarningText = new QLabel(_persistentCacheWarningBanner);
+    _persistentCacheWarningText->setObjectName(QStringLiteral("persistentCacheWarningText"));
+    _persistentCacheWarningText->setWordWrap(true);
+    warningLayout->addWidget(_persistentCacheWarningText, 1);
+    auto* dismissCacheWarning = new QPushButton(tr("Dismiss"), _persistentCacheWarningBanner);
+    dismissCacheWarning->setObjectName(QStringLiteral("dismissPersistentCacheWarning"));
+    warningLayout->addWidget(dismissCacheWarning);
+    connect(dismissCacheWarning, &QPushButton::clicked,
+            _persistentCacheWarningBanner, &QWidget::hide);
+    _persistentCacheWarningBanner->hide();
+    workspaceLayout->addWidget(_persistentCacheWarningBanner);
+    workspaceLayout->addWidget(_workspaceTabs, 1);
+    setCentralWidget(workspaceContainer);
+    connect(_workspaceTabs, &QTabWidget::currentChanged, this, [this]() {
+        scheduleWindowStateSave();
+        updateActiveWorkspaceViewerControls();
+        updateLineAnnotationLengthLabel();
+        QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
+    });
+    connect(_workspaceTabs, &QTabWidget::tabCloseRequested, this, [this](int index) {
+        if (!_workspaceTabs) {
+            return;
+        }
+        auto* dialog = qobject_cast<LineAnnotationDialog*>(_workspaceTabs->widget(index));
+        if (dialog) {
+            dialog->close();
+        }
+    });
     auto* lasagnaEscapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), _lasagnaWorkspaceWindow);
     lasagnaEscapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
     connect(lasagnaEscapeShortcut, &QShortcut::activated, this, &CWindow::switchToMainWorkspace);
@@ -1617,73 +823,106 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     }
     // setAttribute(Qt::WA_DeleteOnClose);
 
-    _cacheSizeBytes = cacheSizeGB * 1024ULL * 1024ULL * 1024ULL;
-    std::cout << "chunk cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
+    std::cout << "memory cache budget is " << cacheSizeGB << " gigabytes" << std::endl;
 
-    _state = new CState(_cacheSizeBytes, this);
+    _state = new CState(this, nullptr, cacheSizeGB * 1024ULL * 1024ULL * 1024ULL);
+    connect(_state, &CState::vpkgChanged, this, &CWindow::updateProjectNameLabel);
+    updateProjectNameLabel();
     connect(_state, &CState::poiChanged, this, &CWindow::onFocusPOIChanged);
     connect(_state, &CState::surfaceWillBeDeleted, this, &CWindow::onSurfaceWillBeDeleted);
-    connect(_state, &CState::vpkgChanged, this,
-            [this](std::shared_ptr<VolumePkg> pkg) {
-                _currentAtlasDir.reset();
-                _currentAtlasName.clear();
-                if (_lineAnnotationController) {
-                    _lineAnnotationController->setCurrentAtlasDirectory(std::nullopt);
-                }
-                _fiberIntersectionCache.clear();
-                refreshAtlasOverviewDocks();
-                updateAtlasFiberDocks();
-                updateAtlasSearchDocks();
-                if (!pkg) return;
-                pkg->setSegmentsChangedCallback(
-                    [self = QPointer<CWindow>(this)]() {
-                        QMetaObject::invokeMethod(self.data(), [self]() {
-                            auto* w = self.data();
-                            if (!w || !w->_surfacePanel || !w->_state || !w->_state->vpkg()) return;
-                            w->_surfacePanel->setVolumePkg(w->_state->vpkg());
-                            w->_surfacePanel->refreshSurfaceList();
-                        }, Qt::QueuedConnection);
-                    });
-            });
-
-    _fileWatcher = std::make_unique<FileWatcherService>(_state, this);
-    connect(_fileWatcher.get(), &FileWatcherService::statusMessage,
-            this, &CWindow::onShowStatusMessage);
-    connect(_fileWatcher.get(), &FileWatcherService::volumeCatalogChanged,
-            this, [this](const QString& preferredVolumeId) {
-                refreshCurrentVolumePackageUi(preferredVolumeId, false);
-            });
+    startDraftRecovery();
 
     _axisAlignedSliceController = std::make_unique<AxisAlignedSliceController>(_state, this);
 
     _viewerManager = std::make_unique<ViewerManager>(_state, _state->pointCollection(), this);
     _viewerManager->setSegmentationCursorMirroring(_mirrorCursorToSegmentation);
+    if (_workspaceTabs && _spiralWorkspaceWindow) {
+        const int spiralIndex = _workspaceTabs->indexOf(_spiralWorkspaceWindow);
+        auto* shell = _spiralWorkspaceWindow;
+        _workspaceTabs->removeTab(spiralIndex);
+        _spiralWorkspace = new SpiralWorkspace(_state, this);
+        _spiralWorkspace->setProperty("workspaceId", QStringLiteral("spiral"));
+        _spiralWorkspaceWindow = _spiralWorkspace;
+        _workspaceTabs->insertTab(spiralIndex, _spiralWorkspace, tr("Spiral"));
+        if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(spiralIndex, QTabBar::RightSide, nullptr);
+        shell->deleteLater();
+        connectVolumeSelector(_spiralWorkspace->volumeSelectionControl());
+        connect(_spiralWorkspace, &SpiralWorkspace::patchEditorRequested, this,
+                [this](const QString& id, const QString& path) {
+                    try {
+                        auto surface = std::make_shared<QuadSurface>(path.toStdString());
+                        surface->ensureLoaded();
+                        _state->setSurface(id.toStdString(), surface);
+                        onSurfaceActivatedPreserveEditing(id, surface);
+                        if (_segmentationModule) {
+                            _segmentationModule->setEditingEnabled(true);
+                            _segmentationModule->beginEditingSession(surface);
+                        }
+                    } catch (const std::exception& error) {
+                        showStatusBarMessage(QString::fromUtf8(error.what()), 15000);
+                    }
+                });
+        connect(_spiralWorkspace->viewerManager(), &ViewerManager::baseViewerCreated,
+                this, [this](VolumeViewerBase* viewer) {
+                    if (auto* chunked = viewer
+                            ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
+                            : nullptr)
+                        configureChunkedViewerConnections(chunked);
+                    if (_fiberCollection && viewer) {
+                        _fiberCollection->attachViewer(
+                            viewer, _spiralWorkspace->viewerManager());
+                    }
+                });
+        for (auto* viewer : _spiralWorkspace->viewerManager()->baseViewers()) {
+            if (auto* chunked = viewer
+                    ? qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())
+                    : nullptr)
+                configureChunkedViewerConnections(chunked);
+        }
+        // The "Add to current spiral fit" context actions are greyed out
+        // unless a Spiral session is active on the connected service.
+        connect(_spiralWorkspace, &SpiralWorkspace::spiralSessionActiveChanged, this, [this](bool active) {
+            if (_surfacePanel) _surfacePanel->setSpiralFitAvailable(active);
+            if (_fiberWidget) _fiberWidget->setSpiralFitAvailable(active);
+        });
+
+    }
     _lineAnnotationController = std::make_unique<LineAnnotationController>(_state,
                                                                            _viewerManager.get(),
                                                                            this,
                                                                            this);
+    if (_spiralWorkspace)
+        _spiralWorkspace->setLineAnnotationController(
+            _lineAnnotationController.get());
     _lineAnnotationController->setVolumeSelectorFactory(
         [this](QWidget* parent) { return createAnnotationVolumeSelector(parent); });
+    connect(_lineAnnotationController.get(), &LineAnnotationController::volumeOverlayToggleRequested,
+            this, &CWindow::toggleVolumeOverlayVisibility);
     connect(_lineAnnotationController.get(),
-            &LineAnnotationController::atlasCreated,
+            &LineAnnotationController::lineAnnotationWorkspaceRequested,
             this,
-            &CWindow::displayAtlasFromDirectory);
-    connect(_lineAnnotationController.get(),
-            &LineAnnotationController::fiberSaved,
-            this,
-            [this](uint64_t fiberId, uint64_t) {
-                _fiberIntersectionCache.pruneFiber(fiberId);
-                updateAtlasSearchDocks();
+            &CWindow::openLineAnnotationWorkspace);
+    connect(_lineAnnotationController.get(), &LineAnnotationController::fiberRetired,
+            this, [this](const QString& path) {
+                if (_spiralWorkspace) _spiralWorkspace->noteFiberRetired(path);
             });
-    connect(_lineAnnotationController.get(),
-            &LineAnnotationController::fibersDeleted,
-            this,
-            [this](std::vector<uint64_t> fiberIds) {
-                for (uint64_t fiberId : fiberIds) {
-                    _fiberIntersectionCache.pruneFiber(fiberId);
+    _fiberMapWorkspace = new FiberMapWorkspace(_state, _lineAnnotationController.get(), this);
+    _fiberMapWorkspace->setProperty("workspaceId", QStringLiteral("fiber-map"));
+    const int fiberMapIndex = _workspaceTabs->addTab(_fiberMapWorkspace, tr("Fiber Map"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) {
+        tabBar->setTabButton(fiberMapIndex, QTabBar::RightSide, nullptr);
+    }
+    connect(_fiberMapWorkspace, &FiberMapWorkspace::openFiberAtControlPointRequested,
+            this, [this](uint64_t fiberId, int controlPointIndex) {
+                if (_fiberWidget) {
+                    _fiberWidget->selectFiber(fiberId);
                 }
-                updateAtlasSearchDocks();
+                if (_lineAnnotationController) {
+                    _lineAnnotationController->openFiberAtControlPoint(fiberId,
+                                                                      controlPointIndex);
+                }
             });
+
     connect(_viewerManager.get(), &ViewerManager::baseViewerCreated, this, [this](VolumeViewerBase* viewer) {
         if (!viewer) {
             return;
@@ -1692,17 +931,112 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
             configureChunkedViewerConnections(chunkedViewer);
         }
     });
+    // Automated Fiber Volume picking precedes the shared focus policy.
+    _viewerManager->setVolumeClickInterceptor(
+        [this](const cv::Vec3f&, const cv::Vec3f&, Surface*,
+               Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
+            return (_fiberCollection && !(_segmentationModule && _segmentationModule->editingEnabled()) &&
+                    _fiberCollection->handleVolumeClick(button, modifiers));
+        });
+    connect(_viewerManager.get(), &ViewerManager::surfaceActivationRequested,
+            this, [this](const std::string& surfaceId) {
+                if (_surfacePanel) {
+                    _surfacePanel->activateSurfaceById(surfaceId);
+                }
+            });
+    connect(_viewerManager.get(), &ViewerManager::sharedCacheStatsChanged,
+            this, &CWindow::onSharedCacheStatsChanged);
 
-    // Slice step size label in status bar
-    _sliceStepLabel = new QLabel(this);
-    _sliceStepLabel->setContentsMargins(4, 0, 4, 0);
-    int initialStepSize = _viewerManager->sliceStepSize();
-    _sliceStepLabel->setText(tr("Step: %1").arg(initialStepSize));
-    _sliceStepLabel->setToolTip(tr("Slice step size: use Shift+G / Shift+H to adjust"));
-    statusBar()->addPermanentWidget(_sliceStepLabel);
+    // Left of the cache figures: the length of the fiber being annotated,
+    // while a Line Annotation tab is the active workspace.
+    _lineAnnotationLengthLabel = new QLabel(this);
+    _lineAnnotationLengthLabel->setObjectName(QStringLiteral("lineAnnotationLengthLabel"));
+    _lineAnnotationLengthLabel->setContentsMargins(8, 0, 8, 0);
+    _lineAnnotationLengthLabel->setToolTip(
+        tr("Line length of the fiber open in this Line Annotation tab. "
+           "Centimetres when the annotation frame's voxel size is known, "
+           "otherwise voxels."));
+    _lineAnnotationLengthLabel->hide();
+    statusBar()->addPermanentWidget(_lineAnnotationLengthLabel);
+
+    _sharedCacheStatsLabel = new GrowOnlyLabel(this);
+    _sharedCacheStatsLabel->setContentsMargins(8, 0, 8, 0);
+    _sharedCacheStatsLabel->setToolTip(
+        tr("Shared RAM cache, downloaded bytes/chunks for this session, and viewers loading volume levels.\n"
+           "Z-scroll sensitivity: use Shift+G / Shift+H to adjust"));
+    statusBar()->addPermanentWidget(_sharedCacheStatsLabel);
+    updateSharedStatusLabel();
+
+    _persistentCacheLowSpaceLabel = new QLabel(this);
+    _persistentCacheLowSpaceLabel->setObjectName(QStringLiteral("persistentCacheLowSpaceLabel"));
+    _persistentCacheLowSpaceLabel->setStyleSheet(QStringLiteral("color: #d28b00; font-weight: 600;"));
+    _persistentCacheLowSpaceLabel->hide();
+    statusBar()->addPermanentWidget(_persistentCacheLowSpaceLabel);
+
+    // Hosted stores: what this client knows of each, from its last status check.
+    _hostedStatusLabel = new QLabel(this);
+    _hostedStatusLabel->setObjectName(QStringLiteral("hostedStoreStatusLabel"));
+    _hostedStatusLabel->setContentsMargins(8, 0, 8, 0);
+    _hostedStatusLabel->hide();
+    statusBar()->addPermanentWidget(_hostedStatusLabel);
+    auto* hostedStatusTimer = new QTimer(this);
+    hostedStatusTimer->setInterval(1000);
+    connect(hostedStatusTimer, &QTimer::timeout, this, &CWindow::updateHostedStatus);
+    connect(_state, &CState::storeRoutesChanged, this, &CWindow::updateHostedStatus);
+    hostedStatusTimer->start();
+
+    _persistentCacheSpaceTimer = new QTimer(this);
+    _persistentCacheSpaceTimer->setInterval(5000);
+    // The free space of the cache root against VC's floor, every 5 s; whether vc_reader has
+    // actually refused a write is its budget's low_space(), which it decides on each write.
+    auto updatePersistentCacheSpace = [this]() {
+        std::error_code spaceError;
+        const auto root = vc3d::remoteCachePathFs();
+        const auto space = std::filesystem::space(root, spaceError);
+        if (spaceError)
+            return;
+        if (space.available < static_cast<std::uintmax_t>(vc::settings::remoteCacheMinFreeBytes())) {
+            const double freeGiB = static_cast<double>(space.available) /
+                                   (1024.0 * 1024.0 * 1024.0);
+            bool refused = false;
+            try {
+                refused = vcr::zarr::diskBudget(root.string(), std::nullopt)->low_space();
+            } catch (const std::exception&) {
+                // No budget on this root yet: nothing has been refused.
+            }
+            const QString text = tr("Low disk space: %1 GiB free. %2 Nothing already cached was removed.")
+                                     .arg(freeGiB, 0, 'f', 1)
+                                     .arg(refused ? tr("Chunks are no longer being cached; downloads continue without caching.")
+                                                  : tr("Chunks will not be cached while the disk stays below the configured floor."));
+            _persistentCacheLowSpaceLabel->setText(QStringLiteral("⚠ ") + text);
+            _persistentCacheLowSpaceLabel->show();
+            if (!_persistentCacheBannerShownThisSession) {
+                _persistentCacheBannerShownThisSession = true;
+                _persistentCacheWarningText->setText(text);
+                _persistentCacheWarningBanner->show();
+            }
+        } else {
+            _persistentCacheLowSpaceLabel->hide();
+            _persistentCacheWarningBanner->hide();
+        }
+    };
+    connect(_persistentCacheSpaceTimer, &QTimer::timeout, this,
+            updatePersistentCacheSpace);
+    _persistentCacheSpaceTimer->start();
+    updatePersistentCacheSpace();
 
     _pointsOverlay = std::make_unique<PointsOverlayController>(_state->pointCollection(), this);
     _viewerManager->setPointsOverlay(_pointsOverlay.get());
+
+    _fiberCollection = std::make_unique<FiberCollectionController>(_state, _viewerManager.get(), this, _lineAnnotationController.get());
+    updateActiveWorkspaceViewerControls();
+    if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
+        _spiralWorkspace->viewerManager()->forEachBaseViewer(
+            [this](VolumeViewerBase* viewer) {
+                _fiberCollection->attachViewer(
+                    viewer, _spiralWorkspace->viewerManager());
+            });
+    }
 
     _rawPointsOverlay = std::make_unique<RawPointsOverlayController>(_state, this);
     _viewerManager->setRawPointsOverlay(_rawPointsOverlay.get());
@@ -1716,8 +1050,8 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _vectorOverlay = std::make_unique<VectorOverlayController>(_state, this);
     _viewerManager->setVectorOverlay(_vectorOverlay.get());
 
-    _atlasControlOverlay = std::make_unique<AtlasControlPointsOverlayController>(this);
-    _atlasControlOverlay->bindToViewerManager(_viewerManager.get());
+    _inkDetectionOverlay = std::make_unique<InkDetectionOverlayController>(_state, this);
+    _viewerManager->setInkDetectionOverlay(_inkDetectionOverlay.get());
 
     _planeSlicingOverlay = std::make_unique<PlaneSlicingOverlayController>(_state, this);
     _planeSlicingOverlay->bindToViewerManager(_viewerManager.get());
@@ -1734,31 +1068,106 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     _axisAlignedSliceController->setViewerManager(_viewerManager.get());
 
     _volumeOverlay = std::make_unique<VolumeOverlayController>(_viewerManager.get(), this);
+    _volumeOverlay->setViewerManagers(
+        {_viewerManager.get(), _spiralWorkspace ? _spiralWorkspace->viewerManager() : nullptr});
     connect(_volumeOverlay.get(), &VolumeOverlayController::requestStatusMessage, this,
             [this](const QString& message, int timeout) {
                 if (statusBar()) {
-                    statusBar()->showMessage(message, timeout);
+                    showStatusBarMessage(message, timeout);
                 }
             });
-    _viewerManager->setVolumeOverlay(_volumeOverlay.get());
+
+    if (_statusDockPanelHost) {
+        if (auto* statusDockBar = _statusDockPanelHost->takeBarWidget()) {
+            statusDockBar->setSizePolicy(QSizePolicy::Minimum, QSizePolicy::Preferred);
+            statusBar()->insertWidget(0, statusDockBar, 0);
+        }
+    }
+
+    _statusMessageLabel = new QLabel(this);
+    _statusMessageLabel->setObjectName(QStringLiteral("statusMessageLabel"));
+    _statusMessageLabel->setContentsMargins(8, 0, 8, 0);
+    _statusMessageLabel->setTextInteractionFlags(Qt::TextSelectableByMouse);
+    _statusMessageLabel->setSizePolicy(QSizePolicy::Expanding, QSizePolicy::Preferred);
+    _statusMessageLabel->setMinimumWidth(160);
+    _statusMessageLabel->setWordWrap(false);
+    statusBar()->addWidget(_statusMessageLabel, 1);
+
+    _statusMessageTimer = new QTimer(this);
+    _statusMessageTimer->setSingleShot(true);
+    connect(_statusMessageTimer, &QTimer::timeout, this, &CWindow::clearStatusBarMessage);
+    connect(statusBar(), &QStatusBar::messageChanged, this, [this](const QString& message) {
+        if (_relayingNativeStatusMessage || message.isEmpty()) {
+            return;
+        }
+
+        _relayingNativeStatusMessage = true;
+        showStatusBarMessage(message, 0);
+        statusBar()->clearMessage();
+        _relayingNativeStatusMessage = false;
+    });
 
     // create UI widgets
     CreateWidgets();
 
+    _volumeAttachmentController =
+        std::make_unique<VolumeAttachmentController>(this);
+    _storeImportController = std::make_unique<StoreImportController>(this);
+
     // create menus/actions controller
     _menuController = std::make_unique<MenuActionController>(this);
     _menuController->populateMenus(menuBar());
-    // Wire the Actions -> Merge tifxyz... menu entry to the handler.
-    // Has to happen here (not inside CreateWidgets) because
-    // _menuController is created after CreateWidgets() returns.
-    connect(_menuController.get(), &MenuActionController::mergeTifxyzFromMenuRequested,
+    connect(_menuController.get(), &MenuActionController::growTrackPatchesFromMenuRequested,
             this, [this]() {
-                _segmentationCommandHandler->onMergeTifxyz(QStringList{});
+                _segmentationCommandHandler->onGrowTrackPatches();
             });
-    connect(_menuController.get(), &MenuActionController::mergePatchFromMenuRequested,
-            this, [this]() {
-                _segmentationCommandHandler->onMergePatch(QStringList{});
+    connect(_menuController.get(), &MenuActionController::openDataCatalogVisibilityChanged,
+            this, [this](bool) {
+                updateVolumePackageEmptyState();
             });
+
+    // The Project tab drives the File menu's project actions.
+    _state->prepareStoreSwitch = [this]() {
+        try { _state->savePointCollections(); }
+        catch (const std::exception&) { return false; }
+        if (_segmentationModule) {
+            if (_segmentationModule->growthInProgress()) return false;
+            const auto status = _segmentationModule->autosaveStatus();
+            if (status.pending || status.saveInProgress || status.dirtyAfterSave) {
+                const auto active = _state->activeSurface().lock();
+                if (!active || !_segmentationModule->saveSurface(active.get())) return false;
+            }
+        }
+        return !_lineAnnotationController || _lineAnnotationController->prepareForPackageSwitch();
+    };
+    _projectWorkspace = new ProjectWorkspace(_state, _menuController.get(), this);
+    _projectWorkspace->setProperty("workspaceId", QStringLiteral("project"));
+    const int projectIndex = _workspaceTabs->addTab(_projectWorkspace, tr("Project"));
+    if (auto* tabBar = _workspaceTabs->tabBar()) tabBar->setTabButton(projectIndex, QTabBar::RightSide, nullptr);
+    connect(_projectWorkspace, &ProjectWorkspace::projectRenamed, this, &CWindow::updateProjectNameLabel);
+    connect(_projectWorkspace, &ProjectWorkspace::volumeActivationRequested, this, [this](const QString& volumeId) {
+        const auto vpkg = _state->vpkg();
+        std::shared_ptr<Volume> volume;
+        try {
+            volume = vpkg ? vpkg->volume(volumeId.toStdString()) : nullptr;
+        } catch (const std::out_of_range&) {
+        }
+        if (!volume) {
+            QMessageBox::warning(this, tr("Error"), tr("Could not load volume."));
+            return;
+        }
+        if (_state->currentVolumeId() != volumeId.toStdString()) {
+            setVolume(volume);
+            syncVolumeSelectionControls(volumeId);
+        }
+        switchToMainWorkspace();
+    });
+    connect(ui.btnOpenDataCatalog, &QPushButton::clicked, this, [this]() {
+        if (_menuController) {
+            _menuController->showOpenDataCatalog();
+            updateVolumePackageEmptyState();
+        }
+    });
 
     if (isDarkMode()) {
         applyDarkPalette();
@@ -1872,13 +1281,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     for (QDockWidget* dock : { ui.dockWidgetSegmentation,
                                _lasagnaDock,
                                ui.dockWidgetDistanceTransform,
-                               _atlasOverviewDock,
-                               _atlasSearchDock,
-                               static_cast<QDockWidget*>(_atlasControlDock),
-                               _atlasWorkspaceOverviewDock,
-                               _atlasWorkspaceSearchDock,
-                               static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
-                               static_cast<QDockWidget*>(_fiberSliceWidget) }) {
+                               ui.dockWidgetOverlay,
+                               _inkDetectionDock,
+                               _transformsDock }) {
         if (dock) {
             dock->setMinimumWidth(250);
             dock->setMinimumHeight(120);
@@ -1892,7 +1297,21 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     }
 
     if (_workspaceTabs) {
-        const int workspaceIndex = geometry.value(WORKSPACE_TAB_SETTING, 0).toInt();
+        int workspaceIndex = -1;
+        const QString workspaceId = geometry.value(WORKSPACE_ID_SETTING).toString();
+        if (!workspaceId.isEmpty()) {
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i)->property("workspaceId").toString() == workspaceId) {
+                    workspaceIndex = i;
+                    break;
+                }
+            }
+        }
+        // An id from a workspace that no longer exists opens main; settings
+        // saved before workspace ids fall back to the tab index.
+        if (workspaceIndex < 0) {
+            workspaceIndex = workspaceId.isEmpty() ? geometry.value(WORKSPACE_TAB_SETTING, 0).toInt() : 0;
+        }
         if (workspaceIndex >= 0 && workspaceIndex < _workspaceTabs->count()) {
             _workspaceTabs->setCurrentIndex(workspaceIndex);
         }
@@ -1904,13 +1323,9 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                ui.dockWidgetVolumes,
                                ui.dockWidgetViewerControls,
-                               _atlasOverviewDock,
-                               _atlasSearchDock,
-                               static_cast<QDockWidget*>(_atlasControlDock),
-                               _atlasWorkspaceOverviewDock,
-                               _atlasWorkspaceSearchDock,
-                               static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
-                               static_cast<QDockWidget*>(_fiberSliceWidget)  }) {
+                               ui.dockWidgetOverlay,
+                                _inkDetectionDock,
+                               _transformsDock }) {
         ensureDockWidgetFeatures(dock);
         // Connect dock widget signals to trigger state saving
         if (!dock) continue;
@@ -1940,17 +1355,33 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
                                    static_cast<QDockWidget*>(_wrapAnnotationWidget),
                                    ui.dockWidgetVolumes,
                                    ui.dockWidgetViewerControls,
-                                   _atlasOverviewDock,
-                                   _atlasSearchDock,
-                                   static_cast<QDockWidget*>(_atlasControlDock),
-                                   _atlasWorkspaceOverviewDock,
-                                   _atlasWorkspaceSearchDock,
-                                   static_cast<QDockWidget*>(_atlasWorkspaceFiberDock),
-                                   static_cast<QDockWidget*>(_fiberSliceWidget),
+                                   ui.dockWidgetOverlay,
+                                   ui.dockWidgetComposite,
+                                        _inkDetectionDock,
+                                   _transformsDock,
+                                   _fibers3DDock,
+                                   _scene3DDock,
                                    static_cast<QDockWidget*>(_point_collection_widget) }) {
             if (!dock) continue;
             connect(dock, &QDockWidget::topLevelChanged, this, fixGrab);
             connect(dock, &QDockWidget::dockLocationChanged, this, fixGrab);
+        }
+    }
+
+    if (_statusDockPanelHost) {
+        for (QDockWidget* dock : {ui.dockWidgetVolumes,
+                                  ui.dockWidgetViewerControls,
+                                  ui.dockWidgetComposite,
+                                      ui.dockWidgetOverlay,
+                                  _inkDetectionDock,
+                                  _transformsDock,
+                                  ui.dockWidgetSegmentation,
+                                  _lasagnaDock,
+                                  ui.dockWidgetDistanceTransform,
+                                  static_cast<QDockWidget*>(_point_collection_widget),
+                                  static_cast<QDockWidget*>(_wrapAnnotationWidget),
+                                  static_cast<QDockWidget*>(_fiberWidget)}) {
+            _statusDockPanelHost->addDock(dock);
         }
     }
 
@@ -1960,14 +1391,21 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         resize(std::max(width(), minWindowSize.width()),
                std::max(height(), minWindowSize.height()));
     }
+    if (!restoredGeometry) {
+        setWindowState(windowState() | Qt::WindowMaximized);
+    }
+
+    bool scheduledStartupAction = false;
 
     // If enabled, auto open the last used local volume package.
     if (settings.value(vc3d::settings::project::AUTO_OPEN, vc3d::settings::project::AUTO_OPEN_DEFAULT).toInt() != 0) {
 
         QStringList files = settings.value(vc3d::settings::project::RECENT).toStringList();
+        files.removeIf([](const QString& path) { return !path.endsWith(".vcproj", Qt::CaseInsensitive); });
 
         if (!files.empty() && !files.at(0).isEmpty()) {
             QString path = files[0];
+            scheduledStartupAction = true;
             QTimer::singleShot(0, this, [this, path]() {
                 if (_menuController) {
                     _menuController->openVolpkgAt(path);
@@ -1976,30 +1414,23 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         }
     }
 
+    if (!scheduledStartupAction &&
+        settings.value(vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP,
+                       vc3d::settings::project::SHOW_OPEN_DATA_CATALOG_ON_STARTUP_DEFAULT).toBool()) {
+        QTimer::singleShot(0, this, [this]() {
+            if (_menuController && !_state->hasVpkg()) {
+                _menuController->showOpenDataCatalog();
+                updateVolumePackageEmptyState();
+            }
+        });
+    }
+
     // Create application-wide keyboard shortcuts
     fCompositeViewShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::CompositeView), this);
     fCompositeViewShortcut->setContext(Qt::ApplicationShortcut);
     connect(fCompositeViewShortcut, &QShortcut::activated, [this]() {
-        if (_viewerControlsPanel) {
-            _viewerControlsPanel->toggleSegmentationComposite();
-        }
-    });
-
-    // Toggle direction hints overlay (Ctrl+T)
-    fDirectionHintsShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::DirectionHints), this);
-    fDirectionHintsShortcut->setContext(Qt::ApplicationShortcut);
-    connect(fDirectionHintsShortcut, &QShortcut::activated, [this]() {
-        using namespace vc3d::settings;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        bool current = settings.value(viewer::SHOW_DIRECTION_HINTS, viewer::SHOW_DIRECTION_HINTS_DEFAULT).toBool();
-        bool next = !current;
-        settings.setValue(viewer::SHOW_DIRECTION_HINTS, next ? "1" : "0");
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
-                if (viewer) {
-                    viewer->setShowDirectionHints(next);
-                }
-            });
+        if (_viewerCompositePanel) {
+            _viewerCompositePanel->toggleSegmentationComposite();
         }
     });
 
@@ -2012,14 +1443,10 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         bool current = settings.value(viewer::SHOW_SURFACE_NORMALS, viewer::SHOW_SURFACE_NORMALS_DEFAULT).toBool();
         bool next = !current;
         settings.setValue(viewer::SHOW_SURFACE_NORMALS, next ? "1" : "0");
-        if (_viewerManager) {
-            _viewerManager->forEachBaseViewer([next](VolumeViewerBase* viewer) {
-                if (viewer) {
-                    viewer->setShowSurfaceNormals(next);
-                }
-            });
+        for (auto* manager : ViewerManager::allManagers()) {
+            manager->setShowSurfaceNormals(next);
         }
-        statusBar()->showMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
+        showStatusBarMessage(next ? tr("Surface normals: ON") : tr("Surface normals: OFF"), 2000);
     });
 
     fAxisAlignedSlicesShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::AxisAlignedSlices), this);
@@ -2037,7 +1464,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (_rawPointsOverlay) {
             bool newEnabled = !_rawPointsOverlay->isEnabled();
             _rawPointsOverlay->setEnabled(newEnabled);
-            statusBar()->showMessage(
+            showStatusBarMessage(
                 newEnabled ? tr("Raw points overlay enabled") : tr("Raw points overlay disabled"),
                 2000);
         }
@@ -2069,7 +1496,18 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
         if (auto* viewer = activeBaseViewer()) {
             viewer->resetSurfaceOffsets();
             viewer->fitSurfaceInView();
-            viewer->renderVisible(true);
+            viewer->renderVisible();
+        }
+    });
+
+    // Zoom-to-fit shortcut (Ctrl+0): fit the current segment in the flattened
+    // segmentation viewer, adjusting pan and zoom to its full extent.
+    fZoomToFitShortcut = new QShortcut(vc3d::keybinds::sequenceFor(vc3d::keybinds::shortcuts::ZoomToFit), this);
+    fZoomToFitShortcut->setContext(Qt::ApplicationShortcut);
+    connect(fZoomToFitShortcut, &QShortcut::activated, [this]() {
+        VolumeViewerBase* viewer = _viewerManager ? _viewerManager->segmentationViewer() : nullptr;
+        if (viewer) {
+            viewer->resetViewForCurrentContent();
         }
     });
 
@@ -2138,7 +1576,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyApprovedTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Approved, true)) {
-            statusBar()->showMessage(tr("Applied Approved tag"), 2000);
+            showStatusBarMessage(tr("Applied Approved tag"), 2000);
         }
     });
 
@@ -2147,7 +1585,7 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     connect(fApplyDefectiveTagShortcut, &QShortcut::activated, [this]() {
         if (_surfacePanel &&
             _surfacePanel->setTagChecked(SurfacePanelController::Tag::Defective, true)) {
-            statusBar()->showMessage(tr("Applied Defective tag"), 2000);
+            showStatusBarMessage(tr("Applied Defective tag"), 2000);
         }
     });
 
@@ -2165,51 +1603,16 @@ CWindow::CWindow(size_t cacheSizeGB, RenderBenchOptions benchOptions) :
     fRepeatLasagnaActionShortcut->setContext(Qt::ApplicationShortcut);
     connect(fRepeatLasagnaActionShortcut, &QShortcut::activated,
             this, &CWindow::repeatLastLasagnaAction);
-
-    connect(_surfacePanel.get(), &SurfacePanelController::moveToPathsRequested,
-            _segmentationCommandHandler.get(), &SegmentationCommandHandler::onMoveSegmentToPaths);
-    connect(_surfacePanel.get(), &SurfacePanelController::renameSurfaceRequested,
-            _segmentationCommandHandler.get(), &SegmentationCommandHandler::onRenameSurface);
-    connect(_surfacePanel.get(), &SurfacePanelController::copySurfaceRequested,
-            _segmentationCommandHandler.get(), &SegmentationCommandHandler::onCopySurfaceRequested);
-
-    // Render-bench: kick off replay once the event loop is running, or arm the
-    // recorder to attach when a volume+segment becomes active.
-    if (!_benchOptions.replayPath.isEmpty()) {
-        _benchReplay = std::make_unique<RenderBenchReplay>();
-        _benchReplay->setReplayLimit(_benchOptions.replayLimit);
-        if (_benchReplay->load(_benchOptions.replayPath)) {
-            _benchReplay->setWarmPass(_benchOptions.replayWarm);
-            _benchReplay->setOffscreen4k(_benchOptions.replayOffscreen4k);
-            _benchReplay->setSkipChunkComplete(_benchOptions.replaySkipChunkComplete);
-            _benchReplay->setSkipFastRender(_benchOptions.replaySkipFastRender);
-            _benchReplay->setTimedProfile(_benchOptions.replayTimedProfile);
-            _benchReplay->setTimedProfilePeriodMs(_benchOptions.replayTimedProfilePeriodMs);
-            QTimer::singleShot(0, this, [this] { _benchReplay->run(*this); });
-        } else {
-            _benchReplay.reset();
-        }
-    } else if (!_benchOptions.recordPath.isEmpty()) {
-        _benchRecorder = std::make_unique<RenderBenchRecorder>(_benchOptions.recordPath);
-    }
 }
 
 // Destructor
 CWindow::~CWindow()
 {
+    _destroyingWindow = true;
     if (qApp) {
         qApp->removeEventFilter(this);
     }
 
-    // Backstop in case ~CWindow is reached without closeEvent firing (e.g.
-    // if the app is torn down programmatically). Same rationale as the
-    // closeEvent hook — skip SurfacePatchIndex removal during teardown.
-    if (_viewerManager) {
-        _viewerManager->beginShutdown();
-    }
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
     setStatusBar(nullptr);
 
     if (_lineAnnotationController) {
@@ -2224,44 +1627,46 @@ void CWindow::populateDockToggleMenu(QMenu* menu) const
         return;
     }
 
-    auto addDock = [menu](QDockWidget* dock) {
+    auto addDock = [](QMenu* targetMenu, QDockWidget* dock) {
         if (dock) {
-            menu->addAction(dock->toggleViewAction());
+            targetMenu->addAction(dock->toggleViewAction());
         }
     };
 
-    addDock(ui.dockWidgetVolumes);
-    addDock(ui.dockWidgetSegmentation);
-    addDock(ui.dockWidgetDistanceTransform);
-    addDock(ui.dockWidgetViewerControls);
-    addDock(ui.dockWidgetPreprocessing);
-    addDock(ui.dockWidgetNormalVis);
-    addDock(ui.dockWidgetView);
-    addDock(ui.dockWidgetOverlay);
-    addDock(ui.dockWidgetRenderSettings);
-    addDock(ui.dockWidgetComposite);
-    addDock(ui.dockWidgetPostprocessing);
-    addDock(_lasagnaDock);
-    addDock(_atlasOverviewDock);
-    addDock(_atlasSearchDock);
-    addDock(_atlasControlDock);
-    addDock(_atlasWorkspaceFiberDock);
-    addDock(_point_collection_widget);
-    addDock(_wrapAnnotationWidget);
-    addDock(_fiberWidget);
-    addDock(_fiberSliceWidget);
+    addDock(menu, ui.dockWidgetVolumes);
+    addDock(menu, ui.dockWidgetSegmentation);
+    addDock(menu, ui.dockWidgetDistanceTransform);
+    addDock(menu, ui.dockWidgetViewerControls);
+    addDock(menu, ui.dockWidgetOverlay);
+    addDock(menu, _inkDetectionDock);
+    addDock(menu, _transformsDock);
+    addDock(menu, ui.dockWidgetComposite);
+    addDock(menu, _lasagnaDock);
+    addDock(menu, _scene3DDock);
+
+    addDock(menu, _point_collection_widget);
+    addDock(menu, _wrapAnnotationWidget);
+
+    if (_fiberWidget || _fibers3DDock) {
+        auto* fiberMenu = menu->addMenu(tr("Fibers"));
+        addDock(fiberMenu, _fiberWidget);
+        addDock(fiberMenu, _fibers3DDock);
+    }
 }
 
-VolumeViewerBase *CWindow::newConnectedViewer(std::string surfaceName, QString title, QMdiArea *mdiArea)
+VolumeViewerBase* CWindow::newConnectedViewerInWidget(std::string surfaceName, QString title, QWidget* parent)
 {
-    if (!_viewerManager) {
+    if (!_viewerManager || !parent) {
         return nullptr;
     }
 
-    VolumeViewerBase* viewer = _viewerManager->createViewer(surfaceName, title, mdiArea);
+    VolumeViewerBase* viewer = _viewerManager->createViewerInWidget(surfaceName, parent);
     if (!viewer) {
         return nullptr;
     }
+
+    if (auto* viewerObject = viewer->asQObject())
+        viewerObject->setProperty("vc_viewer_label", title);
 
     if (auto* chunkedViewer = qobject_cast<CChunkedVolumeViewer*>(viewer->asQObject())) {
         configureChunkedViewerConnections(chunkedViewer);
@@ -2275,35 +1680,32 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
         return;
     }
 
+    // Volume-change propagation, cache-stats aggregation, the default
+    // volume-click policy and active-viewer tracking are wired by
+    // ViewerManager::initializeChunkedViewer for every workspace.
     const bool annotationViewer = viewer->property("vc_viewer_role").toString() == QStringLiteral("annotation");
+    const bool mainViewer = _viewerManager &&
+        std::find(_viewerManager->baseViewers().begin(),
+                  _viewerManager->baseViewers().end(), viewer) !=
+            _viewerManager->baseViewers().end();
 
-    connect(_state, &CState::volumeChanged, viewer, &CChunkedVolumeViewer::OnVolumeChanged, Qt::UniqueConnection);
-    connect(_state, &CState::volumeClosing, viewer, &CChunkedVolumeViewer::onVolumeClosing, Qt::UniqueConnection);
-    if (!annotationViewer) {
-        connect(viewer, &CChunkedVolumeViewer::sendVolumeClicked, this, &CWindow::onVolumeClicked, Qt::UniqueConnection);
-    } else if (!viewer->property("vc_annotation_focus_bound").toBool()) {
+    if (annotationViewer && !viewer->property("vc_annotation_focus_bound").toBool()) {
         const std::string surfaceName = viewer->surfName();
-        const bool atlasFocusViewer = surfaceName == ATLAS_INTERNAL_SURFACE_NAME;
         const bool lineFocusViewer = surfaceName.rfind("line-", 0) == 0 ||
                                      surfaceName.rfind("line_annotation_slice_", 0) == 0;
-        if (atlasFocusViewer || lineFocusViewer) {
+        if (lineFocusViewer) {
             connect(viewer,
                     &CChunkedVolumeViewer::sendVolumeClicked,
                     this,
-                    [this, atlasFocusViewer, lineFocusViewer](cv::Vec3f volLoc,
-                                                              cv::Vec3f normal,
-                                                              Surface*,
-                                                              Qt::MouseButton button,
-                                                              Qt::KeyboardModifiers modifiers) {
+                    [this](cv::Vec3f volLoc,
+                           cv::Vec3f normal,
+                           Surface*,
+                           Qt::MouseButton button,
+                           Qt::KeyboardModifiers modifiers) {
                         if (button != Qt::LeftButton || !modifiers.testFlag(Qt::ControlModifier)) {
                             return;
                         }
-                        std::string sourceId;
-                        if (lineFocusViewer) {
-                            sourceId = "segmentation";
-                        }
-                        const bool focused = centerFocusAt(volLoc, normal, sourceId);
-                        if (atlasFocusViewer || (lineFocusViewer && focused)) {
+                        if (centerFocusAt(volLoc, normal, "segmentation")) {
                             switchToMainWorkspace();
                             raise();
                             activateWindow();
@@ -2346,33 +1748,183 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             ? _segmentationWidget->lasagnaPanel()
                             : nullptr;
 
-                        bool activeSegmentHasLasagnaModel = false;
-                        if (_state && _state->vpkg()) {
-                            auto activeSurface = std::dynamic_pointer_cast<QuadSurface>(
-                                _state->surface("segmentation"));
-                            if (activeSurface && !activeSurface->path.empty()) {
-                                std::filesystem::path segPath = activeSurface->path;
-                                if (segPath.is_relative()) {
-                                    std::filesystem::path outputSegmentsPath =
-                                        _state->vpkg()->outputSegmentsPath();
-                                    if (outputSegmentsPath.empty()) {
-                                        outputSegmentsPath = _state->vpkg()->findSegmentPathByName(
-                                            _state->vpkg()->getSegmentationDirectory());
-                                    }
-                                    if (outputSegmentsPath.empty()) {
-                                        outputSegmentsPath =
-                                            std::filesystem::path(_state->vpkg()->getVolpkgDirectory()) /
-                                            "paths";
-                                    }
-                                    segPath = outputSegmentsPath / segPath.filename();
-                                }
-                                std::error_code ec;
-                                activeSegmentHasLasagnaModel =
-                                    std::filesystem::exists(segPath / "model.pt", ec);
+                        const auto activeSurface = _state ? _state->surface("segmentation") : nullptr;
+                        const bool activeSegmentHasLasagnaModel =
+                            activeSurface && LasagnaServiceManager::instance().surfaceHasModel(activeSurface->id);
+
+                        QMenu menu(this);
+
+                        if (_fiberCollection && _lineAnnotationController) {
+                            if (const auto hit = _fiberCollection->hitTestControlPoint(
+                                    viewer, scenePoint, 12.0);
+                                hit && hit->fiberId != 0) {
+                                const uint64_t fiberId = hit->fiberId;
+                                const int controlIndex = hit->controlPointIndex;
+                                QAction* gotoControlPointAction = menu.addAction(
+                                    tr("Go to control point %1 in %2")
+                                        .arg(controlIndex)
+                                        .arg(_lineAnnotationController->fiberDisplayName(fiberId)));
+                                connect(gotoControlPointAction, &QAction::triggered, this,
+                                        [this, fiberId, controlIndex]() {
+                                            if (_fiberWidget) {
+                                                _fiberWidget->selectFiber(fiberId);
+                                            }
+                                            if (_lineAnnotationController) {
+                                                _lineAnnotationController->openFiberAtControlPoint(
+                                                    fiberId, controlIndex);
+                                            }
+                                        });
+                                menu.addSeparator();
                             }
                         }
 
-                        QMenu menu(this);
+                        if (_spiralWorkspace &&
+                            _spiralWorkspace->isFlattenedViewer(viewer)) {
+                            QAction* spiralLineAction =
+                                menu.addAction(tr("2D line annotation"));
+                            spiralLineAction->setObjectName(
+                                QStringLiteral("spiral2dLineAnnotationAction"));
+                            const QString reason = _spiralWorkspace
+                                                       ->lineAnnotationDraftUnavailableReason();
+                            spiralLineAction->setEnabled(reason.isEmpty());
+                            spiralLineAction->setToolTip(reason);
+                            connect(spiralLineAction, &QAction::triggered, this,
+                                    [this]() {
+                                        if (_spiralWorkspace && _menuController &&
+                                            _menuController->requireProject(tr("Creating a fiber")))
+                                            _spiralWorkspace->startLineAnnotationDraft();
+                                    });
+                            menu.addSeparator();
+                        }
+
+                        // Enabled without a store: choosing it offers to create or attach one.
+                        QAction* newLineAnnotationAction = menu.addAction(tr("New line annotation"));
+                        newLineAnnotationAction->setEnabled(
+                            _lineAnnotationController &&
+                            _lineAnnotationController->viewerSupportsLaunch(viewer) &&
+                            viewer->sampleSceneVolume(scenePoint).has_value());
+
+                        QAction* modelLineAnnotationAction = menu.addAction(tr("New 2D line annotation (model)"));
+                        modelLineAnnotationAction->setObjectName(QStringLiteral("model2dLineAnnotationAction"));
+                        modelLineAnnotationAction->setEnabled(newLineAnnotationAction->isEnabled());
+
+                        QAction* createGrowPatchAction = menu.addAction(tr("Create Segment (GrowPatch)"));
+                        createGrowPatchAction->setEnabled(validVolumePoint &&
+                                                          _segmentationCommandHandler &&
+                                                          _state &&
+                                                          _state->vpkg() &&
+                                                          _state->currentVolume());
+                        connect(createGrowPatchAction, &QAction::triggered, this,
+                                [this, volumePoint]() {
+                                    if (!_segmentationCommandHandler) {
+                                        return;
+                                    }
+                                    _segmentationCommandHandler->onCreateSegmentGrowPatchFromSeed(
+                                        QVector3D(volumePoint[0], volumePoint[1], volumePoint[2]));
+                                });
+
+                        menu.addSeparator();
+
+                        auto* viewerWidget = qobject_cast<QWidget*>(viewer->asQObject());
+                        auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
+                        bool mainGrid = viewerGrid && viewerGrid->indexOf(viewerWidget) >= 0;
+                        if (!mainGrid && _spiralWorkspace && _spiralWorkspace->viewerGrid())
+                            viewerGrid = _spiralWorkspace->viewerGrid();
+                        const int viewerPane = viewerGrid ? viewerGrid->indexOf(viewerWidget) : -1;
+                        if (viewerGrid && viewerPane >= 0) {
+                            const bool fullSizeActive = viewerGrid->fullSizeActive();
+                            QAction* fullSizeAction = menu.addAction(
+                                viewerGrid->fullSizeActiveForPane(viewerPane)
+                                    ? tr("Exit full size")
+                                    : tr("Full size viewer"));
+                            connect(fullSizeAction, &QAction::triggered, this,
+                                    [viewerGrid, viewerPane]() {
+                                        if (viewerGrid->fullSizeActiveForPane(viewerPane)) {
+                                            viewerGrid->exitFullSize();
+                                        } else {
+                                            viewerGrid->setFullSizePane(viewerPane);
+                                        }
+                                    });
+
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            closeAction->setEnabled(!fullSizeActive && !viewerGrid->paneHidden(viewerPane));
+                            connect(closeAction, &QAction::triggered, this, [viewerGrid, viewerPane, mainGrid]() {
+                                viewerGrid->setPaneHidden(viewerPane, true);
+                                if (mainGrid) persistMainViewerLayout(viewerGrid);
+                            });
+
+                            auto* moveMenu = menu.addMenu(tr("Move viewer to"));
+                            for (int pane = 0; pane < 4; ++pane) {
+                                const QString paneLabel = QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* paneAction = moveMenu->addAction(paneLabel);
+                                paneAction->setEnabled(!fullSizeActive && pane != viewerPane);
+                                connect(paneAction, &QAction::triggered, this,
+                                        [viewerGrid, viewerPane, pane, mainGrid]() {
+                                            const bool targetWasHidden = viewerGrid->paneHidden(pane);
+                                            viewerGrid->swapViewers(viewerPane, pane);
+                                            if (targetWasHidden) {
+                                                viewerGrid->setPaneHidden(pane, false);
+                                                viewerGrid->setPaneHidden(viewerPane, true);
+                                            }
+                                            if (mainGrid) persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+
+                            auto* showMenu = menu.addMenu(tr("Show closed viewer here"));
+                            bool hasClosedViewer = false;
+                            for (int pane = 0; pane < 4; ++pane) {
+                                if (!viewerGrid->paneHidden(pane) || !viewerGrid->viewer(pane)) {
+                                    continue;
+                                }
+                                auto* hiddenViewer = baseViewerFromWidget(viewerGrid->viewer(pane));
+                                const QString label = hiddenViewer
+                                    ? mainViewerDisplayName(hiddenViewer->surfName())
+                                    : QObject::tr(kMainViewerPaneLabels[pane]);
+                                QAction* showAction = showMenu->addAction(label);
+                                hasClosedViewer = true;
+                                connect(showAction, &QAction::triggered, this,
+                                        [viewerGrid, viewerPane, pane, mainGrid]() {
+                                            viewerGrid->swapViewers(viewerPane, pane);
+                                            viewerGrid->setPaneHidden(viewerPane, false);
+                                            viewerGrid->setPaneHidden(pane, true);
+                                            if (mainGrid) persistMainViewerLayout(viewerGrid);
+                                        });
+                            }
+                            showMenu->setEnabled(!fullSizeActive && hasClosedViewer);
+                            menu.addSeparator();
+                        }
+
+                        QPointer<QMdiSubWindow> subWindow = viewerWidget
+                            ? qobject_cast<QMdiSubWindow*>(viewerWidget->parentWidget())
+                            : nullptr;
+                        if (subWindow) {
+                            QAction* maximizeAction = menu.addAction(
+                                subWindow->isMaximized() ? tr("Restore viewer") : tr("Maximize viewer"));
+                            connect(maximizeAction, &QAction::triggered, this, [subWindow]() {
+                                if (!subWindow)
+                                    return;
+                                if (subWindow->isMaximized())
+                                    subWindow->showNormal();
+                                else
+                                    subWindow->showMaximized();
+                            });
+
+                            QAction* closeAction = menu.addAction(tr("Close viewer"));
+                            connect(closeAction, &QAction::triggered, this, [subWindow]() {
+                                if (subWindow)
+                                    subWindow->close();
+                            });
+                            menu.addSeparator();
+                        }
+
+                        if (viewer->measurementSupported()) {
+                            QAction* measureAction = menu.addAction(tr("Measure"));
+                            connect(measureAction, &QAction::triggered, this, [viewer]() {
+                                viewer->startMeasurementMode();
+                            });
+                            menu.addSeparator();
+                        }
+
                         auto addLasagnaLaunchAction =
                             [this, lasagnaPanel, &menu, seedX, seedY, seedZ, validVolumePoint,
                              activeSegmentHasLasagnaModel](
@@ -2460,13 +2012,15 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                             }
                         }
 
-                        QAction* action = menu.addAction(tr("New line annotation"));
-                        action->setEnabled(_lineAnnotationController &&
-                                           _lineAnnotationController->canLaunchFromViewer(viewer) &&
-                                           viewer->sampleSceneVolume(scenePoint).has_value());
                         QAction* selected = menu.exec(globalPos);
-                        if (selected == action && action->isEnabled() && _lineAnnotationController) {
-                            _lineAnnotationController->launchFromViewerAtPoint(viewer, scenePoint);
+                        const bool launch = (selected == newLineAnnotationAction ||
+                                             selected == modelLineAnnotationAction) &&
+                                            selected->isEnabled() && _lineAnnotationController &&
+                                            _menuController &&
+                                            _menuController->requireProject(tr("Creating a fiber"));
+                        if (launch) {
+                            _lineAnnotationController->launchFromViewerAtPoint(
+                                viewer, scenePoint, true, selected == modelLineAnnotationAction);
                         }
                     });
             viewer->setProperty("vc_annotation_context_bound", true);
@@ -2485,6 +2039,11 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     if (annotationViewer) {
         return;
     }
+    if (!mainViewer) {
+        // The menu and direct viewer input above are shared. Editing widgets
+        // below intentionally remain bound only to Main's state and manager.
+        return;
+    }
 
     if (_seedingWidget && !viewer->property("vc_seeding_bound").toBool()) {
         connect(_seedingWidget, &SeedingWidget::sendPathsChanged,
@@ -2495,18 +2054,20 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
                 _seedingWidget, &SeedingWidget::onMouseMove, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
                 _seedingWidget, &SeedingWidget::onMouseRelease, Qt::UniqueConnection);
-        connect(viewer, &CChunkedVolumeViewer::sendZSliceChanged,
-                _seedingWidget, &SeedingWidget::updateCurrentZSlice, Qt::UniqueConnection);
         viewer->setProperty("vc_seeding_bound", true);
     }
 
     if (_point_collection_widget && !viewer->property("vc_points_bound").toBool()) {
         connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
                 viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearCollectionSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectCollection, Qt::UniqueConnection);
         connect(_point_collection_widget, &CPointCollectionWidget::pointSelected,
                 viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(_point_collection_widget, &CPointCollectionWidget::pointSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearPointSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _point_collection_widget, &CPointCollectionWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
@@ -2517,10 +2078,14 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     if (_wrapAnnotationWidget && !viewer->property("vc_wrap_annotation_bound").toBool()) {
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelected,
                 viewer, &CChunkedVolumeViewer::onCollectionSelected, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::collectionSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearCollectionSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::sendCollectionSelected,
                 _wrapAnnotationWidget, &WrapAnnotationWidget::selectCollection, Qt::UniqueConnection);
         connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelected,
                 viewer, &CChunkedVolumeViewer::onPointSelected, Qt::UniqueConnection);
+        connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointSelectionCleared,
+                viewer, &CChunkedVolumeViewer::clearPointSelection, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointSelected,
                 _wrapAnnotationWidget, &WrapAnnotationWidget::selectPoint, Qt::UniqueConnection);
         connect(viewer, &CChunkedVolumeViewer::pointClicked,
@@ -2552,28 +2117,22 @@ void CWindow::configureChunkedViewerConnections(CChunkedVolumeViewer* viewer)
     }
 
     const std::string& surfName = viewer->surfName();
-    if ((surfName == "seg xz" || surfName == "seg yz") && !viewer->property("vc_axisaligned_bound").toBool()) {
-        if (auto* graphicsView = viewer->graphicsView()) {
-            graphicsView->setMiddleButtonPanEnabled(!_axisAlignedSliceController->isEnabled());
-        }
-
-        connect(viewer, &CChunkedVolumeViewer::sendMousePressVolume,
-                this, [this, viewer](cv::Vec3f volLoc, cv::Vec3f /*normal*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMousePress(viewer, volLoc, button, modifiers);
-                });
-
-        connect(viewer, &CChunkedVolumeViewer::sendMouseMoveVolume,
-                this, [this, viewer](cv::Vec3f volLoc, Qt::MouseButtons buttons, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMouseMove(viewer, volLoc, buttons, modifiers);
-                });
-
-        connect(viewer, &CChunkedVolumeViewer::sendMouseReleaseVolume,
-                this, [this, viewer](cv::Vec3f /*volLoc*/, Qt::MouseButton button, Qt::KeyboardModifiers modifiers) {
-                    _axisAlignedSliceController->onMouseRelease(viewer, button, modifiers);
-                });
-
-        viewer->setProperty("vc_axisaligned_bound", true);
+    if ((surfName == "xy plane" || surfName == "seg xz" || surfName == "seg yz") &&
+        !viewer->property("vc_volcam_bound").toBool()) {
+        // Slice views fold their volumetric-camera azimuth into the slice
+        // plane itself (so sampling, intersections, focus and handles all
+        // agree); reconfigure the planes whenever the per-view camera (or
+        // anything that implicitly zeroes it) changes.
+        viewer->setVolumetricAzimuthInSurface(true);
+        connect(viewer, &CChunkedVolumeViewer::compositeCameraChanged, this, [this]() {
+            if (_axisAlignedSliceController) {
+                _axisAlignedSliceController->syncVolumetricAzimuths();
+            }
+        });
+        viewer->setProperty("vc_volcam_bound", true);
     }
+    // Axis-aligned rotation/tilt wiring is attached per viewer by
+    // AxisAlignedSliceController via ViewerManager::baseViewerCreated.
 }
 
 CChunkedVolumeViewer* CWindow::segmentationViewer() const
@@ -2604,6 +2163,38 @@ VolumeViewerBase* CWindow::segmentationBaseViewer() const
 
 VolumeViewerBase* CWindow::activeBaseViewer() const
 {
+    auto* manager = activeWorkspaceViewerManager();
+    if (!manager) {
+        return nullptr;
+    }
+
+    if (auto* viewer = manager->activeViewer()) {
+        return viewer;
+    }
+
+    if (manager != _viewerManager.get()) {
+        QWidget* focus = QApplication::focusWidget();
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && focus && (widget == focus || widget->isAncestorOf(focus))) {
+                return viewer;
+            }
+        }
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && widget->isVisible() && widget->underMouse()) {
+                return viewer;
+            }
+        }
+        for (auto* viewer : manager->baseViewers()) {
+            auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+            if (widget && widget->isVisible()) {
+                return viewer;
+            }
+        }
+        return nullptr;
+    }
+
     if (!mdiArea) {
         return nullptr;
     }
@@ -2614,11 +2205,107 @@ VolumeViewerBase* CWindow::activeBaseViewer() const
     return baseViewerFromWidget(subWindow->widget());
 }
 
+ViewerManager* CWindow::activeWorkspaceViewerManager() const
+{
+    if (_workspaceTabs && _spiralWorkspace &&
+        _workspaceTabs->currentWidget() == _spiralWorkspace) {
+        return _spiralWorkspace->viewerManager();
+    }
+    return _viewerManager.get();
+}
+
+void CWindow::updateActiveWorkspaceViewerControls()
+{
+    const bool lineAnnotationActive =
+        _workspaceTabs && qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget());
+    if (_fiberCollection) {
+        _fiberCollection->setLineAnnotationActive(lineAnnotationActive);
+    }
+    if (_fiberWidget) {
+        _fiberWidget->setLineAnnotationActive(lineAnnotationActive);
+    }
+    auto* manager = activeWorkspaceViewerManager();
+    if (_viewerControlsPanel) {
+        _viewerControlsPanel->setViewerManager(manager);
+    }
+    // Composite and volume-overlay controls remain bound to both managers.
+    // Only navigation and other workspace-local controls follow the active tab.
+}
+
+void CWindow::updateProjectNameLabel()
+{
+    if (!_projectNameLabel || !_workspaceTabs) return;
+    const auto project = _state ? _state->vpkg() : nullptr;
+    if (!project) {
+        _projectNameLabel->clear();
+        _projectNameLabel->setToolTip({});
+        _projectNameLabel->setFixedWidth(0);
+        return;
+    }
+    const QString name = QString::fromStdString(project->name());
+    _projectNameLabel->setToolTip(QString::fromStdString(project->path().string()));
+    const int available = std::max(0, _workspaceTabs->width() -
+        _workspaceTabs->tabBar()->sizeHint().width() - 8);
+    const auto metrics = _projectNameLabel->fontMetrics();
+    _projectNameLabel->setFixedWidth(std::min(available, metrics.horizontalAdvance(name) + 16));
+    _projectNameLabel->setText(metrics.elidedText(
+        name, Qt::ElideMiddle, std::max(0, _projectNameLabel->width() - 16)));
+}
+
+void CWindow::resetSegmentationViews(bool persistLayout)
+{
+    auto* viewerGrid = mainViewerSplitGrid(ui.tabSegment);
+    if (!viewerGrid) {
+        return;
+    }
+
+    auto ensureDefaultViewer = [this, viewerGrid](const std::string& surfaceName,
+                                                  const QString& title,
+                                                  const std::set<std::string>& intersects) -> VolumeViewerBase* {
+        if (_viewerManager) {
+            for (auto* viewer : _viewerManager->baseViewers()) {
+                auto* viewerWidget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr;
+                if (viewer && viewerWidget && viewer->surfName() == surfaceName && viewerWidget->parentWidget() == viewerGrid) {
+                    return viewer;
+                }
+            }
+        }
+
+        auto* viewer = newConnectedViewerInWidget(surfaceName, title, viewerGrid);
+        if (viewer) {
+            viewer->setIntersects(intersects);
+        }
+        return viewer;
+    };
+
+    auto* surfaceViewer = ensureDefaultViewer("segmentation", tr("Surface"), {"seg xz", "seg yz"});
+    auto* xyViewer = ensureDefaultViewer("xy plane", tr("XY"), {"segmentation"});
+    auto* xzViewer = ensureDefaultViewer("seg xz", tr("XZ"), {"segmentation"});
+    auto* yzViewer = ensureDefaultViewer("seg yz", tr("YZ"), {"segmentation"});
+
+    viewerGrid->setViewer(0, surfaceViewer ? qobject_cast<QWidget*>(surfaceViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(1, xyViewer ? qobject_cast<QWidget*>(xyViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(2, xzViewer ? qobject_cast<QWidget*>(xzViewer->asQObject()) : nullptr);
+    viewerGrid->setViewer(3, yzViewer ? qobject_cast<QWidget*>(yzViewer->asQObject()) : nullptr);
+
+    for (auto* viewer : {surfaceViewer, xzViewer, xyViewer, yzViewer}) {
+        if (auto* widget = viewer ? qobject_cast<QWidget*>(viewer->asQObject()) : nullptr) {
+            widget->show();
+        }
+    }
+
+    viewerGrid->setPaneHidden(0, kDefaultMainViewerHidden[0]);
+    viewerGrid->setPaneHidden(1, kDefaultMainViewerHidden[1]);
+    viewerGrid->setPaneHidden(2, kDefaultMainViewerHidden[2]);
+    viewerGrid->setPaneHidden(3, kDefaultMainViewerHidden[3]);
+    viewerGrid->resetSplits();
+    if (persistLayout) {
+        persistMainViewerLayout(viewerGrid);
+    }
+}
+
 void CWindow::clearSurfaceSelection()
 {
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->clearPreview(true);
-    }
     _state->clearActiveSurface();
 
     if (_surfacePanel) {
@@ -2632,22 +2319,37 @@ void CWindow::clearSurfaceSelection()
     if (treeWidgetSurfaces) {
         treeWidgetSurfaces->clearSelection();
     }
-
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
-    if (_atlasControlDock) {
-        _atlasControlDock->clearResults();
-    }
 }
 
 void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 {
     const bool hadVolume = static_cast<bool>(_state->currentVolume());
-    POI* existingFocusPoi = _state ? _state->poi("focus") : nullptr;
+    const auto previousVoxels = _state->annotationVolume();
+    // Another volume, or the same at another working level: other voxels.
+    const auto targetVoxels = newvol ? std::optional(vc::project::annotationVolume(_state->vpkg().get(), *newvol))
+                                     : std::nullopt;
+    const auto navigationTransform =
+        (hadVolume && previousVoxels && targetVoxels &&
+         vc::objects::VolumeVoxels(*previousVoxels) != vc::objects::VolumeVoxels(*targetVoxels))
+            ? volumeTransformForSwitch(*previousVoxels, *targetVoxels)
+            : std::optional<vcr::catalog::Affine>{};
 
-    // CState handles cache budget and volume ID resolution, and emits volumeChanged
-    _state->setCurrentVolume(newvol);
+    // Switch both independent states before revalidating the canonical overlay.
+    // This prevents an incompatible base-volume transition from clearing only
+    // one viewer fleet while the other still reports the previous coordinates.
+    if (_volumeOverlay) _volumeOverlay->beginBaseVolumeUpdate();
+    if (_viewerManager) {
+        _viewerManager->switchVolume(newvol, navigationTransform);
+    } else {
+        _state->setCurrentVolume(newvol);
+    }
+    if (_spiralWorkspace) {
+        _spiralWorkspace->synchronizeVolume(newvol, navigationTransform);
+    }
+    if (_volumeOverlay) _volumeOverlay->endBaseVolumeUpdate();
+    if (_state->currentVolume() && !_state->currentVolumeId().empty()) {
+        rememberCurrentVolumeForPackage(QString::fromStdString(_state->currentVolumeId()));
+    }
 
     const bool growthVolumeValid = _state->hasVpkg() && !_state->segmentationGrowthVolumeId().empty() &&
                                    _state->vpkg()->hasVolume(_state->segmentationGrowthVolumeId());
@@ -2660,113 +2362,70 @@ void CWindow::setVolume(std::shared_ptr<Volume> newvol)
 
     updateNormalGridAvailability();
 
-    if (_state->currentVolume() && _state) {
-        auto [w, h, d] = _state->currentVolume()->shapeXyz();
-        float x0 = 0, y0 = 0, z0 = 0;
-        float x1 = static_cast<float>(w - 1), y1 = static_cast<float>(h - 1), z1 = static_cast<float>(d - 1);
-
-        POI* poi = existingFocusPoi;
-        const bool createdPoi = (poi == nullptr);
-        if (!poi) {
-            poi = new POI;
-            poi->n = cv::Vec3f(0, 0, 1);
-        }
-
-        if (createdPoi || !hadVolume) {
-            poi->p = cv::Vec3f((x0 + x1) * 0.5f, (y0 + y1) * 0.5f, (z0 + z1) * 0.5f);
-        } else {
-            poi->p[0] = std::clamp(poi->p[0], x0, x1);
-            poi->p[1] = std::clamp(poi->p[1], y0, y1);
-            poi->p[2] = std::clamp(poi->p[2], z0, z1);
-        }
-        poi->surfacePtr.reset();
-
-        _state->setPOI("focus", poi);
-    }
-
     _axisAlignedSliceController->applyOrientation(_state ? _state->surface("segmentation").get() : nullptr);
     syncVolumeSelectionControls();
 }
 
-bool CWindow::attachVolumeToCurrentPackage(const std::shared_ptr<Volume>& volume,
-                                           const QString& preferredVolumeId)
+CWindow::VolumeAttachResult CWindow::attachVolumeToCurrentPackage(
+    const std::shared_ptr<Volume>& volume,
+    const QString& location,
+    std::vector<std::string> tags,
+    const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg() || !volume) {
-        return false;
+        throw std::logic_error("cannot attach a volume without an open project");
     }
 
-    if (!_state->vpkg()->addVolume(volume)) {
-        return false;
-    }
+    const auto result = _state->vpkg()->attachPreparedVolume(
+        location.toStdString(),
+        std::move(tags),
+        volume);
+    if (result == VolumePkg::AttachVolumeResult::VolumeIdConflict)
+        return VolumeAttachResult::VolumeIdConflict;
 
-    const bool needSurfaceLoad = _surfacePanel && !_surfacePanel->hasSurfaces();
-    refreshCurrentVolumePackageUi(preferredVolumeId.isEmpty()
-                                      ? QString::fromStdString(volume->id())
-                                      : preferredVolumeId,
-                                  needSurfaceLoad);
+    refreshCurrentVolumePackageUi(preferredVolumeId);
     UpdateView();
-    return true;
+    return result == VolumePkg::AttachVolumeResult::Attached
+        ? VolumeAttachResult::Attached
+        : VolumeAttachResult::AlreadyAttached;
 }
 
-void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId,
-                                            bool reloadSurfaces)
+void CWindow::refreshCurrentVolumePackageUi(const QString& preferredVolumeId)
 {
     if (!_state || !_state->vpkg()) {
         return;
     }
 
     if (_segmentationWidget) {
-        _segmentationWidget->setVolumePackagePath(_state->vpkgPath());
+        _segmentationWidget->setVolumePackagePath(_state->projectDirectory());
     }
 
     updateNormalGridAvailability();
 
     refreshVolumeSelectionUi(preferredVolumeId);
     if (!_state->vpkg()->hasVolumes()) {
-        Logger()->info("Opened volpkg '{}' with no volumes", _state->vpkgPath().toStdString());
-        statusBar()->showMessage(tr("Opened volume package with no volumes."), 5000);
+        Logger()->info("Opened volpkg '{}' with no volumes", _state->projectDirectory().toStdString());
+        showStatusBarMessage(tr("Opened volume package with no volumes."), 5000);
     }
 
     if (_volumeOverlay) {
-        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->vpkgPath());
-    }
-
-    {
-        const QSignalBlocker blocker{cmbSegmentationDir};
-        cmbSegmentationDir->clear();
-
-        auto availableDirs = _state->vpkg()->getAvailableSegmentationDirectories();
-        for (const auto& dirName : availableDirs) {
-            cmbSegmentationDir->addItem(QString::fromStdString(dirName));
-        }
-
-        int currentIndex = cmbSegmentationDir->findText(
-            QString::fromStdString(_state->vpkg()->getSegmentationDirectory()));
-        if (currentIndex >= 0) {
-            cmbSegmentationDir->setCurrentIndex(currentIndex);
-        }
+        _volumeOverlay->setVolumePkg(_state->vpkg(), _state->projectDirectory());
     }
 
     if (_surfacePanel) {
-        _surfacePanel->setVolumePkg(_state->vpkg());
-        if (_viewerManager) {
-            _viewerManager->resetStrideUserOverride();
-        }
-        if (reloadSurfaces) {
-            _surfacePanel->loadSurfaces(false);
-            _surfacePanel->refreshPointSetFilterOptions();
-        }
+        _surfacePanel->refreshPointSetFilterOptions();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
+    if (_projectWorkspace) {
+        _projectWorkspace->refresh();
     }
 }
 
 void CWindow::updateNormalGridAvailability()
 {
     QString checkedPath;
-    const QString path = normalGridDirectoryForVolumePkg(_state->vpkg(), &checkedPath);
+    const QString path = normalGridDirectoryForVolumePkg(
+        _state->vpkg(), _state->currentVolumeId(), &checkedPath);
     const bool available = !path.isEmpty();
 
     _normalGridAvailable = available;
@@ -2776,17 +2435,18 @@ void CWindow::updateNormalGridAvailability()
         _segmentationWidget->setNormalGridAvailable(_normalGridAvailable);
         _segmentationWidget->setNormalGridPath(_normalGridPath);
         QString hint;
+        if (!_normalGridAvailable && _state->vpkg() &&
+            _state->vpkg()->catalogView(_state->currentVolumeId())) {
+            hint = tr("No normal grids are published for this open-data volume.");
+        }
         if (_normalGridAvailable) {
+        } else if (!hint.isEmpty()) {
         } else if (!checkedPath.isEmpty()) {
             hint = tr("Checked: %1").arg(checkedPath);
         } else {
             hint = tr("No volume package loaded.");
         }
         _segmentationWidget->setNormalGridPathHint(hint);
-
-        QString normal3dHint;
-        const QStringList normal3d = normal3dZarrCandidatesForVolumePkg(_state->vpkg(), &normal3dHint);
-        _segmentationWidget->setNormal3dZarrCandidates(normal3d, normal3dHint);
     }
 }
 
@@ -2794,6 +2454,9 @@ void CWindow::toggleVolumeOverlayVisibility()
 {
     if (_volumeOverlay) {
         _volumeOverlay->toggleVisibility();
+    }
+    if (_inkDetectionOverlay && _inkDetectionOverlay->hasLoadedSelection()) {
+        _inkDetectionOverlay->toggleVisibility();
     }
 }
 
@@ -2812,7 +2475,7 @@ void CWindow::toggleFocusedView()
         }
         _savedDockStates.clear();
         _focusedViewActive = false;
-        statusBar()->showMessage(tr("Restored full view"), 2000);
+        showStatusBarMessage(tr("Restored full view"), 2000);
     } else {
         _savedDockStates.clear();
         const QList<QDockWidget*> docks = findChildren<QDockWidget*>();
@@ -2827,7 +2490,7 @@ void CWindow::toggleFocusedView()
             dock->hide();
         }
         _focusedViewActive = true;
-        statusBar()->showMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
+        showStatusBarMessage(tr("Focused view (Shift+Ctrl+F to restore)"), 2000);
     }
 }
 
@@ -2857,17 +2520,46 @@ void CWindow::switchToMainWorkspace()
     }
 }
 
-void CWindow::switchToFiberSliceWorkspace()
+void CWindow::openLineAnnotationWorkspace(LineAnnotationDialog* dialog, const QString& title)
 {
-    if (!_workspaceTabs || !_fiberSliceWorkspaceWindow) {
+    if (!_workspaceTabs || !dialog) {
         return;
     }
-    const int index = _workspaceTabs->indexOf(_fiberSliceWorkspaceWindow);
-    if (index >= 0) {
-        _workspaceTabs->setCurrentIndex(index);
-        _fiberSliceWorkspaceWindow->raise();
-        _fiberSliceWorkspaceWindow->setFocus(Qt::ShortcutFocusReason);
+
+    dialog->setWorkspaceEmbedded(true);
+    dialog->enableFibers3D(_state, _lineAnnotationController.get(), _fiberCollection.get());
+
+    int index = _workspaceTabs->indexOf(dialog);
+    if (index < 0) {
+        index = _workspaceTabs->addTab(dialog, title.isEmpty() ? tr("Line Annotation") : title);
+        auto* escapeShortcut = new QShortcut(QKeySequence(Qt::Key_Escape), dialog);
+        escapeShortcut->setContext(Qt::WidgetWithChildrenShortcut);
+        connect(escapeShortcut, &QShortcut::activated, dialog, &QWidget::close);
+        QWidget* tabWidget = dialog;
+        connect(dialog, &QObject::destroyed, this, [this, tabWidget]() {
+            if (_destroyingWindow) {
+                return;
+            }
+            if (!_workspaceTabs) {
+                return;
+            }
+            for (int i = 0; i < _workspaceTabs->count(); ++i) {
+                if (_workspaceTabs->widget(i) == tabWidget) {
+                    const bool wasCurrent = _workspaceTabs->currentIndex() == i;
+                    _workspaceTabs->removeTab(i);
+                    if (wasCurrent) {
+                        switchToMainWorkspace();
+                    }
+                    break;
+                }
+            }
+        });
     }
+
+    _workspaceTabs->setCurrentIndex(index);
+    dialog->show();
+    dialog->raise();
+    dialog->setFocus(Qt::ShortcutFocusReason);
 }
 
 void CWindow::repeatLastLasagnaAction()
@@ -2877,252 +2569,72 @@ void CWindow::repeatLastLasagnaAction()
     }
 }
 
-void CWindow::selectLasagnaOutputSegment(const QString& outputName)
+void CWindow::selectLasagnaOutputSurface(const QString& surfaceUuid)
 {
     switchToMainWorkspace();
-    if (!treeWidgetSurfaces) {
+    if (!treeWidgetSurfaces || surfaceUuid.isEmpty()) {
         return;
     }
-
-    const QString trimmed = outputName.trimmed();
-    if (trimmed.isEmpty()) {
-        return;
-    }
-
-    QStringList candidates;
-    auto addCandidate = [&candidates](const QString& value) {
-        const QString candidate = value.trimmed();
-        if (!candidate.isEmpty() && !candidates.contains(candidate)) {
-            candidates << candidate;
+    for (QTreeWidgetItemIterator it(treeWidgetSurfaces); *it; ++it) {
+        if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString() == surfaceUuid) {
+            treeWidgetSurfaces->setCurrentItem(*it);
+            treeWidgetSurfaces->scrollToItem(*it);
+            ui.dockWidgetVolumes->raise();
+            return;
         }
-    };
+    }
+}
 
-    addCandidate(trimmed);
-    addCandidate(QFileInfo(trimmed).fileName());
-    const QStringList baseCandidates = candidates;
-    for (const QString& candidate : baseCandidates) {
-        if (candidate.endsWith(QStringLiteral(".tifxyz"))) {
-            addCandidate(candidate.left(candidate.size() - 7));
+void CWindow::loadLasagnaResults(Surface* surface)
+{
+    std::optional<nlohmann::json> corr;
+    if (surface && _surfaceCatalog && _surfaceCatalog->attachment()) {
+        try {
+            auto& session = *_surfaceCatalog->session();
+            corr = vc::objects::attachedDocument(session, *_surfaceCatalog->attachment(), surface->id,
+                                                 LasagnaServiceManager::kCorrResultsRole);
+        } catch (const std::exception& error) {
+            qWarning() << "Cannot read Lasagna results for" << QString::fromStdString(surface->id) << error.what();
+        }
+    }
+    if (_point_collection_widget) {
+        if (corr) {
+            _point_collection_widget->loadCorrPointsResults(*corr);
         } else {
-            addCandidate(candidate + QStringLiteral(".tifxyz"));
+            _point_collection_widget->clearCorrPointsResults();
         }
-    }
-
-    auto selectCandidate = [this, &candidates]() -> bool {
-        QTreeWidgetItemIterator it(treeWidgetSurfaces);
-        while (*it) {
-            const QString id = (*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString();
-            if (candidates.contains(id)) {
-                treeWidgetSurfaces->setCurrentItem(*it);
-                treeWidgetSurfaces->scrollToItem(*it);
-                ui.dockWidgetVolumes->raise();
-                return true;
-            }
-            ++it;
-        }
-        return false;
-    };
-
-    if (selectCandidate()) {
-        return;
-    }
-
-    if (_surfacePanel) {
-        _surfacePanel->reloadSurfacesFromDisk();
-        selectCandidate();
     }
 }
 
 bool CWindow::centerFocusAt(const cv::Vec3f& position, const cv::Vec3f& normal, const std::string& sourceId)
 {
-    if (!_state) {
-        return false;
-    }
-
-    POI* focus = _state->poi("focus");
-    if (!focus) {
-        focus = new POI;
-    }
-
-    focus->p = position;
-    if (cv::norm(normal) > 0.0) {
-        focus->n = normal;
-    }
-    if (!sourceId.empty()) {
-        focus->surfaceId = sourceId;
-    } else if (focus->surfaceId.empty()) {
-        focus->surfaceId = "segmentation";
-    }
-    focus->surfacePtr.reset();
-
-    focus->suppressTransientPlaneIntersections = true;
-    _state->setPOI("focus", focus);
-    recenterSegmentationViewerNear(position);
-
-    // Get surface for orientation - look up by ID
-    Surface* orientationSource = _state->surfaceRaw(focus->surfaceId);
-    if (!orientationSource) {
-        orientationSource = _state->surfaceRaw("segmentation");
-    }
-    _axisAlignedSliceController->applyOrientation(orientationSource);
-
-    return true;
+    return _viewerManager && _viewerManager->centerFocusAt(position, normal, sourceId);
 }
 
 void CWindow::recenterPlaneViewersOn(const cv::Vec3f& position)
 {
-    if (!_viewerManager) {
-        return;
+    if (_viewerManager) {
+        _viewerManager->recenterPlaneViewersOn(position);
     }
-
-    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
-        if (!viewer || isAnnotationViewer(viewer)) {
-            return;
-        }
-
-        const std::string name = viewer->surfName();
-        if (name == "xy plane" || name == "seg xz" || name == "seg yz") {
-            centerViewerOnVolumePointForNavigation(viewer, position);
-        }
-    });
 }
 
 void CWindow::recenterSegmentationViewerNear(const cv::Vec3f& position)
 {
-    static constexpr float kMaxDistanceVoxels = 100.0f;
-
-    if (!_viewerManager) {
-        return;
-    }
-
-    auto* viewer = segmentationViewer();
-    if (!viewer) {
-        return;
-    }
-
-    auto activeSurface = _segmentationModule ? _segmentationModule->activeBaseSurfaceShared() : nullptr;
-    if (!activeSurface) {
-        activeSurface = std::dynamic_pointer_cast<QuadSurface>(_state ? _state->surface("segmentation") : nullptr);
-    }
-    if (!activeSurface) {
-        return;
-    }
-
-    auto* patchIndex = _viewerManager->surfacePatchIndex();
-    if (!patchIndex || !patchIndex->containsSurface(activeSurface)) {
-        return;
-    }
-
-    SurfacePatchIndex::PointQuery query;
-    query.worldPoint = position;
-    query.tolerance = kMaxDistanceVoxels;
-    query.surfaces.only = activeSurface;
-    auto hit = patchIndex->locate(query);
-    if (hit && hit->distance <= kMaxDistanceVoxels) {
-        const cv::Vec3f loc = activeSurface->loc(hit->ptr);
-        centerViewerOnSurfacePointForNavigation(viewer, {loc[0], loc[1]});
+    if (_viewerManager) {
+        _viewerManager->recenterSegmentationViewerNear(position);
     }
 }
 
 bool CWindow::recenterViewersOnCurrentFocus()
 {
-    if (!_state || !_viewerManager) {
-        return false;
-    }
-
-    POI* focus = _state->poi("focus");
-    if (!focus) {
-        return false;
-    }
-
-    const cv::Vec3f position = focus->p;
-    _viewerManager->forEachBaseViewer([&position](VolumeViewerBase* viewer) {
-        if (viewer && !isAnnotationViewer(viewer)) {
-            centerViewerOnVolumePointForNavigation(viewer, position);
-        }
-    });
-
-    return true;
+    auto* manager = activeWorkspaceViewerManager();
+    return manager && manager->recenterViewersOnCurrentFocus();
 }
 
 bool CWindow::centerFocusOnCursor()
 {
-    if (!_state || !mdiArea) {
-        return false;
-    }
-
-    const QPoint globalPos = QCursor::pos();
-    auto tryCenterFromViewer = [&](VolumeViewerBase* viewer) -> bool {
-        if (!viewer) {
-            return false;
-        }
-
-        auto* viewerObject = viewer->asQObject();
-        auto* viewerWidget = qobject_cast<QWidget*>(viewerObject);
-        if (viewerWidget && !viewerWidget->isVisible()) {
-            return false;
-        }
-
-        auto* gv = viewer->graphicsView();
-        auto* viewport = gv ? gv->viewport() : nullptr;
-        if (!viewport) {
-            return false;
-        }
-
-        const QPoint viewportPos = viewport->mapFromGlobal(globalPos);
-        if (!viewport->rect().contains(viewportPos)) {
-            return false;
-        }
-
-        const QPointF scenePos = gv->mapToScene(viewportPos);
-        cv::Vec3f p = viewer->sceneToVolume(scenePos);
-        cv::Vec3f n(0, 0, 1);
-        if (auto* plane = dynamic_cast<PlaneSurface*>(viewer->currentSurface())) {
-            n = plane->normal(cv::Vec3f(0, 0, 0), {});
-        }
-
-        return centerFocusAt(p, n, viewer->surfName());
-    };
-
-    // Prefer the viewer actually under the mouse cursor. With tiled MDI
-    // windows, the active subwindow can lag behind the hovered viewer, which
-    // makes the focus jump use the wrong scene transform.
-    if (QWidget* hoveredWidget = QApplication::widgetAt(globalPos)) {
-        for (QWidget* widget = hoveredWidget; widget; widget = widget->parentWidget()) {
-            if (auto* viewer = baseViewerFromWidget(widget)) {
-                if (tryCenterFromViewer(viewer)) {
-                    return true;
-                }
-                break;
-            }
-        }
-    }
-
-    if (_viewerManager) {
-        for (auto* viewer : _viewerManager->baseViewers()) {
-            if (tryCenterFromViewer(viewer)) {
-                return true;
-            }
-        }
-    }
-
-    // Fall back to the active viewer if the cursor isn't currently over any
-    // tiled viewport.
-    if (auto* subWindow = mdiArea->activeSubWindow()) {
-        if (auto* viewer = baseViewerFromWidget(subWindow->widget())) {
-            if (tryCenterFromViewer(viewer)) {
-                return true;
-            }
-        }
-    }
-
-    // Fallback to stored cursor POI if no active viewer or cursor is outside
-    POI* cursor = _state->poi("cursor");
-    if (!cursor) {
-        return false;
-    }
-
-    return centerFocusAt(cursor->p, cursor->n, cursor->surfaceId);
+    auto* manager = activeWorkspaceViewerManager();
+    return manager && manager->centerFocusOnCursor();
 }
 
 void CWindow::setSegmentationCursorMirroring(bool enabled)
@@ -3140,2221 +2652,9 @@ void CWindow::setSegmentationCursorMirroring(bool enabled)
     }
 
     if (statusBar()) {
-        statusBar()->showMessage(enabled ? tr("Mirroring cursor to Surface view enabled")
-                                         : tr("Mirroring cursor to Surface view disabled"),
+        showStatusBarMessage(enabled ? tr("Syncing cursor across views enabled")
+                                         : tr("Syncing cursor across views disabled"),
                                   2000);
-    }
-}
-
-void CWindow::createAtlasWorkspace()
-{
-    if (!_atlasWorkspaceWindow || !_segmentWorkspaceWindow) {
-        return;
-    }
-
-    if (!_atlasWorkspaceWindow->centralWidget()) {
-        auto* central = new QWidget(_atlasWorkspaceWindow);
-        auto* layout = new QVBoxLayout(central);
-        layout->setContentsMargins(0, 0, 0, 0);
-        layout->setSpacing(0);
-        _atlasWorkspaceWindow->setCentralWidget(central);
-    }
-
-    if (!_atlasViewer && _viewerManager) {
-        auto* central = _atlasWorkspaceWindow->centralWidget();
-        _atlasViewer = _viewerManager->createViewerInWidget(ATLAS_INTERNAL_SURFACE_NAME,
-                                                            central,
-                                                            ViewerManager::ViewerRole::Annotation);
-        if (auto* layout = central ? dynamic_cast<QVBoxLayout*>(central->layout()) : nullptr) {
-            if (auto* viewerWidget = _atlasViewer ? qobject_cast<QWidget*>(_atlasViewer->asQObject()) : nullptr) {
-                layout->addWidget(viewerWidget);
-            }
-        }
-        if (!_atlasOverlay) {
-            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
-        }
-        _atlasOverlay->attachViewer(_atlasViewer);
-    }
-
-    _atlasWorkspaceOverviewDock = createAtlasOverviewDock(this);
-    _atlasWorkspaceOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverviewAtlas"));
-    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceOverviewDock);
-
-    _atlasWorkspaceFiberDock = createAtlasFiberDock(this);
-    _atlasWorkspaceFiberDock->setObjectName(QStringLiteral("dockWidgetAtlasFibersAtlas"));
-    _atlasWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasWorkspaceFiberDock);
-    if (auto* optimize = _atlasWorkspaceFiberDock->widget()
-            ? _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
-                  QStringLiteral("atlasOptimizeSnapCandidatesButton"))
-            : nullptr) {
-        connect(optimize, &QPushButton::clicked,
-                this, &CWindow::optimizeAtlasSnapCandidates);
-    }
-    _atlasWorkspaceWindow->tabifyDockWidget(_atlasWorkspaceOverviewDock, _atlasWorkspaceFiberDock);
-    _atlasWorkspaceFiberDock->raise();
-
-    _atlasWorkspaceSearchDock = createAtlasSearchDock(this);
-    _atlasWorkspaceSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearchAtlas"));
-    _atlasWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasWorkspaceSearchDock);
-
-    _atlasOverviewDock = createAtlasOverviewDock(this);
-    _atlasOverviewDock->setObjectName(QStringLiteral("dockWidgetAtlasOverview"));
-    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _atlasOverviewDock);
-
-    _atlasSearchDock = createAtlasSearchDock(this);
-    _atlasSearchDock->setObjectName(QStringLiteral("dockWidgetAtlasSearch"));
-    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasSearchDock);
-
-    _atlasOverviewDock->hide();
-    _atlasSearchDock->hide();
-
-    auto connectOverview = [this](QDockWidget* dock) {
-        if (!dock || !dock->widget()) {
-            return;
-        }
-        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasOverviewTree"));
-        if (!tree) {
-            return;
-        }
-        if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(
-                QStringLiteral("atlasRankSnapButton"))) {
-            connect(rankSnap, &QPushButton::clicked, this, &CWindow::optimizeAtlasSnapCandidates);
-        }
-        if (auto* remap = dock->widget()->findChild<QPushButton*>(
-                QStringLiteral("atlasRemapButton"))) {
-            connect(remap, &QPushButton::clicked, this, &CWindow::remapCurrentAtlas);
-        }
-        connect(tree, &QTreeWidget::itemActivated, this, [this](QTreeWidgetItem* item, int) {
-            while (item && item->data(0, Qt::UserRole).toString().isEmpty()) {
-                item = item->parent();
-            }
-            if (!item) {
-                return;
-            }
-            const QString path = item->data(0, Qt::UserRole).toString();
-            if (!path.isEmpty()) {
-                displayAtlasFromDirectory(std::filesystem::path(path.toStdString()));
-            }
-        });
-    };
-    connectOverview(_atlasOverviewDock);
-    connectOverview(_atlasWorkspaceOverviewDock);
-
-    if (_atlasWorkspaceFiberDock && _atlasWorkspaceFiberDock->widget()) {
-        if (auto* tree = _atlasWorkspaceFiberDock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasFiberTree"))) {
-            auto itemFiberId = [](QTreeWidgetItem* item) -> uint64_t {
-                while (item) {
-                    bool ok = false;
-                    const qulonglong fiberId = item->data(0, ATLAS_FIBER_ID_ROLE).toULongLong(&ok);
-                    if (ok && fiberId != 0) {
-                        return static_cast<uint64_t>(fiberId);
-                    }
-                    item = item->parent();
-                }
-                return 0;
-            };
-            auto focusAtlasControlItem = [this](QTreeWidgetItem* item) {
-                if (!item || !_atlasOverlay) {
-                    return;
-                }
-                const QString pathKey = item->data(0, ATLAS_FIBER_PATH_KEY_ROLE).toString();
-                const int sourceIndex = item->data(0, ATLAS_CONTROL_SOURCE_INDEX_ROLE).toInt();
-                if (!pathKey.isEmpty() && sourceIndex >= 0) {
-                    _atlasOverlay->setSelectedControlPoint(
-                        std::make_pair(pathKey.toStdString(), sourceIndex));
-                }
-                bool okX = false;
-                bool okY = false;
-                const float x = item->data(0, ATLAS_SURFACE_X_ROLE).toFloat(&okX);
-                const float y = item->data(0, ATLAS_SURFACE_Y_ROLE).toFloat(&okY);
-                if (okX && okY && std::isfinite(x) && std::isfinite(y)) {
-                    centerViewerOnSurfacePointForNavigation(_atlasViewer, cv::Vec2f{x, y});
-                }
-            };
-            auto openFromItem = [this, tree, itemFiberId, focusAtlasControlItem](QTreeWidgetItem* item) {
-                if (!item ||
-                    tree->property("vc_atlas_opening_fiber").toBool()) {
-                    return;
-                }
-                bool hasControlIndex = false;
-                const int controlIndex = item->data(0, ATLAS_CONTROL_INDEX_ROLE).toInt(&hasControlIndex);
-                if (hasControlIndex && controlIndex >= 0) {
-                    focusAtlasControlItem(item);
-                    return;
-                }
-                if (!_lineAnnotationController) {
-                    return;
-                }
-                const uint64_t fiberId = itemFiberId(item);
-                if (fiberId == 0) {
-                    return;
-                }
-                tree->setProperty("vc_atlas_opening_fiber", true);
-                QTimer::singleShot(0, tree, [tree]() {
-                    tree->setProperty("vc_atlas_opening_fiber", false);
-                });
-                if (_fiberWidget) {
-                    _fiberWidget->selectFiber(fiberId);
-                }
-                if (_fiberSliceWidget) {
-                    _fiberSliceWidget->selectFiber(fiberId);
-                }
-                _lineAnnotationController->openFiber(fiberId);
-            };
-            connect(tree,
-                    &QTreeWidget::itemSelectionChanged,
-                    this,
-                    [this, tree]() {
-                        if (_atlasOverlay) {
-                            _atlasOverlay->setSelectedFiberPaths(atlasSelectedFiberPathKeys(tree));
-                        }
-                    });
-            connect(tree,
-                    &QTreeWidget::itemDoubleClicked,
-                    this,
-                    [openFromItem](QTreeWidgetItem* item, int) {
-                        openFromItem(item);
-                    });
-            connect(tree,
-                    &QTreeWidget::customContextMenuRequested,
-                    this,
-                    [this, tree, itemFiberId, focusAtlasControlItem](const QPoint& pos) {
-                        QTreeWidgetItem* item = tree->itemAt(pos);
-                        if (!item) {
-                            return;
-                        }
-                        if (!tree->selectionModel()->isSelected(tree->indexFromItem(item))) {
-                            tree->setCurrentItem(item);
-                        }
-                        bool hasControlIndex = false;
-                        const int controlIndex = item->data(0, ATLAS_CONTROL_INDEX_ROLE).toInt(&hasControlIndex);
-                        if (!hasControlIndex || controlIndex < 0) {
-                            return;
-                        }
-                        bool hasSourceIndex = false;
-                        const int sourceIndex = item->data(0, ATLAS_CONTROL_SOURCE_INDEX_ROLE).toInt(&hasSourceIndex);
-                        const uint64_t fiberId = itemFiberId(item);
-                        QMenu menu(tree);
-                        auto* showAction = menu.addAction(tr("Show in line annotation"));
-                        showAction->setEnabled(fiberId != 0 && _lineAnnotationController != nullptr);
-                        QAction* selected = menu.exec(tree->viewport()->mapToGlobal(pos));
-                        if (selected == showAction && fiberId != 0 && _lineAnnotationController) {
-                            focusAtlasControlItem(item);
-                            if (_fiberWidget) {
-                                _fiberWidget->selectFiber(fiberId);
-                            }
-                            if (_fiberSliceWidget) {
-                                _fiberSliceWidget->selectFiber(fiberId);
-                            }
-                            if (hasSourceIndex && sourceIndex >= 0) {
-                                _lineAnnotationController->openFiberAtLinePointIndex(fiberId, sourceIndex);
-                            } else {
-                                _lineAnnotationController->openFiberAtControlPoint(fiberId, controlIndex);
-                            }
-                        }
-                    });
-        }
-    }
-
-    auto connectSearchDock = [this](QDockWidget* dock) {
-        if (!dock || !dock->widget()) {
-            return;
-        }
-        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
-            connect(run, &QPushButton::clicked, this, &CWindow::startAtlasFiberIntersectionSearch);
-        }
-        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
-            connect(cancel, &QPushButton::clicked, this, &CWindow::cancelAtlasFiberIntersectionSearch);
-        }
-        if (auto* combo = dock->widget()->findChild<QComboBox*>(QStringLiteral("atlasSearchTypeCombo"))) {
-            connect(combo,
-                    QOverload<int>::of(&QComboBox::currentIndexChanged),
-                    this,
-                    [this]() { updateAtlasSearchDocks(); });
-        }
-        if (auto* maxDistance =
-                dock->widget()->findChild<QDoubleSpinBox*>(QStringLiteral("atlasSearchMaxDistanceSpin"))) {
-            connect(maxDistance,
-                    QOverload<double>::of(&QDoubleSpinBox::valueChanged),
-                    this,
-                    [this, dock](double value) {
-                        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-                        settings.setValue(vc3d::settings::atlas::SEARCH_MAX_DISTANCE, value);
-                        for (auto* otherDock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-                            if (!otherDock || otherDock == dock || !otherDock->widget()) {
-                                continue;
-                            }
-                            if (auto* otherSpin = otherDock->widget()->findChild<QDoubleSpinBox*>(
-                                    QStringLiteral("atlasSearchMaxDistanceSpin"))) {
-                                const QSignalBlocker blocker(otherSpin);
-                                otherSpin->setValue(value);
-                            }
-                        }
-                    });
-        }
-        if (auto* groupByFiber =
-                dock->widget()->findChild<QCheckBox*>(QStringLiteral("atlasSearchGroupByFiberCheck"))) {
-            connect(groupByFiber,
-                    &QCheckBox::toggled,
-                    this,
-                    [this, dock](bool checked) {
-                        for (auto* otherDock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-                            if (!otherDock || otherDock == dock || !otherDock->widget()) {
-                                continue;
-                            }
-                            if (auto* otherCheck = otherDock->widget()->findChild<QCheckBox*>(
-                                    QStringLiteral("atlasSearchGroupByFiberCheck"))) {
-                                const QSignalBlocker blocker(otherCheck);
-                                otherCheck->setChecked(checked);
-                            }
-                        }
-                        if (!_atlasSearchCancelFlag && !_atlasSearchResults.empty()) {
-                            populateAtlasSearchResults(_atlasSearchResults);
-                        }
-                    });
-        }
-        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-            auto openFromItem = [this, tree](QTreeWidgetItem* item) {
-                if (!item || tree->property("vc_atlas_opening_result").toBool()) {
-                    return;
-                }
-                const auto resultIndex = atlasSearchResultIndexForItem(item);
-                if (!resultIndex) {
-                    return;
-                }
-                tree->setProperty("vc_atlas_opening_result", true);
-                QTimer::singleShot(0, tree, [tree]() {
-                    tree->setProperty("vc_atlas_opening_result", false);
-                });
-                openAtlasSearchResult(*resultIndex);
-            };
-            connect(tree,
-                    &QTreeWidget::itemDoubleClicked,
-                    this,
-                    openFromItem);
-            connect(tree,
-                    &QTreeWidget::itemEntered,
-                    this,
-                    [this](QTreeWidgetItem* item, int /*column*/) {
-                        setAtlasSearchHoverResult(atlasSearchResultIndexForItem(item));
-                    });
-            if (auto* viewport = tree->viewport()) {
-                viewport->setMouseTracking(true);
-                viewport->installEventFilter(new FunctionEventFilter(
-                    [this](QObject*, QEvent* event) {
-                        if (event && event->type() == QEvent::Leave) {
-                            setAtlasSearchHoverResult(std::nullopt);
-                        }
-                        return false;
-                    },
-                    viewport));
-            }
-            connect(tree,
-                    &QTreeWidget::itemSelectionChanged,
-                    this,
-                    [this, tree]() {
-                        if (tree->property("vc_atlas_syncing_selection").toBool()) {
-                            return;
-                        }
-                        updateAtlasSearchSelectionFromTree(tree);
-                    });
-            connect(tree,
-                    &QWidget::customContextMenuRequested,
-                    this,
-                    [this, tree](const QPoint& pos) {
-                        if (!_lineAnnotationController) {
-                            return;
-                        }
-                        QTreeWidgetItem* item = tree->itemAt(pos);
-                        const auto runtimeFiberId = atlasSearchFiberIdForItem(item);
-                        if (!runtimeFiberId) {
-                            return;
-                        }
-                        const auto snapshotIt =
-                            _atlasSearchFiberSnapshotsByRuntimeId.find(*runtimeFiberId);
-                        if (snapshotIt == _atlasSearchFiberSnapshotsByRuntimeId.end() ||
-                            snapshotIt->second.storedFiberId == 0) {
-                            return;
-                        }
-
-                        QMenu menu(tree);
-                        QAction* createAtlas = menu.addAction(tr("Create atlas from fiber"));
-                        QAction* chosen = menu.exec(tree->viewport()->mapToGlobal(pos));
-                        if (chosen == createAtlas) {
-                            _lineAnnotationController->createAtlasFromFiber(
-                                snapshotIt->second.storedFiberId);
-                        }
-                    });
-        }
-    };
-    connectSearchDock(_atlasSearchDock);
-    connectSearchDock(_atlasWorkspaceSearchDock);
-    refreshAtlasOverviewDocks();
-    updateAtlasFiberDocks();
-    updateAtlasSearchDocks();
-}
-
-void CWindow::refreshAtlasOverviewDocks()
-{
-    auto vpkg = _state ? _state->vpkg() : nullptr;
-    const std::filesystem::path volpkgRoot = vpkg && !vpkg->path().empty()
-        ? vpkg->path().parent_path()
-        : std::filesystem::path{};
-
-    auto populate = [this, &volpkgRoot](QDockWidget* dock) {
-        if (!dock || !dock->widget()) {
-            return;
-        }
-        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasOverviewTree"));
-        if (!tree) {
-            return;
-        }
-        tree->clear();
-        for (const auto& atlasInfo : vc::atlas::discoverAtlasDirectories(volpkgRoot)) {
-            const std::filesystem::path& atlasDir = atlasInfo.path;
-            try {
-                const auto atlas = vc::atlas::Atlas::load(atlasDir);
-                auto* item = new QTreeWidgetItem(tree);
-                item->setText(0, QString::fromStdString(atlas.metadata.name));
-                item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
-
-                auto* fiberCount = new QTreeWidgetItem(item);
-                fiberCount->setText(0, tr("Fiber count"));
-                fiberCount->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
-
-                auto* fibersRoot = new QTreeWidgetItem(item);
-                fibersRoot->setText(0, tr("Fibers"));
-                fibersRoot->setText(1, QString::number(static_cast<int>(atlas.fibers.size())));
-                for (const auto& mapping : atlas.fibers) {
-                    auto* fiberItem = new QTreeWidgetItem(fibersRoot);
-                    fiberItem->setText(0, QString::fromStdString(mapping.fiberPath.generic_string()));
-                    fiberItem->setText(
-                        1,
-                        tr("%1 line anchors, %2 control anchors")
-                            .arg(static_cast<int>(mapping.lineAnchors.size()))
-                            .arg(static_cast<int>(mapping.controlAnchors.size())));
-                }
-
-                auto* coveredSize = new QTreeWidgetItem(item);
-                coveredSize->setText(0, tr("Object covered atlas size"));
-                const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-                const QuadSurface baseSurface(basePath);
-                const auto* basePoints = baseSurface.rawPointsPtr();
-                if (!basePoints || basePoints->empty() || basePoints->cols <= 0) {
-                    throw std::runtime_error("atlas base mesh has no valid grid");
-                }
-                coveredSize->setText(1, formatAtlasCoveredSize(
-                    vc::atlas::mappedObjectCoveredAtlasSize(
-                        atlas,
-                        baseSurface.scale(),
-                        vc::atlas::atlasHorizontalPeriodColumns(baseSurface))));
-            } catch (const std::exception& ex) {
-                auto* item = new QTreeWidgetItem(tree);
-                item->setText(0, QString::fromStdString(
-                    atlasInfo.name.empty() ? atlasDir.filename().string() : atlasInfo.name));
-                item->setText(1, QString::fromStdString(ex.what()));
-                item->setData(0, Qt::UserRole, QString::fromStdString(atlasDir.string()));
-            }
-        }
-        tree->expandAll();
-    };
-
-    populate(_atlasOverviewDock);
-    populate(_atlasWorkspaceOverviewDock);
-}
-
-void CWindow::updateAtlasFiberDocks()
-{
-    if (!_atlasWorkspaceFiberDock || !_atlasWorkspaceFiberDock->widget()) {
-        return;
-    }
-
-    auto* label = _atlasWorkspaceFiberDock->widget()->findChild<QLabel*>(QStringLiteral("atlasFiberCurrentLabel"));
-    auto* tree = _atlasWorkspaceFiberDock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasFiberTree"));
-    auto* optimize = _atlasWorkspaceFiberDock->widget()->findChild<QPushButton*>(
-        QStringLiteral("atlasOptimizeSnapCandidatesButton"));
-    auto updateOptimizeEnabled = [&]() {
-        bool hasManifest = false;
-        if (_state && _state->vpkg()) {
-            const auto manifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
-            hasManifest = !manifestPath.empty() && std::filesystem::exists(manifestPath);
-        }
-        if (optimize) {
-            optimize->setEnabled(_currentAtlasDir.has_value() &&
-                                 hasManifest &&
-                                 LasagnaServiceManager::instance().isRunning());
-        }
-    };
-    if (!tree) {
-        updateOptimizeEnabled();
-        return;
-    }
-
-    const QSignalBlocker treeBlocker(tree);
-    tree->setSortingEnabled(false);
-    tree->clear();
-
-    if (!_currentAtlasDir) {
-        if (label) {
-            label->setText(tr("No atlas selected"));
-        }
-        updateOptimizeEnabled();
-        return;
-    }
-
-    vc::atlas::Atlas atlas;
-    try {
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        std::filesystem::path volpkgRoot;
-        if (vpkg) {
-            volpkgRoot = vpkg->path().empty()
-                ? std::filesystem::path(vpkg->getVolpkgDirectory())
-                : vpkg->path().parent_path();
-        }
-        atlas = volpkgRoot.empty()
-            ? vc::atlas::Atlas::load(*_currentAtlasDir)
-            : vc::atlas::Atlas::load(*_currentAtlasDir, volpkgRoot);
-    } catch (const std::exception& ex) {
-        if (label) {
-            label->setText(tr("Atlas: %1 (could not load: %2)")
-                .arg(QString::fromStdString(_currentAtlasName.empty()
-                         ? _currentAtlasDir->filename().string()
-                         : _currentAtlasName),
-                     QString::fromStdString(ex.what())));
-        }
-        updateOptimizeEnabled();
-        return;
-    }
-
-    if (label) {
-        label->setText(tr("Atlas: %1 (%2 mapped fibers)")
-            .arg(QString::fromStdString(atlas.metadata.name.empty()
-                     ? _currentAtlasDir->filename().string()
-                     : atlas.metadata.name))
-            .arg(static_cast<int>(atlas.fibers.size())));
-    }
-
-    for (const auto& mapping : atlas.fibers) {
-        const std::optional<uint64_t> matchedFiberId = _lineAnnotationController
-            ? _lineAnnotationController->fiberIdForAtlasPath(mapping.fiberPath)
-            : std::nullopt;
-        const uint64_t fiberId = matchedFiberId.value_or(0);
-        const QString fiberPathKey = QString::fromStdString(
-            vc::atlas::atlasFiberPathKey(mapping.fiberPath));
-
-        int snapTotal = 0;
-        int snapFound = 0;
-        vc::atlas::AtlasPredSnapSet predSnapSet;
-        std::unordered_map<std::string, const vc::atlas::AtlasPredSnapPoint*> snapsByControl;
-        try {
-            predSnapSet = vc::atlas::loadAtlasPredSnapSet(
-                vc::atlas::atlasPredSnapAttachmentPath(*_currentAtlasDir, mapping.fiberPath));
-            snapTotal = static_cast<int>(predSnapSet.points.size());
-            snapFound = static_cast<int>(std::count_if(predSnapSet.points.begin(),
-                                                       predSnapSet.points.end(),
-                                                       [](const vc::atlas::AtlasPredSnapPoint& point) {
-                                                           return isResolvedAtlasPredSnap(point);
-                                                       }));
-            for (const auto& point : predSnapSet.points) {
-                snapsByControl[vc::atlas::atlasPredSnapControlPointKey(point.controlPoint)] = &point;
-            }
-        } catch (const std::exception&) {
-            snapTotal = -1;
-            snapFound = -1;
-        }
-
-        const std::filesystem::path fiberNamePath = mapping.fiberPath.filename();
-        const std::string fiberLabel = fiberNamePath.empty()
-            ? mapping.fiberPath.generic_string()
-            : fiberNamePath.string();
-        auto* fiberItem = new QTreeWidgetItem(tree);
-        fiberItem->setText(0, QString::fromStdString(fiberLabel));
-        fiberItem->setText(1, tr("%1 controls").arg(static_cast<int>(mapping.controlAnchors.size())));
-        fiberItem->setText(3, snapTotal < 0 ? tr("missing") : tr("%1/%2").arg(snapFound).arg(snapTotal));
-        fiberItem->setText(6, snapTotal < 0 ? tr("missing") : tr("%1 records").arg(snapTotal));
-        fiberItem->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
-        fiberItem->setToolTip(0, QString::fromStdString(mapping.fiberPath.generic_string()));
-        fiberItem->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
-        fiberItem->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
-        fiberItem->setData(0, ATLAS_CONTROL_INDEX_ROLE, -1);
-        fiberItem->setData(0, ATLAS_CONTROL_SOURCE_INDEX_ROLE, -1);
-
-        for (int controlIndex = 0;
-             controlIndex < static_cast<int>(mapping.controlAnchors.size());
-             ++controlIndex) {
-            const auto& anchor = mapping.controlAnchors[static_cast<size_t>(controlIndex)];
-            const auto surfaceCoord = _atlasOverlay
-                ? _atlasOverlay->atlasAnchorToSurface(anchor, mapping)
-                : std::optional<cv::Vec2f>{};
-            const vc::atlas::AtlasPredSnapPoint* snap =
-                predSnapPointForAnchor(snapsByControl, anchor);
-            const bool snapResolved = snap && isResolvedAtlasPredSnap(*snap);
-
-            auto* row = new QTreeWidgetItem(fiberItem);
-            row->setText(0, tr("CP %1").arg(controlIndex));
-            row->setText(1, QString::number(anchor.sourceIndex));
-            row->setText(2, QString::number(anchor.distance, 'f', 3));
-            row->setText(3, snapResolved
-                ? predSnapDirectionLabel(snap->direction)
-                : (snap ? tr("none") : tr("-")));
-            row->setText(4, snapResolved ? formatOptionalDouble(predSnapDisplayWinding(*snap), 3)
-                                         : QStringLiteral("-"));
-            row->setText(5, snapResolved
-                ? formatAtlasVec3(*snap->predSnapPoint)
-                : QStringLiteral("-"));
-            row->setText(6, predSnapStatusLabel(snap));
-            row->setText(7, predSnapStatusReason(snap));
-            row->setText(8, fiberId == 0 ? tr("not loaded") : QString::number(fiberId));
-            row->setData(0, ATLAS_FIBER_ID_ROLE, QVariant::fromValue<qulonglong>(fiberId));
-            row->setData(0, ATLAS_FIBER_PATH_KEY_ROLE, fiberPathKey);
-            row->setData(0, ATLAS_CONTROL_INDEX_ROLE, controlIndex);
-            row->setData(0, ATLAS_CONTROL_SOURCE_INDEX_ROLE, anchor.sourceIndex);
-            if (surfaceCoord) {
-                row->setData(0, ATLAS_SURFACE_X_ROLE, (*surfaceCoord)[0]);
-                row->setData(0, ATLAS_SURFACE_Y_ROLE, (*surfaceCoord)[1]);
-            }
-            row->setToolTip(0, tr("Control point: %1").arg(formatAtlasVec3(anchor.world)));
-            row->setToolTip(6, predSnapStatusReason(snap));
-            row->setToolTip(7, predSnapStatusReason(snap));
-            if (snapResolved) {
-                row->setToolTip(5, tr("Snap target: %1").arg(formatAtlasVec3(*snap->predSnapPoint)));
-            }
-        }
-    }
-
-    tree->collapseAll();
-    updateOptimizeEnabled();
-}
-
-void CWindow::updateAtlasSearchDocks()
-{
-    const auto snapshots = _lineAnnotationController
-        ? _lineAnnotationController->fiberSnapshotsFromStorage()
-        : std::vector<vc::atlas::FiberPolyline>{};
-    int savedFiberCount = 0;
-    QString atlasLoadError;
-    if (_currentAtlasDir) {
-        try {
-            const vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
-            savedFiberCount = static_cast<int>(atlas.fibers.size());
-        } catch (const std::exception& ex) {
-            atlasLoadError = QString::fromStdString(ex.what());
-        }
-    }
-    const bool hasSnapshots = !snapshots.empty();
-    const bool atlasUsable = _currentAtlasDir.has_value() && atlasLoadError.isEmpty();
-    const QString atlasName = _currentAtlasDir
-        ? QString::fromStdString(_currentAtlasName.empty()
-              ? _currentAtlasDir->filename().string()
-              : _currentAtlasName)
-        : QString{};
-    const QString atlasText = !_currentAtlasDir
-        ? tr("No atlas selected (non-atlas search available)")
-        : (!atlasLoadError.isEmpty()
-              ? tr("Atlas: %1 (could not load: %2)").arg(atlasName, atlasLoadError)
-              : tr("Atlas: %1 (%2 saved fibers)").arg(atlasName).arg(savedFiberCount));
-
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* label = dock->widget()->findChild<QLabel*>(QStringLiteral("atlasSearchCurrentLabel"))) {
-            label->setText(atlasText);
-        }
-        int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
-        if (auto* combo = dock->widget()->findChild<QComboBox*>(QStringLiteral("atlasSearchTypeCombo"))) {
-            combo->setEnabled(hasSnapshots);
-            searchMode = combo->currentData().toInt();
-        }
-        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
-            run->setEnabled(hasSnapshots &&
-                            (searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY || atlasUsable));
-        }
-        if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
-                QStringLiteral("atlasSearchTagFilterEdit"))) {
-            tagFilter->setEnabled(hasSnapshots);
-        }
-        if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
-                QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
-            excludeTagFilter->setEnabled(hasSnapshots);
-        }
-        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
-            cancel->setEnabled(false);
-        }
-    }
-
-    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* rankSnap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRankSnapButton"))) {
-            rankSnap->setEnabled(atlasUsable);
-        }
-        if (auto* remap = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasRemapButton"))) {
-            remap->setEnabled(atlasUsable);
-        }
-    }
-}
-
-void CWindow::remapCurrentAtlas()
-{
-    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before remapping."));
-        return;
-    }
-    auto vpkg = _state->vpkg();
-    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Select a local Lasagna dataset before remapping."));
-        return;
-    }
-
-    const std::filesystem::path atlasDir = *_currentAtlasDir;
-    const std::filesystem::path volpkgRoot = vpkg->path().empty()
-        ? std::filesystem::path(vpkg->getVolpkgDirectory())
-        : vpkg->path().parent_path();
-
-    if (statusBar()) {
-        statusBar()->showMessage(tr("Remapping atlas fibers..."), 3000);
-    }
-    for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* button = dock->widget()->findChild<QPushButton*>(
-                QStringLiteral("atlasRemapButton"))) {
-            button->setEnabled(false);
-        }
-        if (auto* button = dock->widget()->findChild<QPushButton*>(
-                QStringLiteral("atlasRankSnapButton"))) {
-            button->setEnabled(false);
-        }
-    }
-
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher,
-            &QFutureWatcher<QString>::finished,
-            this,
-            [this, watcher, atlasDir]() {
-        watcher->deleteLater();
-        try {
-            const QString summary = watcher->result();
-            displayAtlasFromDirectory(atlasDir);
-            if (statusBar()) {
-                statusBar()->showMessage(tr("Remapped atlas fibers. %1").arg(summary), 7000);
-            }
-        } catch (const std::exception& ex) {
-            refreshAtlasOverviewDocks();
-            updateAtlasFiberDocks();
-            updateAtlasSearchDocks();
-            QMessageBox::warning(
-                this,
-                tr("Atlas Remap"),
-                tr("Could not remap atlas: %1").arg(QString::fromStdString(ex.what())));
-        }
-    });
-
-    watcher->setFuture(QtConcurrent::run([atlasDir, volpkgRoot, manifestPath]() -> QString {
-        std::cerr << "[atlas-remap] start"
-                  << " atlas=" << atlasDir.string()
-                  << " volpkg_root=" << volpkgRoot.string()
-                  << " manifest=" << manifestPath.string()
-                  << std::endl;
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(manifestPath);
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        const vc::atlas::Atlas rebuilt =
-            vc::atlas::rebuildAtlasFromSourceFibers(atlasDir, volpkgRoot, sampler);
-
-        std::ostringstream summary;
-        summary.imbue(std::locale::classic());
-        summary << "fibers=" << rebuilt.fibers.size();
-        for (const auto& mapping : rebuilt.fibers) {
-            std::cerr << "[atlas-remap] fiber="
-                      << mapping.fiberPath.generic_string()
-                      << " line_anchors=" << mapping.lineAnchors.size()
-                      << " control_anchors=" << mapping.controlAnchors.size()
-                      << std::endl;
-            summary << " "
-                    << mapping.fiberPath.filename().string()
-                    << ":"
-                    << mapping.controlAnchors.size()
-                    << "cp";
-        }
-        std::cerr << "[atlas-remap] finished" << std::endl;
-        return QString::fromStdString(summary.str());
-    }));
-}
-
-void CWindow::optimizeAtlasSnapCandidates()
-{
-    if (!_currentAtlasDir || !_state || !_state->vpkg()) {
-        QMessageBox::warning(this, tr("Atlas"), tr("Load an atlas before ranking snap candidates."));
-        return;
-    }
-    auto vpkg = _state->vpkg();
-    const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-    if (manifestPath.empty() || !std::filesystem::exists(manifestPath)) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Select a local Lasagna dataset before ranking snap candidates."));
-        return;
-    }
-
-    auto& manager = LasagnaServiceManager::instance();
-    if (manager.isExternal()) {
-        if (!manager.isRunning()) {
-            QMessageBox::warning(this,
-                                 tr("Atlas"),
-                                 tr("Connect the external Lasagna service before ranking snap candidates."));
-            return;
-        }
-    } else if (!manager.ensureServiceRunning()) {
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Failed to start Lasagna service: %1").arg(manager.lastError()));
-        return;
-    }
-
-    const std::filesystem::path atlasDir = *_currentAtlasDir;
-    const std::filesystem::path volpkgRoot = vpkg->path().empty()
-        ? std::filesystem::path(vpkg->getVolpkgDirectory())
-        : vpkg->path().parent_path();
-    const std::string serviceManifestPath = manager.isExternal()
-        ? manifestPath.filename().generic_string()
-        : manifestPath.string();
-    if (statusBar()) {
-        statusBar()->showMessage(tr("Preparing atlas snap candidates..."), 3000);
-    }
-    auto setRankButtonsEnabled = [this](bool enabled) {
-        for (auto* dock : {_atlasOverviewDock, _atlasWorkspaceOverviewDock}) {
-            if (!dock || !dock->widget()) {
-                continue;
-            }
-            if (auto* button = dock->widget()->findChild<QPushButton*>(
-                    QStringLiteral("atlasRankSnapButton"))) {
-                button->setEnabled(enabled);
-            }
-        }
-    };
-    setRankButtonsEnabled(false);
-
-    QPointer<CWindow> self(this);
-    auto startFinish =
-        [this, self, atlasDir, setRankButtonsEnabled](
-            vc::atlas::AtlasSnapPreparedCandidates prepared,
-            nlohmann::json rankResponse) {
-        if (!self) {
-            return;
-        }
-        if (statusBar()) {
-            statusBar()->showMessage(tr("Applying atlas snap candidate ranking..."), 3000);
-        }
-        auto* finishWatcher = new QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>(this);
-        connect(finishWatcher,
-                &QFutureWatcher<vc::atlas::AtlasSnapOptimizeReport>::finished,
-                this,
-                [this, finishWatcher, atlasDir, setRankButtonsEnabled]() {
-            finishWatcher->deleteLater();
-            setRankButtonsEnabled(true);
-            try {
-                const vc::atlas::AtlasSnapOptimizeReport report = finishWatcher->result();
-                refreshAtlasOverviewDocks();
-                displayAtlasFromDirectory(atlasDir);
-                if (statusBar()) {
-                    statusBar()->showMessage(
-                        tr("Ranked snap candidates: %1 controls, terms %2 ok / %3 zero / %4 skipped (%5 total), %6 queued, %7 cached.")
-                            .arg(report.controls)
-                            .arg(report.successfulPairTerms)
-                            .arg(report.zeroContributionTerms)
-                            .arg(report.skippedPairTerms)
-                            .arg(report.pairTerms)
-                            .arg(report.rankJobsRequested)
-                            .arg(report.cacheHits),
-                        6000);
-                }
-                std::cerr << "[atlas-snap] rank finished"
-                          << " controls=" << report.controls
-                          << " variables=" << report.variableControls
-                          << " fixed=" << report.fixedControls
-                          << " manual=" << report.manualControls
-                          << " singleton_auto=" << report.singletonControls
-                          << " links=" << report.links
-                          << " pair_terms=" << report.pairTerms
-                          << " successful_terms=" << report.successfulPairTerms
-                          << " zero_contribution_terms=" << report.zeroContributionTerms
-                          << " skipped_terms=" << report.skippedPairTerms
-                          << " queued=" << report.rankJobsRequested
-                          << " cached=" << report.cacheHits
-                          << " objective=" << report.objective
-                          << std::endl;
-            } catch (const std::exception& ex) {
-                refreshAtlasOverviewDocks();
-                updateAtlasSearchDocks();
-                const QString message = extractFutureExceptionMessage(ex);
-                std::cerr << "[atlas-snap] finish failed: "
-                          << message.toStdString() << std::endl;
-                QMessageBox::warning(
-                    this,
-                    tr("Atlas Snap Candidates"),
-                    tr("Could not rank snap candidates: %1").arg(message));
-            }
-        });
-        finishWatcher->setFuture(QtConcurrent::run(
-            [prepared = std::move(prepared), rankResponse = std::move(rankResponse)]() mutable {
-                return vc::atlas::finishAtlasPredSnapCandidates(prepared, rankResponse);
-            }));
-    };
-
-    auto* prepareWatcher =
-        new QFutureWatcher<vc::atlas::AtlasSnapPreparedCandidates>(this);
-    connect(prepareWatcher,
-            &QFutureWatcher<vc::atlas::AtlasSnapPreparedCandidates>::finished,
-            this,
-            [this,
-             prepareWatcher,
-             startFinish,
-             self,
-             serviceManifestPath,
-             setRankButtonsEnabled]() mutable {
-        prepareWatcher->deleteLater();
-        try {
-            vc::atlas::AtlasSnapPreparedCandidates prepared = prepareWatcher->result();
-            const size_t jobCount =
-                prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
-            if (jobCount == 0) {
-                std::cerr << "[atlas-snap] no laplace rank jobs required; finishing from cache"
-                          << std::endl;
-                startFinish(std::move(prepared), nlohmann::json::object());
-                return;
-            }
-
-            nlohmann::json serviceRequest = prepared.rankRequest;
-            serviceRequest["manifest"] = serviceManifestPath;
-            std::cerr << "[atlas-snap] requesting laplace rank jobs="
-                      << jobCount
-                      << " service_manifest=" << serviceManifestPath
-                      << std::endl;
-            QJsonObject qtRequest = toQtJsonObject(serviceRequest);
-            if (statusBar()) {
-                statusBar()->showMessage(tr("Ranking atlas snap candidates..."), 3000);
-            }
-            LasagnaServiceManager::instance().rankLaplaceSnapPairs(
-                qtRequest,
-                [startFinish, prepared](const QJsonObject& response) mutable {
-                    std::cerr << "[atlas-snap] laplace rank response received"
-                              << std::endl;
-                    startFinish(prepared, fromQtJsonObject(response));
-                },
-                [self, setRankButtonsEnabled](const QString& message) {
-                    if (!self) {
-                        return;
-                    }
-                    setRankButtonsEnabled(true);
-                    self->refreshAtlasOverviewDocks();
-                    self->updateAtlasSearchDocks();
-                    std::cerr << "[atlas-snap] laplace rank failed: "
-                              << message.toStdString() << std::endl;
-                    QMessageBox::warning(
-                        self.data(),
-                        self->tr("Atlas Snap Candidates"),
-                        self->tr("Could not rank snap candidates: %1").arg(message));
-                },
-                [self, prepared](int index, const QJsonObject& result) mutable {
-                    if (!self) {
-                        return;
-                    }
-                    try {
-                        vc::atlas::cacheAtlasPredSnapRankResult(
-                            prepared,
-                            static_cast<size_t>(index),
-                            fromQtJsonObject(result));
-                    } catch (const std::exception& ex) {
-                        std::cerr << "[atlas-snap] partial rank result callback failed: "
-                                  << ex.what()
-                                  << std::endl;
-                    } catch (...) {
-                        std::cerr << "[atlas-snap] partial rank result callback failed: "
-                                  << "unknown non-standard exception"
-                                  << std::endl;
-                    }
-                });
-        } catch (const std::exception& ex) {
-            setRankButtonsEnabled(true);
-            refreshAtlasOverviewDocks();
-            updateAtlasSearchDocks();
-            const QString message = extractFutureExceptionMessage(ex);
-            std::cerr << "[atlas-snap] prepare failed: "
-                      << message.toStdString() << std::endl;
-            QMessageBox::warning(
-                this,
-                tr("Atlas Snap Candidates"),
-                tr("Could not rank snap candidates: %1").arg(message));
-        }
-    });
-
-    prepareWatcher->setFuture(QtConcurrent::run([atlasDir,
-                                                  volpkgRoot,
-                                                  manifestPath]() {
-        try {
-            std::cerr << "[atlas-snap] prepare start"
-                      << " atlas=" << atlasDir.string()
-                      << " volpkg_root=" << volpkgRoot.string()
-                      << " manifest=" << manifestPath.string()
-                      << std::endl;
-            vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
-            vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            if (!sampler.hasPredDtChannel()) {
-                throw std::runtime_error("selected Lasagna dataset has no pred_dt channel: " +
-                                         manifestPath.string());
-            }
-
-            vc::atlas::AtlasSnapOptimizeOptions options;
-            options.predDtThreshold = 110;
-            options.rankOptions = {
-                {"threshold", options.predDtThreshold},
-                {"margin_base_voxels", 1000},
-                {"source_depth", 0},
-                {"amgx_config", nullptr},
-            };
-
-            vc::atlas::AtlasSnapPreparedCandidates prepared =
-                vc::atlas::prepareAtlasPredSnapCandidates(
-                    atlasDir,
-                    volpkgRoot,
-                    manifestPath,
-                    sampler,
-                    options);
-            const size_t jobCount =
-                prepared.rankRequest.value("jobs", nlohmann::json::array()).size();
-            std::cerr << "[atlas-snap] prepare finished"
-                      << " queued=" << jobCount
-                      << std::endl;
-            return prepared;
-        } catch (const std::exception& ex) {
-            std::cerr << "[atlas-snap] prepare exception: "
-                      << ex.what() << std::endl;
-            throw;
-        } catch (...) {
-            std::cerr << "[atlas-snap] prepare exception: unknown non-standard exception"
-                      << std::endl;
-            throw;
-        }
-    }));
-}
-
-void CWindow::cancelAtlasFiberIntersectionSearch()
-{
-    _atlasSearchCancelRequested = true;
-    if (_atlasSearchCancelFlag) {
-        _atlasSearchCancelFlag->store(true, std::memory_order_relaxed);
-    }
-    qInfo().noquote() << QStringLiteral("[atlas-search] cancel requested phase=%1 completed=%2 total=%3")
-        .arg(atlasSearchPhaseNumber(_atlasSearchProgressPhase))
-        .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
-        .arg(static_cast<qulonglong>(_atlasSearchPhaseTotal));
-    clearAtlasSearchPreviewState();
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-            progress->setRange(0, 100);
-            progress->setValue(vc::atlas::atlasSearchPhaseProgressPercent(
-                _atlasSearchProgressPhase,
-                _atlasSearchPhaseCompleted,
-                _atlasSearchPhaseTotal));
-            progress->setFormat(tr("Canceling: phase %1/%2 %3 (%4 / %5)")
-                                    .arg(atlasSearchPhaseNumber(_atlasSearchProgressPhase))
-                                    .arg(ATLAS_SEARCH_PHASE_COUNT)
-                                    .arg(atlasSearchPhaseAction(_atlasSearchProgressPhase))
-                                    .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
-                                    .arg(static_cast<qulonglong>(_atlasSearchPhaseTotal)));
-        }
-        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
-            cancel->setEnabled(false);
-        }
-        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-            tree->clear();
-        }
-    }
-}
-
-void CWindow::updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase phase,
-                                        std::size_t completed,
-                                        std::size_t total)
-{
-    _atlasSearchProgressPhase = phase;
-    _atlasSearchPhaseCompleted = total == 0 ? completed : std::min(completed, total);
-    _atlasSearchPhaseTotal = total;
-
-    const int percent = vc::atlas::atlasSearchPhaseProgressPercent(
-        phase,
-        _atlasSearchPhaseCompleted,
-        total);
-    const QString action = atlasSearchPhaseAction(phase);
-    const QString format = _atlasSearchCancelRequested
-        ? tr("Canceling: phase %1/%2 %3 (%4 / %5)")
-              .arg(atlasSearchPhaseNumber(phase))
-              .arg(ATLAS_SEARCH_PHASE_COUNT)
-              .arg(action)
-              .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
-              .arg(static_cast<qulonglong>(total))
-        : tr("Phase %1/%2: %3 (%4 / %5)")
-              .arg(atlasSearchPhaseNumber(phase))
-              .arg(ATLAS_SEARCH_PHASE_COUNT)
-              .arg(action)
-              .arg(static_cast<qulonglong>(_atlasSearchPhaseCompleted))
-              .arg(static_cast<qulonglong>(total));
-
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-            progress->setRange(0, 100);
-            progress->setValue(percent);
-            progress->setFormat(format);
-        }
-    }
-}
-
-void CWindow::startAtlasFiberIntersectionSearch()
-{
-    if (!_lineAnnotationController) {
-        updateAtlasSearchDocks();
-        return;
-    }
-
-    vc::atlas::FiberIntersectionBroadPhaseOptions broad;
-    int searchMode = ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS;
-    QStringList requiredTags;
-    QStringList excludedTags;
-    auto readSearchControls = [&](QDockWidget* dock) {
-        if (!dock || !dock->widget()) {
-            return false;
-        }
-        bool found = false;
-        if (auto* combo = dock->widget()->findChild<QComboBox*>(
-                QStringLiteral("atlasSearchTypeCombo"))) {
-            searchMode = combo->currentData().toInt();
-            found = true;
-        }
-        if (auto* tagFilter = dock->widget()->findChild<QLineEdit*>(
-                QStringLiteral("atlasSearchTagFilterEdit"))) {
-            requiredTags = atlasSearchTagList(tagFilter->text());
-            found = true;
-        }
-        if (auto* excludeTagFilter = dock->widget()->findChild<QLineEdit*>(
-                QStringLiteral("atlasSearchExcludeTagFilterEdit"))) {
-            excludedTags = atlasSearchTagList(excludeTagFilter->text());
-            found = true;
-        }
-        if (auto* spin = dock->widget()->findChild<QDoubleSpinBox*>(
-                QStringLiteral("atlasSearchMaxDistanceSpin"))) {
-            broad.maxDistance = spin->value();
-            found = true;
-        }
-        return found;
-    };
-    bool readControls = false;
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (dock && dock->isVisible()) {
-            readControls = readSearchControls(dock) || readControls;
-        }
-    }
-    if (!readControls) {
-        for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-            if (readSearchControls(dock)) {
-                break;
-            }
-        }
-    }
-    if (searchMode != ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS &&
-        searchMode != ATLAS_SEARCH_MODE_NON_ATLAS_ONLY) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Unsupported atlas search type."));
-        return;
-    }
-
-    if (!_currentAtlasDir && searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Select an atlas, or choose \"Non-atlas fibers only\"."));
-        return;
-    }
-
-    vc::atlas::Atlas atlas;
-    bool haveAtlas = false;
-    if (_currentAtlasDir) {
-        try {
-            atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
-            haveAtlas = true;
-        } catch (const std::exception& ex) {
-            QMessageBox::warning(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Could not load selected atlas: %1")
-                                     .arg(QString::fromStdString(ex.what())));
-            return;
-        }
-    }
-
-    const auto fiberSnapshots = _lineAnnotationController->fiberSnapshotsFromStorageWithPaths();
-    if (fiberSnapshots.empty()) {
-        updateAtlasSearchDocks();
-        return;
-    }
-
-    std::vector<std::string> atlasFiberPaths = haveAtlas
-        ? vc::atlas::atlasMappedFiberPathKeys(atlas)
-        : std::vector<std::string>{};
-    if (searchMode == ATLAS_SEARCH_MODE_ATLAS_TO_NON_ATLAS && atlasFiberPaths.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("Selected atlas has no saved fiber mappings."));
-        return;
-    }
-
-    const bool debugSearch = atlasSearchDebugEnabled();
-    if (debugSearch) {
-        qInfo().noquote() << QStringLiteral("[atlas-search] atlas_dir=%1 name=%2 mapping_count=%3")
-            .arg(_currentAtlasDir
-                     ? QString::fromStdString(_currentAtlasDir->string())
-                     : QStringLiteral("<none>"),
-                 QString::fromStdString(atlas.metadata.name))
-            .arg(static_cast<int>(atlas.fibers.size()));
-        for (const auto& mapping : atlas.fibers) {
-            qInfo().noquote() << QStringLiteral("[atlas-search] atlas_mapping fiber_path=%1 key=%2 line_anchors=%3 control_anchors=%4")
-                .arg(QString::fromStdString(mapping.fiberPath.generic_string()),
-                     QString::fromStdString(vc::atlas::atlasFiberPathKey(mapping.fiberPath)))
-                .arg(static_cast<int>(mapping.lineAnchors.size()))
-                .arg(static_cast<int>(mapping.controlAnchors.size()));
-        }
-        qInfo().noquote() << QStringLiteral("[atlas-search] saved_fiber_count=%1")
-            .arg(static_cast<int>(fiberSnapshots.size()));
-    }
-
-    std::vector<std::filesystem::path> canonicalPaths;
-    canonicalPaths.reserve(fiberSnapshots.size());
-    for (const auto& snapshot : fiberSnapshots) {
-        canonicalPaths.push_back(snapshot.fiberPath);
-    }
-    const auto runtimeIds = vc::atlas::makeFiberRuntimeIdentityMap(canonicalPaths);
-    const auto searchSets = vc::atlas::atlasFiberSearchSets(atlas, runtimeIds);
-    std::vector<vc::atlas::FiberPolyline> fibers;
-    std::vector<uint64_t> sourceFiberIds = searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
-        ? searchSets.targetFiberIds
-        : searchSets.sourceFiberIds;
-    std::vector<uint64_t> targetFiberIds = searchSets.targetFiberIds;
-    std::unordered_map<uint64_t, std::string> fiberPathById;
-    std::unordered_map<uint64_t, AtlasSearchFiberSnapshot> snapshotsByRuntimeId;
-    fibers.reserve(fiberSnapshots.size());
-    snapshotsByRuntimeId.reserve(fiberSnapshots.size());
-    _atlasSearchCancelRequested = false;
-    qInfo().noquote() << QStringLiteral("[atlas-search] phase=1 prepare_inputs start total=%1")
-        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
-    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
-                              0,
-                              fiberSnapshots.size());
-    std::size_t preparedFibers = 0;
-    for (const auto& snapshot : fiberSnapshots) {
-        const uint64_t fiberId = runtimeIds.idForPath(snapshot.fiberPath);
-        auto fiber = snapshot.fiber;
-        fiber.id = fiberId;
-        fibers.push_back(std::move(fiber));
-        auto previewFiber = snapshot.fiber;
-        previewFiber.id = fiberId;
-        snapshotsByRuntimeId.emplace(
-            fiberId,
-            AtlasSearchFiberSnapshot{
-                snapshot.fiberPath,
-                std::move(previewFiber),
-                snapshot.storedFiberId,
-                snapshot.hvClassification,
-                snapshot.manualHvTag,
-                snapshot.tags});
-        const std::string pathKey = vc::atlas::atlasFiberPathKey(snapshot.fiberPath);
-        const bool inAtlas = std::binary_search(atlasFiberPaths.begin(), atlasFiberPaths.end(), pathKey);
-        fiberPathById.emplace(fiberId, pathKey);
-        if (debugSearch) {
-            qInfo().noquote() << QStringLiteral("[atlas-search] saved_fiber path=%1 key=%2 runtime_id=%3 generation=%4 points=%5 controls=%6 side=%7")
-                .arg(QString::fromStdString(snapshot.fiberPath.generic_string()),
-                     QString::fromStdString(pathKey),
-                     QString::number(fiberId),
-                     QString::number(snapshot.fiber.generation),
-                     QString::number(static_cast<int>(snapshot.fiber.points.size())),
-                     QString::number(static_cast<int>(snapshot.fiber.controlPoints.size())),
-                     inAtlas ? QStringLiteral("source_atlas") : QStringLiteral("target_non_atlas"));
-        }
-        ++preparedFibers;
-        updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::PrepareInputs,
-                                  preparedFibers,
-                                  fiberSnapshots.size());
-    }
-    qInfo().noquote() << QStringLiteral("[atlas-search] phase=1 prepare_inputs end completed=%1 total=%2")
-        .arg(static_cast<qulonglong>(preparedFibers))
-        .arg(static_cast<qulonglong>(fiberSnapshots.size()));
-    if (!requiredTags.isEmpty() || !excludedTags.isEmpty()) {
-        auto keepTagged = [&snapshotsByRuntimeId, &requiredTags, &excludedTags](std::vector<uint64_t>& ids) {
-            ids.erase(std::remove_if(ids.begin(),
-                                     ids.end(),
-                                     [&snapshotsByRuntimeId, &requiredTags, &excludedTags](uint64_t id) {
-                                         const auto it = snapshotsByRuntimeId.find(id);
-                                         return it == snapshotsByRuntimeId.end() ||
-                                                !atlasSearchFiberMatchesTags(it->second.tags,
-                                                                             requiredTags) ||
-                                                atlasSearchFiberHasAnyTag(it->second.tags,
-                                                                          excludedTags);
-                                     }),
-                      ids.end());
-        };
-        keepTagged(sourceFiberIds);
-        keepTagged(targetFiberIds);
-    }
-    if (sourceFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 searchMode == ATLAS_SEARCH_MODE_NON_ATLAS_ONLY
-                                     ? tr("No saved non-atlas fibers match the search filters.")
-                                     : tr("None of the selected atlas fibers are available in saved fiber files or match the search filters."));
-        return;
-    }
-    if (targetFiberIds.empty()) {
-        QMessageBox::information(this,
-                                 tr("Atlas Object Search"),
-                                 tr("No saved non-atlas fibers are available to search or match the search filters."));
-        return;
-    }
-    if (debugSearch) {
-        qInfo().noquote() << QStringLiteral("[atlas-search] split source_ids=%1 target_ids=%2")
-            .arg(atlasSearchIdListString(sourceFiberIds),
-                 atlasSearchIdListString(targetFiberIds));
-    }
-    const std::size_t pairTotal = sourceFiberIds.size() * targetFiberIds.size();
-    qInfo().noquote() << QStringLiteral("[atlas-search] start mode=%1 saved_fibers=%2 sources=%3 targets=%4 pairs=%5")
-        .arg(atlasSearchModeName(searchMode))
-        .arg(static_cast<qulonglong>(fiberSnapshots.size()))
-        .arg(static_cast<qulonglong>(sourceFiberIds.size()))
-        .arg(static_cast<qulonglong>(targetFiberIds.size()))
-        .arg(static_cast<qulonglong>(pairTotal));
-
-    vc::atlas::FiberIntersectionCeresOptions ceres;
-
-    std::filesystem::path lasagnaManifestPath;
-    if (_state && _state->vpkg()) {
-        lasagnaManifestPath = _state->vpkg()->selectedLasagnaDatasetPath();
-    }
-    if (lasagnaManifestPath.empty()) {
-        QMessageBox::warning(this,
-                             tr("Atlas Object Search"),
-                             tr("Select a local Lasagna dataset before searching. "
-                                "Intersection distance is measured in grad_mag winding-integral space."));
-        return;
-    }
-
-    clearAtlasSearchPreviewState();
-    auto snapshotsByRuntimeIdForWorker = snapshotsByRuntimeId;
-    _atlasSearchFiberSnapshotsByRuntimeId = std::move(snapshotsByRuntimeId);
-    _atlasSearchLasagnaManifestPath = lasagnaManifestPath;
-    _atlasSearchCancelRequested = false;
-    _atlasSearchCancelFlag = std::make_shared<std::atomic_bool>(false);
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* run = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchRunButton"))) {
-            run->setEnabled(false);
-        }
-        if (auto* cancel = dock->widget()->findChild<QPushButton*>(QStringLiteral("atlasSearchCancelButton"))) {
-            cancel->setEnabled(true);
-        }
-        if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-            tree->clear();
-        }
-    }
-    _atlasSearchResults.clear();
-    _atlasSearchSignedWindings.clear();
-
-    const auto searchStart = std::chrono::steady_clock::now();
-    auto* watcher = new QFutureWatcher<AtlasSearchWorkerResult>(this);
-    connect(watcher,
-            &QFutureWatcher<AtlasSearchWorkerResult>::finished,
-            this,
-            [this,
-             watcher,
-             cancelFlag = _atlasSearchCancelFlag,
-             searchStart]() {
-                const auto workerResult = watcher->result();
-                watcher->deleteLater();
-                const bool canceled = cancelFlag && cancelFlag->load(std::memory_order_relaxed);
-                if (!canceled && !_atlasSearchCancelRequested) {
-                    populateAtlasSearchResults(workerResult.results, workerResult.signedWindings);
-                    if (statusBar()) {
-                        const QString message = workerResult.skippedSigningCount == 0
-                            ? tr("Atlas object search found %1 result(s)")
-                                  .arg(static_cast<int>(workerResult.results.size()))
-                            : tr("Atlas object search found %1 signed result(s); skipped %2 result(s)")
-                                  .arg(static_cast<int>(workerResult.results.size()))
-                                  .arg(static_cast<int>(workerResult.skippedSigningCount));
-                        statusBar()->showMessage(message, 3000);
-                    }
-                } else {
-                    qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results start total=1")
-                        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults));
-                    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                                              1,
-                                              1);
-                    qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results end completed=1 total=1")
-                        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults));
-                    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-                        if (!dock || !dock->widget()) {
-                            continue;
-                        }
-                        if (auto* progress = dock->widget()->findChild<QProgressBar*>(
-                                QStringLiteral("atlasSearchProgressBar"))) {
-                            progress->setFormat(tr("Canceled"));
-                        }
-                    }
-                    if (statusBar()) {
-                        statusBar()->showMessage(tr("Atlas object search canceled"), 3000);
-                    }
-                }
-                const auto elapsedMs = std::chrono::duration_cast<std::chrono::milliseconds>(
-                    std::chrono::steady_clock::now() - searchStart).count();
-                qInfo().noquote() << QStringLiteral("[atlas-search] final raw_result_count=%1 signed_result_count=%2 skipped_signing=%3 canceled=%4 elapsed_ms=%5")
-                    .arg(static_cast<qulonglong>(workerResult.rawResultCount))
-                    .arg(static_cast<qulonglong>(workerResult.results.size()))
-                    .arg(static_cast<qulonglong>(workerResult.skippedSigningCount))
-                    .arg(canceled || _atlasSearchCancelRequested ? QStringLiteral("yes") : QStringLiteral("no"))
-                    .arg(static_cast<qlonglong>(elapsedMs));
-                _atlasSearchCancelRequested = false;
-                if (_atlasSearchCancelFlag == cancelFlag) {
-                    _atlasSearchCancelFlag.reset();
-                }
-                updateAtlasSearchDocks();
-            });
-
-    vc::atlas::FiberIntersectionCache* cache = &_fiberIntersectionCache;
-    QPointer<CWindow> self(this);
-    auto cancelFlag = _atlasSearchCancelFlag;
-    const auto atlasDirForWorker = _currentAtlasDir;
-    watcher->setFuture(QtConcurrent::run([fibers = std::move(fibers),
-                                          sourceFiberIds = std::move(sourceFiberIds),
-                                          targetFiberIds = std::move(targetFiberIds),
-                                          fiberPathById = std::move(fiberPathById),
-                                          snapshotsByRuntimeId = std::move(snapshotsByRuntimeIdForWorker),
-                                          lasagnaManifestPath = std::move(lasagnaManifestPath),
-                                          atlasDir = atlasDirForWorker,
-                                          cache,
-                                          broad,
-                                          ceres,
-                                          self,
-                                          cancelFlag,
-                                          debugSearch]() mutable {
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(lasagnaManifestPath);
-        vc::lasagna::LasagnaNormalSampler windingSampler(dataset);
-        bool phase2Started = false;
-        bool phase2Ended = false;
-        bool phase3Started = false;
-        bool phase3Ended = false;
-        bool phase4Started = false;
-        bool phase4Ended = false;
-        auto progressCallback = [self,
-                                 cancelFlag,
-                                 &phase2Started,
-                                 &phase2Ended,
-                                 &phase3Started,
-                                 &phase3Ended,
-                                 &phase4Started,
-                                 &phase4Ended](vc::atlas::AtlasSearchProgressPhase phase,
-                                               std::size_t completed,
-                                               std::size_t total) {
-            bool* started = nullptr;
-            bool* ended = nullptr;
-            if (phase == vc::atlas::AtlasSearchProgressPhase::BuildSpatialIndex) {
-                started = &phase2Started;
-                ended = &phase2Ended;
-            } else if (phase == vc::atlas::AtlasSearchProgressPhase::SearchPairs) {
-                started = &phase3Started;
-                ended = &phase3Ended;
-            } else if (phase == vc::atlas::AtlasSearchProgressPhase::PrepareSigningSurface) {
-                started = &phase4Started;
-                ended = &phase4Ended;
-            }
-            if (started && !*started && completed == 0) {
-                *started = true;
-                qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 %2 start total=%3")
-                    .arg(atlasSearchPhaseNumber(phase))
-                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
-                    .arg(static_cast<qulonglong>(total));
-            }
-            if (ended && !*ended && (completed >= total)) {
-                *ended = true;
-                qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 %2 end completed=%3 total=%4")
-                    .arg(atlasSearchPhaseNumber(phase))
-                    .arg(atlasSearchPhaseAction(phase).toLower().replace(QChar(' '), QChar('_')))
-                    .arg(static_cast<qulonglong>(completed))
-                    .arg(static_cast<qulonglong>(total));
-            }
-            if (!self) {
-                return;
-            }
-            QMetaObject::invokeMethod(self.data(), [self, cancelFlag, phase, completed, total]() {
-                if (!self || self->_atlasSearchCancelFlag != cancelFlag) {
-                    return;
-                }
-                self->updateAtlasSearchProgress(phase, completed, total);
-            }, Qt::QueuedConnection);
-        };
-        auto cancelCallback = [cancelFlag]() {
-            return cancelFlag && cancelFlag->load(std::memory_order_relaxed);
-        };
-        auto rawResults = vc::atlas::searchFiberIntersections(fibers,
-                                                              sourceFiberIds,
-                                                              targetFiberIds,
-                                                              cache,
-                                                              broad,
-                                                              ceres,
-                                                              &windingSampler,
-                                                              progressCallback,
-                                                              cancelCallback);
-        if (debugSearch) {
-            qInfo().noquote() << QStringLiteral("[atlas-search] finished source_ids=%1 target_ids=%2 result_count=%3")
-                .arg(atlasSearchIdListString(sourceFiberIds),
-                     atlasSearchIdListString(targetFiberIds))
-                .arg(static_cast<int>(rawResults.size()));
-            for (const auto& result : rawResults) {
-                const auto sourcePath = fiberPathById.find(result.sourceFiberId);
-                const auto targetPath = fiberPathById.find(result.targetFiberId);
-                qInfo().noquote() << QStringLiteral("[atlas-search] result source_id=%1 source_path=%2 target_id=%3 target_path=%4 winding=%5 candidate=%6 source_s=%7 target_s=%8")
-                    .arg(QString::number(result.sourceFiberId),
-                         QString::fromStdString(sourcePath == fiberPathById.end() ? std::string("<missing>") : sourcePath->second),
-                         QString::number(result.targetFiberId),
-                         QString::fromStdString(targetPath == fiberPathById.end() ? std::string("<missing>") : targetPath->second),
-                         QString::number(result.windingDistance, 'g', 12),
-                         QString::number(result.candidateDistance, 'g', 12),
-                         QString::number(result.sourceArclength, 'g', 12),
-                         QString::number(result.targetArclength, 'g', 12));
-            }
-        }
-        if (cancelCallback()) {
-            AtlasSearchWorkerResult canceledResult;
-            canceledResult.rawResultCount = rawResults.size();
-            return canceledResult;
-        }
-        return buildSignedAtlasSearchResults(std::move(rawResults),
-                                             snapshotsByRuntimeId,
-                                             atlasDir,
-                                             lasagnaManifestPath,
-                                             progressCallback,
-                                             debugSearch);
-    }));
-}
-
-void CWindow::populateAtlasSearchResults(const std::vector<vc::atlas::FiberIntersectionResult>& results,
-                                         std::vector<double> signedWindings)
-{
-    struct FiberDisplayInfo {
-        QString label;
-        double lengthVx = 0.0;
-    };
-    std::unordered_map<uint64_t, FiberDisplayInfo> fiberInfo;
-    if (_lineAnnotationController) {
-        for (const auto& fiber : _lineAnnotationController->fiberSummaries()) {
-            QString label = QString::number(fiber.id);
-            if (!fiber.name.empty()) {
-                label = tr("%1 (%2)")
-                    .arg(QString::fromStdString(fiber.name))
-                    .arg(fiber.id);
-            }
-            fiberInfo[fiber.id] = FiberDisplayInfo{label, fiber.lengthVx};
-        }
-    }
-
-    auto fiberLabel = [&fiberInfo](uint64_t fiberId) {
-        const auto it = fiberInfo.find(fiberId);
-        if (it != fiberInfo.end()) {
-            return it->second.label;
-        }
-        return QString::number(fiberId);
-    };
-    auto arclengthFraction = [&fiberInfo](uint64_t fiberId, double arclength) {
-        const auto it = fiberInfo.find(fiberId);
-        if (it == fiberInfo.end() || !std::isfinite(it->second.lengthVx) ||
-            it->second.lengthVx <= 0.0 || !std::isfinite(arclength)) {
-            return 0.0;
-        }
-        return std::clamp(arclength / it->second.lengthVx, 0.0, 1.0);
-    };
-
-    if (signedWindings.empty() &&
-        results.size() == _atlasSearchResults.size() &&
-        _atlasSearchSignedWindings.size() == _atlasSearchResults.size()) {
-        signedWindings = _atlasSearchSignedWindings;
-    }
-    if (signedWindings.size() != results.size()) {
-        qWarning().noquote() << QStringLiteral("[atlas-search] render skipped: result_count=%1 signed_count=%2")
-            .arg(static_cast<qulonglong>(results.size()))
-            .arg(static_cast<qulonglong>(signedWindings.size()));
-        return;
-    }
-
-    _atlasSearchResults = results;
-    _atlasSearchSignedWindings = std::move(signedWindings);
-    ++_atlasSearchPreviewGeneration;
-    _atlasSearchHoveredResult.reset();
-    _atlasSearchSelectedResults.clear();
-    _atlasSearchPreviewRequestedResults.clear();
-
-    const std::size_t finishTotal = std::max<std::size_t>(1, _atlasSearchResults.size());
-    qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results start total=%2")
-        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
-        .arg(static_cast<qulonglong>(finishTotal));
-    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                              0,
-                              finishTotal);
-    bool countedResultRows = false;
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"));
-        if (!tree) {
-            continue;
-        }
-        tree->clear();
-        tree->setColumnCount(5);
-        tree->setSelectionMode(QAbstractItemView::ExtendedSelection);
-        tree->setSelectionBehavior(QAbstractItemView::SelectRows);
-        tree->setMouseTracking(true);
-        tree->setHeaderLabels({
-            tr("Distance (windings)"),
-            tr("Source fiber"),
-            tr("Target fiber"),
-            tr("Src idx"),
-            tr("Tgt idx"),
-        });
-        const bool groupByFiber = [&]() {
-            if (auto* check = dock->widget()->findChild<QCheckBox*>(
-                    QStringLiteral("atlasSearchGroupByFiberCheck"))) {
-                return check->isChecked();
-            }
-            return true;
-        }();
-
-        auto fillResultRow = [&](QTreeWidgetItem* row, int resultIndex) {
-            const auto& result = _atlasSearchResults[static_cast<size_t>(resultIndex)];
-            row->setData(0, ATLAS_SEARCH_RESULT_INDEX_ROLE, resultIndex);
-            row->setText(0, QString::number(_atlasSearchSignedWindings[static_cast<size_t>(resultIndex)], 'f', 3));
-            row->setTextAlignment(0, Qt::AlignRight | Qt::AlignVCenter);
-            row->setText(1, fiberLabel(result.sourceFiberId));
-            row->setText(2, fiberLabel(result.targetFiberId));
-            row->setText(3, QString::number(arclengthFraction(result.sourceFiberId,
-                                                              result.sourceArclength),
-                                            'f',
-                                            6));
-            row->setTextAlignment(3, Qt::AlignRight | Qt::AlignVCenter);
-            row->setText(4, QString::number(arclengthFraction(result.targetFiberId,
-                                                              result.targetArclength),
-                                            'f',
-                                            6));
-            row->setTextAlignment(4, Qt::AlignRight | Qt::AlignVCenter);
-        };
-
-        if (!groupByFiber) {
-            for (int rowIndex = 0; rowIndex < static_cast<int>(_atlasSearchResults.size()); ++rowIndex) {
-                auto* row = new QTreeWidgetItem(tree);
-                fillResultRow(row, rowIndex);
-                if (!countedResultRows) {
-                    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                                              static_cast<std::size_t>(rowIndex) + 1,
-                                              finishTotal);
-                }
-            }
-            if (_atlasSearchResults.empty() && !countedResultRows) {
-                updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                                          1,
-                                          finishTotal);
-            }
-            countedResultRows = true;
-            tree->resizeColumnToContents(0);
-            tree->resizeColumnToContents(1);
-            tree->resizeColumnToContents(2);
-            continue;
-        }
-
-        struct FiberGroup {
-            uint64_t fiberId = 0;
-            std::vector<int> resultIndices;
-            std::set<uint64_t> partnerFiberIds;
-            std::set<uint64_t> closePartnerFiberIds;
-        };
-        std::map<uint64_t, FiberGroup> groupsByFiber;
-        for (int row = 0; row < static_cast<int>(_atlasSearchResults.size()); ++row) {
-            const auto& result = _atlasSearchResults[static_cast<size_t>(row)];
-            auto addToGroup = [&](uint64_t fiberId, uint64_t partnerFiberId) {
-                auto& group = groupsByFiber[fiberId];
-                group.fiberId = fiberId;
-                group.resultIndices.push_back(row);
-                group.partnerFiberIds.insert(partnerFiberId);
-                if (std::abs(result.windingDistance) < ATLAS_SEARCH_CLOSE_WINDING_THRESHOLD) {
-                    group.closePartnerFiberIds.insert(partnerFiberId);
-                }
-            };
-            addToGroup(result.sourceFiberId, result.targetFiberId);
-            addToGroup(result.targetFiberId, result.sourceFiberId);
-            if (!countedResultRows) {
-                updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                                          static_cast<std::size_t>(row) + 1,
-                                          finishTotal);
-            }
-        }
-
-        std::vector<FiberGroup> groups;
-        groups.reserve(groupsByFiber.size());
-        for (auto& [fiberId, group] : groupsByFiber) {
-            (void)fiberId;
-            std::sort(group.resultIndices.begin(),
-                      group.resultIndices.end(),
-                      [&](int a, int b) {
-                          const auto& ra = _atlasSearchResults[static_cast<size_t>(a)];
-                          const auto& rb = _atlasSearchResults[static_cast<size_t>(b)];
-                          const double da = _atlasSearchSignedWindings[static_cast<size_t>(a)];
-                          const double db = _atlasSearchSignedWindings[static_cast<size_t>(b)];
-                          if (da != db) return da < db;
-                          const double rawA = std::abs(ra.windingDistance);
-                          const double rawB = std::abs(rb.windingDistance);
-                          if (rawA != rawB) return rawA < rawB;
-                          if (ra.sourceFiberId != rb.sourceFiberId) {
-                              return ra.sourceFiberId < rb.sourceFiberId;
-                          }
-                          return ra.targetFiberId < rb.targetFiberId;
-                      });
-            groups.push_back(std::move(group));
-        }
-        std::sort(groups.begin(), groups.end(), [&](const FiberGroup& a, const FiberGroup& b) {
-            if (a.closePartnerFiberIds.size() != b.closePartnerFiberIds.size()) {
-                return a.closePartnerFiberIds.size() > b.closePartnerFiberIds.size();
-            }
-            if (a.partnerFiberIds.size() != b.partnerFiberIds.size()) {
-                return a.partnerFiberIds.size() > b.partnerFiberIds.size();
-            }
-            return fiberLabel(a.fiberId) < fiberLabel(b.fiberId);
-        });
-
-        for (const FiberGroup& group : groups) {
-            auto* root = new QTreeWidgetItem(tree);
-            root->setText(
-                0,
-                tr("%1 - %2 pairs below 0.5 windings, %3 total pairs, %4 intersections")
-                    .arg(fiberLabel(group.fiberId))
-                    .arg(static_cast<int>(group.closePartnerFiberIds.size()))
-                    .arg(static_cast<int>(group.partnerFiberIds.size()))
-                    .arg(static_cast<int>(group.resultIndices.size())));
-            root->setData(0,
-                          ATLAS_SEARCH_FIBER_ID_ROLE,
-                          QVariant::fromValue<qulonglong>(group.fiberId));
-            root->setFirstColumnSpanned(true);
-            root->setFlags(root->flags() & ~Qt::ItemIsSelectable);
-
-            for (int resultIndex : group.resultIndices) {
-                auto* row = new QTreeWidgetItem(root);
-                fillResultRow(row, resultIndex);
-            }
-        }
-        if (_atlasSearchResults.empty() && !countedResultRows) {
-            updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                                      1,
-                                      finishTotal);
-        }
-        countedResultRows = true;
-        tree->expandAll();
-        tree->resizeColumnToContents(0);
-        tree->resizeColumnToContents(1);
-        tree->resizeColumnToContents(2);
-    }
-    updateAtlasSearchProgress(vc::atlas::AtlasSearchProgressPhase::FinishResults,
-                              finishTotal,
-                              finishTotal);
-    qInfo().noquote() << QStringLiteral("[atlas-search] phase=%1 finishing_results end completed=%2 total=%3")
-        .arg(atlasSearchPhaseNumber(vc::atlas::AtlasSearchProgressPhase::FinishResults))
-        .arg(static_cast<qulonglong>(finishTotal))
-        .arg(static_cast<qulonglong>(finishTotal));
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-            progress->setFormat(tr("Done"));
-        }
-    }
-    updateAtlasSearchPreviewCandidates();
-}
-
-void CWindow::openAtlasSearchResult(int sortedResultIndex)
-{
-    if (sortedResultIndex < 0 ||
-        sortedResultIndex >= static_cast<int>(_atlasSearchResults.size())) {
-        return;
-    }
-    if (!_lineAnnotationController || !_intersectionsMdiArea) {
-        QMessageBox::warning(this,
-                             tr("Intersections"),
-                             tr("Intersections workspace is not available."));
-        return;
-    }
-    if (!_currentAtlasDir) {
-        QMessageBox::information(this,
-                                 tr("Intersections"),
-                                 tr("Create or select an atlas before inspecting intersections."));
-        return;
-    }
-    if (_workspaceTabs && _intersectionsWorkspaceWindow) {
-        _workspaceTabs->setCurrentWidget(_intersectionsWorkspaceWindow);
-    }
-    _lineAnnotationController->showIntersectionInspection(
-        _atlasSearchResults[static_cast<size_t>(sortedResultIndex)],
-        _intersectionsMdiArea,
-        _currentAtlasDir);
-}
-
-void CWindow::clearAtlasSearchPreviewState()
-{
-    ++_atlasSearchPreviewGeneration;
-    _atlasSearchResults.clear();
-    _atlasSearchSignedWindings.clear();
-    _atlasSearchFiberSnapshotsByRuntimeId.clear();
-    _atlasSearchLasagnaManifestPath.reset();
-    _atlasSearchHoveredResult.reset();
-    _atlasSearchSelectedResults.clear();
-    _atlasSearchPreviewRequestedResults.clear();
-    if (_atlasOverlay) {
-        _atlasOverlay->clearSearchPreviews();
-    }
-}
-
-void CWindow::updateAtlasSearchPreviewCandidates()
-{
-    if (!_atlasOverlay || !_currentAtlasDir || _atlasSearchResults.empty()) {
-        if (_atlasOverlay) {
-            _atlasOverlay->setSearchPreviewCandidates({});
-        }
-        return;
-    }
-
-    try {
-        vc::atlas::Atlas atlas = vc::atlas::Atlas::load(*_currentAtlasDir);
-        const std::filesystem::path basePath = *_currentAtlasDir / atlas.metadata.baseMeshPath;
-        QuadSurface baseSurface(basePath);
-        const auto* points = baseSurface.rawPointsPtr();
-        if (!points || points->empty() || points->cols <= 0) {
-            throw std::runtime_error("atlas base mesh has no valid grid");
-        }
-        const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(baseSurface);
-        (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
-        const vc::atlas::AtlasDisplayRange displayRange =
-            vc::atlas::atlasDisplayRange(atlas, periodColumns);
-        const auto displaySurface =
-            vc::atlas::repeatedAtlasDisplaySurface(baseSurface,
-                                                   displayRange.unwrapCount,
-                                                   atlas.metadata.zeroWindingColumn);
-
-        std::vector<AtlasOverlayController::SearchPreviewCandidate> candidates;
-        candidates.reserve(_atlasSearchResults.size());
-        for (int row = 0; row < static_cast<int>(_atlasSearchResults.size()); ++row) {
-            const auto coord = atlasSearchCandidateSurfaceCoord(
-                atlas,
-                *displaySurface,
-                displayRange,
-                _atlasSearchResults[static_cast<size_t>(row)],
-                _atlasSearchFiberSnapshotsByRuntimeId);
-            if (!coord) {
-                continue;
-            }
-            candidates.push_back({row, *coord});
-        }
-        _atlasOverlay->setSearchPreviewCandidates(std::move(candidates));
-    } catch (const std::exception& ex) {
-        qWarning().noquote() << QStringLiteral("Could not build atlas search preview crosses: %1")
-            .arg(QString::fromStdString(ex.what()));
-        _atlasOverlay->setSearchPreviewCandidates({});
-    }
-}
-
-void CWindow::setAtlasSearchHoverResult(std::optional<int> sortedResultIndex)
-{
-    if (sortedResultIndex &&
-        (*sortedResultIndex < 0 ||
-         *sortedResultIndex >= static_cast<int>(_atlasSearchResults.size()))) {
-        sortedResultIndex.reset();
-    }
-    if (_atlasSearchHoveredResult == sortedResultIndex) {
-        return;
-    }
-    _atlasSearchHoveredResult = sortedResultIndex;
-    if (_atlasOverlay) {
-        _atlasOverlay->setSearchPreviewHover(_atlasSearchHoveredResult);
-    }
-    updateAtlasSearchPreviewRequests();
-}
-
-void CWindow::updateAtlasSearchSelectionFromTree(QTreeWidget* sourceTree)
-{
-    std::set<int> selected;
-    if (sourceTree) {
-        for (const auto* item : sourceTree->selectedItems()) {
-            const auto resultIndex = atlasSearchResultIndexForItem(item);
-            if (!resultIndex) {
-                continue;
-            }
-            if (*resultIndex >= 0 &&
-                *resultIndex < static_cast<int>(_atlasSearchResults.size())) {
-                selected.insert(*resultIndex);
-            }
-        }
-    }
-
-    if (_atlasSearchSelectedResults == selected) {
-        return;
-    }
-    _atlasSearchSelectedResults = std::move(selected);
-    syncAtlasSearchTreeSelection(nullptr);
-    if (_atlasOverlay) {
-        _atlasOverlay->setSearchPreviewSelection(_atlasSearchSelectedResults);
-    }
-    updateAtlasSearchPreviewRequests();
-}
-
-void CWindow::syncAtlasSearchTreeSelection(QTreeWidget* sourceTree)
-{
-    for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-        if (!dock || !dock->widget()) {
-            continue;
-        }
-        auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"));
-        if (!tree || tree == sourceTree) {
-            continue;
-        }
-        QSignalBlocker blocker(tree);
-        tree->setProperty("vc_atlas_syncing_selection", true);
-        tree->clearSelection();
-        if (auto* selection = tree->selectionModel()) {
-            forEachAtlasSearchResultItem(tree, [&](QTreeWidgetItem* item) {
-                const auto resultIndex = atlasSearchResultIndexForItem(item);
-                if (!resultIndex ||
-                    _atlasSearchSelectedResults.find(*resultIndex) ==
-                        _atlasSearchSelectedResults.end()) {
-                    return;
-                }
-                const QModelIndex left = tree->indexFromItem(item, 0);
-                const QModelIndex right = tree->indexFromItem(item, tree->columnCount() - 1);
-                selection->select(QItemSelection(left, right),
-                                  QItemSelectionModel::Select | QItemSelectionModel::Rows);
-            });
-        }
-        tree->setProperty("vc_atlas_syncing_selection", false);
-    }
-}
-
-void CWindow::updateAtlasSearchPreviewRequests()
-{
-    std::set<int> wanted = _atlasSearchSelectedResults;
-    if (_atlasSearchHoveredResult) {
-        wanted.insert(*_atlasSearchHoveredResult);
-    }
-    for (const int resultIndex : wanted) {
-        requestAtlasSearchPreviewLine(resultIndex);
-    }
-}
-
-void CWindow::requestAtlasSearchPreviewLine(int sortedResultIndex)
-{
-    if (sortedResultIndex < 0 ||
-        sortedResultIndex >= static_cast<int>(_atlasSearchResults.size()) ||
-        !_currentAtlasDir ||
-        !_atlasSearchLasagnaManifestPath ||
-        _atlasSearchPreviewRequestedResults.find(sortedResultIndex) !=
-            _atlasSearchPreviewRequestedResults.end()) {
-        return;
-    }
-
-    const auto result = _atlasSearchResults[static_cast<size_t>(sortedResultIndex)];
-    const auto sourceIt = _atlasSearchFiberSnapshotsByRuntimeId.find(result.sourceFiberId);
-    const auto targetIt = _atlasSearchFiberSnapshotsByRuntimeId.find(result.targetFiberId);
-    if (sourceIt == _atlasSearchFiberSnapshotsByRuntimeId.end() ||
-        targetIt == _atlasSearchFiberSnapshotsByRuntimeId.end()) {
-        return;
-    }
-
-    _atlasSearchPreviewRequestedResults.insert(sortedResultIndex);
-    const int generation = _atlasSearchPreviewGeneration;
-    auto* watcher =
-        new QFutureWatcher<std::optional<AtlasOverlayController::SearchPreviewFiber>>(this);
-    connect(watcher,
-            &QFutureWatcher<std::optional<AtlasOverlayController::SearchPreviewFiber>>::finished,
-            this,
-            [this, watcher, generation, sortedResultIndex]() {
-                const auto preview = watcher->result();
-                watcher->deleteLater();
-                if (generation != _atlasSearchPreviewGeneration || !preview || !_atlasOverlay) {
-                    return;
-                }
-                _atlasOverlay->setSearchPreviewFiber(*preview);
-            });
-
-    watcher->setFuture(QtConcurrent::run([
-        atlasDir = *_currentAtlasDir,
-        manifestPath = *_atlasSearchLasagnaManifestPath,
-        result,
-        sourceSnapshot = sourceIt->second,
-        targetSnapshot = targetIt->second,
-        sortedResultIndex
-    ]() -> std::optional<AtlasOverlayController::SearchPreviewFiber> {
-        try {
-            vc::atlas::Atlas atlas = vc::atlas::Atlas::load(atlasDir);
-            const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-            auto baseSurface = std::make_shared<QuadSurface>(basePath);
-            const auto* points = baseSurface->rawPointsPtr();
-            if (!points || points->empty() || points->cols <= 0) {
-                throw std::runtime_error("atlas base mesh has no valid grid");
-            }
-
-            vc::lasagna::LasagnaDataset dataset =
-                vc::lasagna::LasagnaDataset::open(manifestPath);
-            vc::lasagna::LasagnaNormalSampler sampler(dataset);
-            SurfacePatchIndex baseIndex;
-            baseIndex.rebuild({baseSurface});
-            const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
-            (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
-
-            const vc::atlas::FiberInput sourceInput =
-                fiberInputFromSnapshot(sourceSnapshot.fiberPath, sourceSnapshot.fiber);
-            const vc::atlas::FiberInput targetInput =
-                fiberInputFromSnapshot(targetSnapshot.fiberPath, targetSnapshot.fiber);
-
-            if (!findAtlasMappingForPath(atlas, sourceInput.fiberPath)) {
-                atlas.fibers.push_back(vc::atlas::mapFiberToBaseSurface(
-                    sourceInput, *baseSurface, baseIndex, sampler));
-            }
-            if (!findAtlasMappingForPath(atlas, targetInput.fiberPath)) {
-                atlas.fibers.push_back(vc::atlas::mapFiberToBaseSurface(
-                    targetInput, *baseSurface, baseIndex, sampler));
-            }
-
-            const auto* sourceMapping = findAtlasMappingForPath(atlas, sourceInput.fiberPath);
-            auto* targetMapping = findAtlasMappingForPath(atlas, targetInput.fiberPath);
-            if (!sourceMapping || !targetMapping) {
-                throw std::runtime_error("Could not map both preview fibers into the atlas");
-            }
-
-            const auto sourceSample = vc3d::fiber_slice::samplePolylineAtArclength(
-                sourceInput.linePoints,
-                result.sourceArclength);
-            const auto targetSample = vc3d::fiber_slice::samplePolylineAtArclength(
-                targetInput.linePoints,
-                result.targetArclength);
-            if (!sourceSample.valid || !targetSample.valid) {
-                throw std::runtime_error("Could not sample preview intersection arclengths");
-            }
-
-            auto endpointFor = [](const vc::atlas::FiberMapping& mapping,
-                                  double arclength,
-                                  double linePosition) {
-                const auto* best = nearestLineAnchorForPosition(mapping, linePosition);
-                if (!best) {
-                    throw std::runtime_error("Mapped preview fiber has no line anchor");
-                }
-                vc::atlas::AtlasLinkEndpoint endpoint;
-                endpoint.fiberPath = mapping.fiberPath;
-                endpoint.sourceIndex = best->sourceIndex;
-                endpoint.arclength = arclength;
-                endpoint.atlasU = best->atlasU;
-                endpoint.atlasV = best->atlasV;
-                return endpoint;
-            };
-
-            vc::atlas::AtlasLink link;
-            link.first = endpointFor(*sourceMapping,
-                                     result.sourceArclength,
-                                     sourceSample.linePosition);
-            link.second = endpointFor(*targetMapping,
-                                      result.targetArclength,
-                                      targetSample.linePosition);
-            link.desiredWindingDelta = 0;
-            const int delta = vc::atlas::atlasLinkWindingOffsetDelta(
-                link, periodColumns, atlas.metadata.zeroWindingColumn);
-            targetMapping->windingOffset = sourceMapping->windingOffset + delta;
-            return AtlasOverlayController::SearchPreviewFiber{
-                sortedResultIndex,
-                *targetMapping,
-            };
-        } catch (const std::exception& ex) {
-            qWarning().noquote() << QStringLiteral("Could not build atlas search preview line: %1")
-                .arg(QString::fromStdString(ex.what()));
-            return std::nullopt;
-        }
-    }));
-}
-
-void CWindow::displayAtlasFromDirectory(const std::filesystem::path& atlasDir)
-{
-    try {
-        if (!_atlasWorkspaceWindow || !_atlasViewer) {
-            createAtlasWorkspace();
-        }
-        auto vpkg = _state ? _state->vpkg() : nullptr;
-        if (!vpkg) {
-            throw std::runtime_error("No volume package is loaded");
-        }
-        const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-        if (manifestPath.empty()) {
-            throw std::runtime_error(
-                "No local Lasagna normal dataset is selected; atlas pred-snap attachments are required");
-        }
-        if (!std::filesystem::exists(manifestPath)) {
-            throw std::runtime_error("Selected Lasagna normal dataset does not exist");
-        }
-        const std::filesystem::path volpkgRoot = vpkg->path().empty()
-            ? std::filesystem::path(vpkg->getVolpkgDirectory())
-            : vpkg->path().parent_path();
-        auto atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        vc::lasagna::LasagnaDataset dataset =
-            vc::lasagna::LasagnaDataset::open(manifestPath);
-        vc::lasagna::LasagnaNormalSampler sampler(dataset);
-        (void)vc::atlas::ensureAtlasPredSnapAttachments(atlasDir, volpkgRoot, sampler);
-        atlas = vc::atlas::Atlas::load(atlasDir, volpkgRoot);
-        _currentAtlasDir = atlasDir;
-        _currentAtlasName = atlas.metadata.name;
-        if (_lineAnnotationController) {
-            _lineAnnotationController->setCurrentAtlasDirectory(_currentAtlasDir);
-        }
-        if (_segmentationWidget && _segmentationWidget->lasagnaPanel()) {
-            _segmentationWidget->lasagnaPanel()->setSelectedAtlasPath(
-                QString::fromStdString(atlasDir.string()));
-        }
-        const std::filesystem::path basePath = atlasDir / atlas.metadata.baseMeshPath;
-        auto baseSurface = std::make_shared<QuadSurface>(basePath);
-        const auto* points = baseSurface->rawPointsPtr();
-        if (!points || points->empty() || points->cols <= 0) {
-            throw std::runtime_error("atlas base mesh has no valid grid");
-        }
-        const cv::Vec2f baseScale = baseSurface->scale();
-        if (!std::isfinite(baseScale[0]) || !std::isfinite(baseScale[1]) ||
-            baseScale[0] <= 0.0f || baseScale[1] <= 0.0f) {
-            throw std::runtime_error("atlas base mesh has invalid scale");
-        }
-
-        const int periodColumns = vc::atlas::atlasHorizontalPeriodColumns(*baseSurface);
-        (void)vc::atlas::layoutAtlasObjects(atlas, periodColumns);
-        const vc::atlas::AtlasDisplayRange displayRange =
-            vc::atlas::atlasDisplayRange(atlas, periodColumns);
-        std::shared_ptr<QuadSurface> displaySurface =
-            vc::atlas::repeatedAtlasDisplaySurface(*baseSurface,
-                                                   displayRange.unwrapCount,
-                                                   atlas.metadata.zeroWindingColumn);
-        displaySurface->id = ATLAS_INTERNAL_SURFACE_NAME;
-        if (_state) {
-            _state->setSurface(ATLAS_INTERNAL_SURFACE_NAME, displaySurface);
-        }
-
-        if (!_atlasOverlay) {
-            _atlasOverlay = std::make_unique<AtlasOverlayController>(this);
-        }
-        if (_atlasViewer) {
-            _atlasOverlay->attachViewer(_atlasViewer);
-        }
-        _atlasOverlay->setAtlas(atlas, displaySurface, displayRange);
-        clearAtlasSearchPreviewState();
-        for (auto* dock : {_atlasSearchDock, _atlasWorkspaceSearchDock}) {
-            if (!dock || !dock->widget()) {
-                continue;
-            }
-            if (auto* tree = dock->widget()->findChild<QTreeWidget*>(QStringLiteral("atlasSearchResultTree"))) {
-                tree->clear();
-            }
-            if (auto* progress = dock->widget()->findChild<QProgressBar*>(QStringLiteral("atlasSearchProgressBar"))) {
-                progress->setRange(0, 100);
-                progress->setValue(0);
-                progress->setFormat(QString());
-            }
-        }
-
-        if (_atlasViewer) {
-            if (const auto bounds = _atlasOverlay->surfaceBounds()) {
-                _atlasViewer->centerOnSurfacePoint({
-                    static_cast<float>(bounds->center().x()),
-                    static_cast<float>(bounds->center().y()),
-                }, false);
-            } else {
-                _atlasViewer->fitSurfaceInView();
-            }
-        }
-        refreshAtlasOverviewDocks();
-        updateAtlasFiberDocks();
-        updateAtlasSearchDocks();
-        if (_workspaceTabs && _atlasWorkspaceWindow) {
-            _workspaceTabs->setCurrentWidget(_atlasWorkspaceWindow);
-        }
-        if (statusBar()) {
-            statusBar()->showMessage(tr("Displayed atlas %1")
-                                         .arg(QString::fromStdString(atlas.metadata.name)),
-                                     3000);
-        }
-    } catch (const std::exception& ex) {
-        if (vc::atlas::atlasLoadErrorRequiresRebuild(ex)) {
-            const auto choice = QMessageBox::question(
-                this,
-                tr("Atlas Rebuild Required"),
-                tr("This atlas was saved with an older or stale mapping format and must be rebuilt "
-                   "from its unchanged source fiber JSON using the selected Lasagna normal dataset.\n\n"
-                   "Rebuild now?"),
-                QMessageBox::Yes | QMessageBox::No,
-                QMessageBox::No);
-            if (choice != QMessageBox::Yes) {
-                return;
-            }
-            try {
-                auto vpkg = _state ? _state->vpkg() : nullptr;
-                if (!vpkg) {
-                    throw std::runtime_error("No volume package is loaded");
-                }
-                const std::filesystem::path manifestPath = vpkg->selectedLasagnaDatasetPath();
-                if (manifestPath.empty()) {
-                    throw std::runtime_error("No local Lasagna normal dataset is selected");
-                }
-                if (!std::filesystem::exists(manifestPath)) {
-                    throw std::runtime_error("Selected Lasagna normal dataset does not exist");
-                }
-                const std::filesystem::path volpkgRoot = vpkg->path().empty()
-                    ? std::filesystem::path{}
-                    : vpkg->path().parent_path();
-                vc::lasagna::LasagnaDataset dataset =
-                    vc::lasagna::LasagnaDataset::open(manifestPath);
-                vc::lasagna::LasagnaNormalSampler sampler(dataset);
-                if (!sampler.hasPredDtChannel()) {
-                    throw std::runtime_error(
-                        "Selected Lasagna dataset has no pred_dt channel; atlas pred-snap attachments are required");
-                }
-                vc::atlas::rebuildAtlasFromSourceFibers(
-                    atlasDir, volpkgRoot, sampler);
-                displayAtlasFromDirectory(atlasDir);
-            } catch (const std::exception& rebuildEx) {
-                QMessageBox::warning(
-                    this,
-                    tr("Atlas Rebuild"),
-                    tr("Could not rebuild atlas: %1")
-                        .arg(QString::fromStdString(rebuildEx.what())));
-            }
-            return;
-        }
-        QMessageBox::warning(this,
-                             tr("Atlas"),
-                             tr("Could not display atlas: %1").arg(QString::fromStdString(ex.what())));
     }
 }
 
@@ -5365,91 +2665,108 @@ void CWindow::CreateWidgets(void)
 
     // add volume viewer
     auto aWidgetLayout = new QVBoxLayout;
+    aWidgetLayout->setContentsMargins(0, 0, 0, 0);
+    aWidgetLayout->setSpacing(0);
     ui.tabSegment->setLayout(aWidgetLayout);
 
-    mdiArea = new QMdiArea(ui.tabSegment);
-    aWidgetLayout->addWidget(mdiArea);
+    mdiArea = nullptr;
 
-    // Ensure the viewer's graphics view gets focus when subwindow is activated
-    connect(mdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-        if (subWindow) {
-            if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                if (auto* graphicsView = viewer->graphicsView()) {
-                    graphicsView->setFocus();
-                }
-            }
-        }
-    });
+    auto* viewerGrid = new ViewerSplitGrid(ui.tabSegment);
+    viewerGrid->setObjectName(QStringLiteral("mainViewerSplitGrid"));
+    aWidgetLayout->addWidget(viewerGrid, 1);
 
     {
-        newConnectedViewer("seg xz", tr("Segmentation XZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("seg yz", tr("Segmentation YZ"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("xy plane", tr("XY / Slices"), mdiArea)->setIntersects({"segmentation"});
-        newConnectedViewer("segmentation", tr("Surface"), mdiArea)->setIntersects({"seg xz","seg yz"});
-    }
-    mdiArea->tileSubWindows();
-
-    if (_fiberSliceWorkspaceWindow) {
-        _fiberSliceMdiArea = new QMdiArea(_fiberSliceWorkspaceWindow);
-        _fiberSliceMdiArea->setObjectName(QStringLiteral("fiberSliceMdiArea"));
-        _fiberSliceWorkspaceWindow->setCentralWidget(_fiberSliceMdiArea);
-        connect(_fiberSliceMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-            if (subWindow) {
-                if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                    if (auto* graphicsView = viewer->graphicsView()) {
-                        graphicsView->setFocus();
-                    }
-                }
-            }
-        });
+        resetSegmentationViews(false);
+        applyMainViewerLayout(viewerGrid, _viewerManager.get());
+        viewerGrid->setSplits(settings.value(MAIN_VIEWER_SPLIT_X_SETTING, 0.5).toDouble(),
+                              settings.value(MAIN_VIEWER_SPLIT_Y_SETTING, 0.5).toDouble());
     }
 
-    if (_intersectionsWorkspaceWindow) {
-        _intersectionsMdiArea = new QMdiArea(_intersectionsWorkspaceWindow);
-        _intersectionsMdiArea->setObjectName(QStringLiteral("intersectionsMdiArea"));
-        _intersectionsWorkspaceWindow->setCentralWidget(_intersectionsMdiArea);
-        connect(_intersectionsMdiArea, &QMdiArea::subWindowActivated, [](QMdiSubWindow* subWindow) {
-            if (subWindow) {
-                if (auto* viewer = dynamic_cast<VolumeViewerBase*>(subWindow->widget())) {
-                    if (auto* graphicsView = viewer->graphicsView()) {
-                        graphicsView->setFocus();
-                    }
-                }
-            }
-        });
-
-    }
-
-    createAtlasWorkspace();
+    viewerGrid->onSplitChanged = [viewerGrid]() {
+        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        settings.setValue(MAIN_VIEWER_SPLIT_X_SETTING, viewerGrid->splitX());
+        settings.setValue(MAIN_VIEWER_SPLIT_Y_SETTING, viewerGrid->splitY());
+    };
 
     treeWidgetSurfaces = ui.treeWidgetSurfaces;
     treeWidgetSurfaces->setSelectionMode(QAbstractItemView::ExtendedSelection);
-    btnReloadSurfaces = ui.btnReloadSurfaces;
+
+    // The surface list reads the surfaces' store for the current volume.
+    _surfaceCatalog = std::make_unique<SurfaceCatalog>(_state->objectStoreSession(), this);
+    if (_inkDetectionOverlay) {
+        _inkDetectionOverlay->setSurfaceCatalog(_surfaceCatalog.get());
+    }
+    auto updateSurfaceSource = [this]() {
+        _surfaceCatalog->setSource(_state->storeFor("surface"), _state->currentVolume(),
+                                   _state->annotationVolume().value_or(vc::project::AnnotationVolume{}));
+        LasagnaServiceManager::instance().setObjectStore(_state->objectStoreSession(), _state->storeFor("surface"));
+    };
+    connect(_state, &CState::objectStoreChanged, _surfaceCatalog.get(),
+            [this, updateSurfaceSource](const vc::objects::StoreSessionEvent& event) {
+                using Kind = vc::objects::StoreSessionEvent::Kind;
+                if (event.kind == Kind::Attached || event.kind == Kind::Detached) updateSurfaceSource();
+                else _surfaceCatalog->handle(event);
+            });
+    connect(_state, &CState::volumeChanged, _surfaceCatalog.get(), [updateSurfaceSource]() { updateSurfaceSource(); });
+    connect(_state, &CState::storeRoutesChanged, _surfaceCatalog.get(), [updateSurfaceSource]() { updateSurfaceSource(); });
 
     SurfacePanelController::UiRefs surfaceUi{
         .treeWidget = treeWidgetSurfaces,
-        .reloadButton = btnReloadSurfaces,
     };
     _surfacePanel = std::make_unique<SurfacePanelController>(
         surfaceUi,
         _state,
+        _surfaceCatalog.get(),
         _viewerManager.get(),
         [this]() { return segmentationViewer(); },
-        std::function<void()>{},
         this);
+    _storeSurfaceOverlay = std::make_unique<StoreSurfaceOverlayController>(_state, _viewerManager.get(), this);
+    connect(_surfacePanel.get(), &SurfacePanelController::visibleSurfacesChanged,
+            _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setSurfaces);
+    connect(_surfacePanel.get(), &SurfacePanelController::highlightedSurfacesChanged,
+            _storeSurfaceOverlay.get(), &StoreSurfaceOverlayController::setHighlighted);
+    // Another client, tool or service changed the open surface: reopen it, unless
+    // it is being edited (its edits continue from their own revisions).
+    connect(_surfaceCatalog.get(), &SurfaceCatalog::surfacesCommitted, this, [this](const std::vector<std::string>& uuids) {
+        const auto active = _state->activeSurface().lock();
+        const auto* row = active ? _surfaceCatalog->row(active->id) : nullptr;
+        if (!row || std::find(uuids.begin(), uuids.end(), active->id) == uuids.end()) {
+            return;
+        }
+        auto known = _segmentationModule ? _segmentationModule->storePin(active.get()) : std::nullopt;
+        if (!known && _surfacePanel->opened()) known = _surfacePanel->opened()->pin;
+        const auto head = _surfaceCatalog->session()->currentObject(row->source, active->id);
+        if (!head || (known && known->version == head->version && known->generation == head->generation)) {
+            return;
+        }
+        if (_segmentationModule && _segmentationModule->editingEnabled()) {
+            showStatusBarMessage(tr("This surface changed in the object store while you edit it; your saves will be refused until you reopen it."), 15000);
+            return;
+        }
+        _surfacePanel->activateSurfaceById(active->id);
+    });
+    if (_viewerManager) {
+        _viewerManager->setSurfacePicker([this](const cv::Vec3f& point, float tolerance) -> std::optional<std::string> {
+            const auto active = _state->surface("segmentation");
+            if (!_surfaceCatalog->volume()) return std::nullopt;
+            vc::objects::SurfaceProximityQuery query;
+            query.point = {point[0], point[1], point[2]};
+            query.tolerance = tolerance;
+            query.uuids = _surfacePanel->visibleSurfaceIds();
+            query.volume = _surfaceCatalog->volume()->id();
+            for (const auto& [attachment, hit] : _surfaceCatalog->session()->nearestSurfaces(_surfaceCatalog->sources(), query))
+                if (!active || hit.objectUuid != active->id) return hit.objectUuid;
+            return std::nullopt;
+        });
+    }
     if (_segmentationGrower) {
         _segmentationGrower->setSurfacePanel(_surfacePanel.get());
     }
     if (_lineAnnotationController) {
         _lineAnnotationController->setSurfacePanel(_surfacePanel.get());
     }
-    connect(_surfacePanel.get(), &SurfacePanelController::surfacesLoaded, this, [this]() {
+    connect(_surfaceCatalog.get(), &SurfaceCatalog::rowsChanged, this, [this]() {
         emit _state->surfacesLoaded();
-        // Update surface overlay dropdown when surfaces are loaded
-        updateSurfaceOverlayDropdown();
-        if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
     });
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceSelectionCleared, this, [this]() {
         clearSurfaceSelection();
@@ -5457,18 +2774,22 @@ void CWindow::CreateWidgets(void)
     connect(_surfacePanel.get(), &SurfacePanelController::filtersApplied, this, [this](int filterCount) {
         UpdateVolpkgLabel(filterCount);
     });
-    connect(_surfacePanel.get(), &SurfacePanelController::copySegmentPathRequested,
+    connect(_surfacePanel.get(), &SurfacePanelController::addSurfaceToSpiralFitRequested,
             this, [this](const QString& segmentId) {
-                if (!_state->vpkg()) {
+                if (!_spiralWorkspace) {
                     return;
                 }
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
-                if (!surf) {
+                std::shared_ptr<QuadSurface> surf;
+                try {
+                    surf = _surfaceCatalog->open(segmentId.toStdString()).surface;
+                } catch (const std::exception&) {
+                }
+                if (!surf || surf->path.empty()) {
+                    showStatusBarMessage(tr("Cannot resolve an on-disk TIFXYZ directory for %1").arg(segmentId), 5000);
                     return;
                 }
-                const QString path = absoluteSegmentPathForClipboard(surf->path, _state->vpkg());
-                QApplication::clipboard()->setText(path);
-                statusBar()->showMessage(tr("Copied segment path to clipboard: %1").arg(path), 3000);
+                _spiralWorkspace->addPatchToCurrentFit(
+                    QString::fromStdString(surf->path.string()), surf);
             });
     connect(_surfacePanel.get(), &SurfacePanelController::renderSegmentRequested,
             this, [this](const QString& segmentId) {
@@ -5486,25 +2807,10 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onResumeLocalGrowPatchRequested(segmentId);
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::reloadFromBackupRequested,
-            this, [this](const QString& segmentId, int backupIndex) {
-                _segmentationCommandHandler->onReloadFromBackup(segmentId, backupIndex);
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::convertToObjRequested,
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onConvertToObj(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergeTifxyzRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergeTifxyz(segmentIds);
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::mergePatchRequested,
-            this, [this](const QStringList& segmentIds) {
-                _segmentationCommandHandler->onMergePatch(segmentIds);
-            });
-    // Note: the Actions -> Merge tifxyz... menu wiring lives in the
-    // constructor after _menuController is initialized -- _menuController
-    // is null inside CreateWidgets().
     connect(_surfacePanel.get(), &SurfacePanelController::visLasagnaObjRequested,
             this, [this](const QString& segmentId) {
                 onVisLasagnaObj(segmentId.toStdString());
@@ -5527,8 +2833,20 @@ void CWindow::CreateWidgets(void)
             });
     connect(_surfacePanel.get(), &SurfacePanelController::focusSurfaceRequested,
             this, [this](const QString& segmentId) {
-                if (!_state || !_state->vpkg()) return;
-                auto surf = _state->vpkg()->getSurface(segmentId.toStdString());
+                if (!_state) return;
+                const std::string id = segmentId.toStdString();
+                auto surf = std::dynamic_pointer_cast<QuadSurface>(_state->surface(id));
+                if (const auto& opened = _surfacePanel->opened(); !surf && opened && opened->surface->id == id) {
+                    surf = opened->surface;
+                }
+                if (!surf && _surfaceCatalog) {
+                    try {
+                        surf = _surfaceCatalog->open(id).surface;
+                    } catch (const std::exception& error) {
+                        showStatusBarMessage(tr("Cannot focus %1: %2").arg(segmentId, QString::fromUtf8(error.what())), 5000);
+                        return;
+                    }
+                }
                 auto* quad = dynamic_cast<QuadSurface*>(surf.get());
                 if (!quad) return;
                 const auto focusPoint = findSegmentFocusPoint(*quad);
@@ -5559,66 +2877,9 @@ void CWindow::CreateWidgets(void)
             this, [this](const QString& segmentId) {
                 _segmentationCommandHandler->onSlimFlatten(segmentId.toStdString());
             });
-    connect(_surfacePanel.get(), &SurfacePanelController::straightenRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onStraighten(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::abfFlattenRequested,
-            this, [this](const QString& segmentId) {
-                _segmentationCommandHandler->onABFFlatten(segmentId.toStdString());
-            });
-    connect(_surfacePanel.get(), &SurfacePanelController::exportTifxyzChunksRequested,
-        this, [this](const QString& segmentId) {
-            _segmentationCommandHandler->onExportWidthChunks(segmentId.toStdString());
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::rasterizeSegmentsRequested,
-        this, [this](const QStringList& segmentIds) {
-            _segmentationCommandHandler->onRasterizeSegments(segmentIds);
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::addIgnoreLabelRequested,
-        this, [this]() {
-            _segmentationCommandHandler->onAddIgnoreLabel();
-        });
-    connect(_surfacePanel.get(), &SurfacePanelController::recalcAreaRequested,
-            this, [this](const QStringList& segmentIds) {
-                if (segmentIds.isEmpty()) return;
-                std::vector<std::string> ids;
-                ids.reserve(segmentIds.size());
-                for (const auto& id : segmentIds) {
-                    ids.push_back(id.toStdString());
-                }
-                auto results = SurfaceAreaCalculator::calculateAreas(_state->vpkg(), _state->currentVolume(), ids);
-                int okCount = 0, failCount = 0;
-                QStringList skippedIds;
-                for (const auto& r : results) {
-                    if (r.success) {
-                        ++okCount;
-                        // Update tree widget
-                        QTreeWidgetItemIterator it(treeWidgetSurfaces);
-                        while (*it) {
-                            if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == r.segmentId) {
-                                (*it)->setText(2, QString::number(r.areaCm2, 'f', 3));
-                                break;
-                            }
-                            ++it;
-                        }
-                    } else {
-                        ++failCount;
-                        skippedIds << QString::fromStdString(r.segmentId + " (" + r.errorReason + ")");
-                    }
-                }
-                if (okCount > 0) {
-                    statusBar()->showMessage(
-                        tr("Recalculated area for %1 segment(s).").arg(okCount), 5000);
-                }
-                if (failCount > 0) {
-                    QMessageBox::warning(this, tr("Area Recalculation"),
-                        tr("Updated: %1\nSkipped: %2\n\n%3").arg(okCount).arg(failCount).arg(skippedIds.join("\n")));
-                }
-            });
     connect(_surfacePanel.get(), &SurfacePanelController::statusMessageRequested,
             this, [this](const QString& message, int timeoutMs) {
-                statusBar()->showMessage(message, timeoutMs);
+                showStatusBarMessage(message, timeoutMs);
             });
 
     const auto attachScrollAreaToDock = [](QDockWidget* dock, QWidget* content, const QString& objectName) {
@@ -5664,6 +2925,7 @@ void CWindow::CreateWidgets(void)
     {
         auto* panel = _segmentationWidget->lasagnaPanel();
         panel->setState(_state);
+        panel->setSurfaceCatalog(_surfaceCatalog.get());
         panel->setVisible(true);
         _lasagnaWorkspaceWindow->setCentralWidget(panel);
 
@@ -5676,15 +2938,17 @@ void CWindow::CreateWidgets(void)
         connect(panel, &SegmentationLasagnaPanel::openLasagnaWorkspaceRequested,
                 this, &CWindow::switchToLasagnaWorkspace);
         connect(panel, &SegmentationLasagnaPanel::lasagnaOutputActivated,
-                this, &CWindow::selectLasagnaOutputSegment);
+                this, &CWindow::selectLasagnaOutputSurface);
     }
 
     _segmentationEdit = std::make_unique<SegmentationEditManager>(this);
     _segmentationEdit->setViewerManager(_viewerManager.get());
     _segmentationOverlay = std::make_unique<SegmentationOverlayController>(_state, this);
-    _segmentationOverlay->setEditManager(_segmentationEdit.get());
     _segmentationOverlay->setViewerManager(_viewerManager.get());
     _surfaceRotationOverlay = std::make_unique<SurfaceRotationOverlayController>(_state, this);
+    _surfaceRotationOverlay->setSaver([this](QuadSurface* surface) {
+        return _segmentationModule && _segmentationModule->saveSurface(surface);
+    });
     _surfaceRotationOverlay->setViewerManager(_viewerManager.get());
 
     _segmentationModule = std::make_unique<SegmentationModule>(
@@ -5696,6 +2960,24 @@ void CWindow::CreateWidgets(void)
         _state->pointCollection(),
         _segmentationWidget->isEditingEnabled(),
         this);
+    _segmentationModule->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        // Continue editing in the store the surface was opened from.
+        QString error;
+        if (surface && _surfacePanel && !_surfacePanel->prepareSurfaceEditing(surface->id, &error)) {
+            showStatusBarMessage(error, 15000);
+            return false;
+        }
+        return !_spiralWorkspace || _spiralWorkspace->prepareManagedPatch(surface);
+    });
+    // Edits of the active surface commit to the store object it was opened from.
+    _segmentationModule->setStorePinResolver([this](const QuadSurface* surface) -> std::optional<SegmentationModule::StoreOrigin> {
+        const auto& opened = _surfacePanel ? _surfacePanel->opened() : std::nullopt;
+        // By id: transforms and edit previews publish copies of the opened surface.
+        if (opened && surface && opened->surface->id == surface->id && opened->editable)
+            return SegmentationModule::StoreOrigin{opened->pin, opened->view};
+        return std::nullopt;
+    });
+
 
     if (_segmentationModule && _planeSlicingOverlay) {
         QPointer<PlaneSlicingOverlayController> overlayPtr(_planeSlicingOverlay.get());
@@ -5727,15 +3009,8 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSegmentationStopToolsRequested);
     connect(_segmentationModule.get(), &SegmentationModule::growthInProgressChanged,
             this, &CWindow::onSegmentationGrowthStatusChanged);
-    connect(_segmentationModule.get(), &SegmentationModule::focusPoiRequested,
-            this, [this](const cv::Vec3f& position, QuadSurface* base) {
-                Q_UNUSED(position);
-                _axisAlignedSliceController->applyOrientation(base);
-            });
     connect(_segmentationModule.get(), &SegmentationModule::growSurfaceRequested,
             this, &CWindow::onGrowSegmentationSurface);
-    connect(_segmentationModule.get(), &SegmentationModule::approvalMaskSaved,
-            _fileWatcher.get(), &FileWatcherService::markSegmentRecentlyEdited);
 
     SegmentationGrower::Context growerContext{
         _segmentationModule.get(),
@@ -5746,7 +3021,7 @@ void CWindow::CreateWidgets(void)
     SegmentationGrower::UiCallbacks growerCallbacks{
         [this](const QString& text, int timeout) {
             if (statusBar()) {
-                statusBar()->showMessage(text, timeout);
+                showStatusBarMessage(text, timeout);
             }
         },
         [this](QuadSurface* surface) {
@@ -5756,43 +3031,29 @@ void CWindow::CreateWidgets(void)
     _segmentationGrower = std::make_unique<SegmentationGrower>(growerContext, growerCallbacks, this);
 
     _segmentationCommandHandler = std::make_unique<SegmentationCommandHandler>(this, _state, this);
+    _segmentationCommandHandler->setEditingDestinationResolver([this](const std::shared_ptr<QuadSurface>& surface) {
+        return _segmentationModule->prepareEditingDestination(surface);
+    });
+    _segmentationCommandHandler->setSurfaceSaver([this](QuadSurface* surface) {
+        return _segmentationModule && _segmentationModule->saveSurface(surface);
+    });
     _segmentationCommandHandler->setCmdRunner(_cmdRunner);
     _segmentationCommandHandler->setSurfacePanel(_surfacePanel.get());
     _segmentationCommandHandler->setSegmentationGrower(_segmentationGrower.get());
     initializeCommandLineRunner();
-    _segmentationCommandHandler->setIsEditingCheck([this]() -> bool {
-        return _segmentationModule && _segmentationModule->isEditingApprovalMask();
-    });
-    _segmentationCommandHandler->setClearSelectionCallback([this]() {
-        clearSurfaceSelection();
-    });
-    _segmentationCommandHandler->setRestoreSelectionCallback([this](const std::string& id) {
-        if (treeWidgetSurfaces) {
-            QTreeWidgetItemIterator it(treeWidgetSurfaces);
-            while (*it) {
-                if ((*it)->data(SURFACE_ID_COLUMN, Qt::UserRole).toString().toStdString() == id) {
-                    treeWidgetSurfaces->setCurrentItem(*it);
-                    break;
-                }
-                ++it;
-            }
-        }
-    });
-    _segmentationCommandHandler->setNormal3dZarrPathGetter([this]() -> QString {
-        return _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString();
+    _segmentationCommandHandler->setNormalGridPathGetter([this]() -> QString {
+        updateNormalGridAvailability();
+        return _normalGridPath;
     });
     connect(_segmentationCommandHandler.get(), &SegmentationCommandHandler::statusMessage,
             this, &CWindow::onShowStatusMessage);
 
-    _fileWatcher->setSurfacePanel(_surfacePanel.get());
-    _fileWatcher->setSegmentationModule(_segmentationModule.get());
-    _fileWatcher->setTreeWidget(treeWidgetSurfaces);
 
     connect(_segmentationWidget, &SegmentationWidget::copyWithNtRequested,
             this, &CWindow::onCopyWithNtRequested);
     connect(_segmentationWidget, &SegmentationWidget::volumeSelectionChanged, this, [this](const QString& volumeId) {
         if (!_state->vpkg()) {
-            statusBar()->showMessage(tr("No volume package loaded."), 4000);
+            showStatusBarMessage(tr("No volume package loaded."), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->segmentationGrowthVolumeId().empty()
                                                                    ? _state->segmentationGrowthVolumeId()
@@ -5810,9 +3071,9 @@ void CWindow::CreateWidgets(void)
             if (_segmentationWidget && vol) {
                 _segmentationWidget->setVolumeZarrPath(QString::fromStdString(vol->path().string()));
             }
-            statusBar()->showMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
+            showStatusBarMessage(tr("Using volume '%1' for surface growth.").arg(volumeId), 2500);
         } catch (const std::out_of_range&) {
-            statusBar()->showMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
+            showStatusBarMessage(tr("Volume '%1' not found in this package.").arg(volumeId), 4000);
             if (_segmentationWidget) {
                 const QString fallbackId = QString::fromStdString(!_state->currentVolumeId().empty()
                                                                    ? _state->currentVolumeId()
@@ -5841,43 +3102,24 @@ void CWindow::CreateWidgets(void)
 
     connect(_segmentationWidget, &SegmentationWidget::lasagnaStopRequested, this, [this]() {
         LasagnaServiceManager::instance().stopOptimization();
-        statusBar()->showMessage(tr("Lasagna optimization stop requested."), 3000);
+        showStatusBarMessage(tr("Lasagna optimization stop requested."), 3000);
     });
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStarted,
-            this, &CWindow::updateAtlasFiberDocks);
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::serviceStopped,
-            this, &CWindow::updateAtlasFiberDocks);
 
-    // Add only the segments placed by lasagna instead of rescanning every surface.
-    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::resultsPlaced,
-            this, [this](const QString& outputDir, const QStringList& segmentNames) {
-        statusBar()->showMessage(
-            tr("Lasagna optimization finished. Added %1 segment(s) from %2")
-                .arg(segmentNames.size())
-                .arg(outputDir), 5000);
-        if (_surfacePanel) {
-            for (const QString& segmentName : segmentNames) {
-                _surfacePanel->addSingleSegmentation(segmentName.toStdString());
-            }
-            _surfacePanel->refreshFiltersOnly();
-        }
-        // corr_points_results will be loaded when the new segment is activated
+    // The new surfaces reach the surface list through the store's commit events.
+    connect(&LasagnaServiceManager::instance(), &LasagnaServiceManager::optimizationFinished,
+            this, [this](const QStringList& surfaceUuids) {
+        showStatusBarMessage(tr("Lasagna optimization finished: %1 new surface(s)").arg(surfaceUuids.size()), 5000);
     });
 
     // Create Seeding widget
     _seedingWidget = new SeedingWidget(_state->pointCollection(), _state);
+    _seedingWidget->setSurfaceCatalog(_surfaceCatalog.get());
     _seedingWidget->setViewerManager(_viewerManager.get());
     attachScrollAreaToDock(ui.dockWidgetDistanceTransform, _seedingWidget, QStringLiteral("dockWidgetDistanceTransformContent"));
 
     _seedingWidget->setState(_state);
     connect(_state, &CState::volumeChanged, _seedingWidget,
             static_cast<void (SeedingWidget::*)(std::shared_ptr<Volume>, const std::string&)>(&SeedingWidget::onVolumeChanged));
-    connect(_state, &CState::volumeChanged, this,
-            [this](std::shared_ptr<Volume>, const std::string&) {
-                if (_surfaceAffineTransforms) {
-                    _surfaceAffineTransforms->refresh();
-                }
-            });
     connect(_seedingWidget, &SeedingWidget::sendStatusMessageAvailable, this, &CWindow::onShowStatusMessage);
     connect(_state, &CState::surfacesLoaded, _seedingWidget, &SeedingWidget::onSurfacesLoaded);
 
@@ -5900,48 +3142,6 @@ void CWindow::CreateWidgets(void)
     _point_collection_widget->setObjectName("pointCollectionDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _point_collection_widget);
 
-    _atlasControlDock = new AtlasControlPointsDock(this);
-    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _atlasControlDock);
-    connect(_atlasControlDock, &AtlasControlPointsDock::resultsChanged,
-            this, [this](const AtlasControlPointResults& results) {
-                if (_atlasControlOverlay) {
-                    _atlasControlOverlay->setResults(results);
-                    _atlasControlOverlay->setOverlayEnabled(_atlasControlDock && _atlasControlDock->overlayChecked());
-                }
-            });
-    connect(_atlasControlDock, &AtlasControlPointsDock::overlayToggled,
-            this, [this](bool enabled) {
-                if (_atlasControlOverlay) {
-                    _atlasControlOverlay->setOverlayEnabled(enabled);
-                }
-            });
-    connect(_atlasControlDock, &AtlasControlPointsDock::controlPointSelected,
-            this, [this](const AtlasControlPointResult& point) {
-                if (_atlasControlOverlay) {
-                    _atlasControlOverlay->setSelectedPoint(point.fiberId, point.controlIndex);
-                }
-            });
-    connect(_atlasControlDock, &AtlasControlPointsDock::controlPointActivated,
-            this, [this](const AtlasControlPointResult& point) {
-                if (_atlasControlOverlay) {
-                    _atlasControlOverlay->setSelectedPoint(point.fiberId, point.controlIndex);
-                }
-                const cv::Vec3f* focusPoint = nullptr;
-                if (isFiniteVec3(point.snapTargetXyz)) {
-                    focusPoint = &point.snapTargetXyz;
-                } else if (isFiniteVec3(point.meshXyz)) {
-                    focusPoint = &point.meshXyz;
-                }
-
-                if (focusPoint) {
-                    const std::string sourceId = _state ? _state->activeSurfaceId() : std::string{};
-                    centerFocusAt(*focusPoint, cv::Vec3f(0.0f, 0.0f, 0.0f), sourceId);
-                    recenterPlaneViewersOn(*focusPoint);
-                } else if (const auto surfacePoint = atlasControlGridToSurface(segmentationBaseViewer(), point)) {
-                    centerViewerOnSurfacePointForNavigation(segmentationBaseViewer(), *surfacePoint);
-                }
-            });
-
     // Selection dock (removed per request; selection actions remain in the menu)
     if (_viewerManager) {
         for (auto* viewer : _viewerManager->baseViewers()) {
@@ -5954,9 +3154,23 @@ void CWindow::CreateWidgets(void)
     }
     connect(_point_collection_widget, &CPointCollectionWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
     connect(_point_collection_widget, &CPointCollectionWidget::convertPointToAnchorRequested, this, &CWindow::onConvertPointToAnchor);
-    connect(_point_collection_widget, &CPointCollectionWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_point_collection_widget, &CPointCollectionWidget::focusCollectionRequested,
+            this, [this](uint64_t collectionId) {
+                onFocusViewsRequested(collectionId, std::nullopt);
+            });
+    connect(_point_collection_widget, &CPointCollectionWidget::focusPointRequested,
+            this, [this](vc::PointRef point) {
+                onFocusViewsRequested(point.collectionId, point);
+            });
     connect(_wrapAnnotationWidget, &WrapAnnotationWidget::pointDoubleClicked, this, &CWindow::onPointDoubleClicked);
-    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusViewsRequested, this, &CWindow::onFocusViewsRequested);
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusCollectionRequested,
+            this, [this](uint64_t collectionId) {
+                onFocusViewsRequested(collectionId, std::nullopt);
+            });
+    connect(_wrapAnnotationWidget, &WrapAnnotationWidget::focusPointRequested,
+            this, [this](vc::PointRef point) {
+                onFocusViewsRequested(point.collectionId, point);
+            });
     if (_pointsOverlay) {
         _pointsOverlay->setViewTolerance(_point_collection_widget->pointViewTolerance());
         connect(_point_collection_widget, &CPointCollectionWidget::pointViewToleranceChanged,
@@ -5972,27 +3186,25 @@ void CWindow::CreateWidgets(void)
             _point_collection_widget, &CPointCollectionWidget::setAnnotateChecked);
     connect(_segmentationModule.get(), &SegmentationModule::annotationPointSelected,
             _point_collection_widget, &CPointCollectionWidget::selectPoint);
+    connect(_segmentationModule.get(), &SegmentationModule::annotationSelectionCleared,
+            _point_collection_widget, &CPointCollectionWidget::clearSelection);
     connect(_segmentationModule.get(), &SegmentationModule::annotationCollectionSelected,
             _point_collection_widget, &CPointCollectionWidget::selectCollection);
     connect(_point_collection_widget, &CPointCollectionWidget::collectionSelected,
             _segmentationModule.get(), &SegmentationModule::setSelectedAnnotationCollection);
-
-    // Create fiber annotation controller and dock
-    _fiberController = std::make_unique<FiberAnnotationController>(
-        _state, _state->pointCollection(), this);
-    _fiberController->setMdiArea(mdiArea);
+    connect(_point_collection_widget, &CPointCollectionWidget::collectionSelectionCleared,
+            _segmentationModule.get(), &SegmentationModule::clearSelectedAnnotationCollection);
 
     _fiberWidget = new CFiberWidget(this);
     _fiberWidget->setObjectName("fiberDock");
     _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _fiberWidget);
 
-    if (_fiberSliceWorkspaceWindow) {
-        _fiberSliceWidget = new CFiberWidget(_fiberSliceWorkspaceWindow);
-        _fiberSliceWidget->setObjectName(QStringLiteral("fiberSliceDock"));
-        _fiberSliceWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fiberSliceWidget);
-    }
+    auto withFiberWidget = [this](auto&& apply) {
+        if (_fiberWidget) apply(_fiberWidget);
+    };
 
-    if (_lineAnnotationController) {
+    if (_lineAnnotationController && _fiberCollection) {
+        auto* collection = _fiberCollection.get();
         auto toFiberWidgetAlignment =
             [](const LineAnnotationController::FiberSummary::AlignmentMetrics& source) {
                 CFiberWidget::FiberEntry::AlignmentMetrics alignment;
@@ -6004,58 +3216,160 @@ void CWindow::CreateWidgets(void)
                 alignment.error = source.error;
                 return alignment;
             };
-        auto updateFiberList =
-            [this, toFiberWidgetAlignment](const std::vector<LineAnnotationController::FiberSummary>& fibers) {
-            std::vector<CFiberWidget::FiberEntry> entries;
-            entries.reserve(fibers.size());
-            for (const auto& fiber : fibers) {
-                CFiberWidget::FiberEntry::AlignmentMetrics alignment =
-                    toFiberWidgetAlignment(fiber.alignment);
-
-                std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
-                spans.reserve(fiber.spans.size());
-                for (const auto& span : fiber.spans) {
-                    CFiberWidget::FiberEntry::AlignmentMetrics spanAlignment =
-                        toFiberWidgetAlignment(span.alignment);
-                    spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
-                        span.spanIndex,
-                        span.firstControlIndex,
-                        span.secondControlIndex,
-                        span.controlPointCount,
-                        span.linePointCount,
-                        span.lengthVx,
-                        spanAlignment,
-                    });
-                }
-
-                entries.push_back(CFiberWidget::FiberEntry{
-                    fiber.id,
-                    fiber.name,
-                    fiber.controlPointCount,
-                    fiber.linePointCount,
-                    fiber.lengthVx,
-                    alignment,
-                    spans,
-                    fiber.hvZDistance,
-                    fiber.hvFiberLength,
-                    fiber.horizontalScore,
-                    fiber.verticalScore,
-                    fiber.automaticCertainty,
-                    fiber.automaticHvTag,
-                    fiber.manualHvTag,
-                    fiber.tags,
+        // A store catalog row as the panels list it; details load on selection.
+        auto catalogEntry = [this](const FiberCollectionController::CatalogRow& row) {
+            CFiberWidget::FiberEntry entry;
+            entry.id = _lineAnnotationController->fiberIdForUuid(row.record.uuid);
+            entry.fileName = row.record.name + ".json";
+            entry.tags = row.record.tags;
+            if (const auto& fiber = row.record.fiber) {
+                entry.controlPointCount = static_cast<int>(fiber->controlPointCount);
+                entry.linePointCount = static_cast<int>(fiber->linePointCount);
+                // The volume length the store ordered a bound row by; stored units otherwise.
+                entry.lengthVx = row.record.volumeLength.value_or(fiber->length);
+                (fiber->manualFamily ? entry.manualHvTag : entry.automaticHvTag) = fiber->family;
+            }
+            entry.linkedFiberCount = row.componentSize >= 2 ? row.componentSize : 0;
+            entry.pendingLinkCount = row.pendingLinks;
+            entry.detailsLoaded = false;
+            return entry;
+        };
+        auto detailEntry = [toFiberWidgetAlignment](const LineAnnotationController::FiberSummary& fiber) {
+            std::vector<CFiberWidget::FiberEntry::SpanEntry> spans;
+            spans.reserve(fiber.spans.size());
+            for (const auto& span : fiber.spans) {
+                spans.push_back(CFiberWidget::FiberEntry::SpanEntry{
+                    span.spanIndex,
+                    span.firstControlIndex,
+                    span.secondControlIndex,
+                    span.controlPointCount,
+                    span.linePointCount,
+                    span.lengthVx,
+                    toFiberWidgetAlignment(span.alignment),
+                    span.interpMarker,
+                    span.fiberManifest,
                 });
             }
-            if (_fiberWidget) {
-                _fiberWidget->setFibers(entries);
-                _fiberWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
+            CFiberWidget::FiberEntry::TraceState traceState =
+                CFiberWidget::FiberEntry::TraceState::Legacy;
+            switch (fiber.traceState) {
+            case vc3d::line_annotation::FiberTraceState::Predictions:
+                traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Mixed:
+                traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+                break;
+            case vc3d::line_annotation::FiberTraceState::Legacy:
+                break;
             }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setFibers(entries);
-                _fiberSliceWidget->setKnownTags(_lineAnnotationController->knownFiberTags());
-            }
-            updateAtlasFiberDocks();
+            return CFiberWidget::FiberEntry{
+                fiber.id,
+                fiber.name,
+                fiber.controlPointCount,
+                fiber.linePointCount,
+                fiber.annotatedLengthVx,
+                toFiberWidgetAlignment(fiber.alignment),
+                std::move(spans),
+                fiber.hvZDistance,
+                fiber.hvFiberLength,
+                fiber.horizontalScore,
+                fiber.verticalScore,
+                fiber.automaticCertainty,
+                fiber.automaticHvTag,
+                fiber.manualHvTag,
+                fiber.tags,
+                fiber.linkedFiberCount,
+                fiber.pendingLinkCount,
+                traceState,
+                true,
+            };
         };
+
+        connect(collection, &FiberCollectionController::catalogChanged, this,
+                [this, withFiberWidget, catalogEntry](const std::vector<FiberCollectionController::CatalogRow>& rows, bool morePages) {
+                    std::vector<CFiberWidget::FiberEntry> entries;
+                    entries.reserve(rows.size());
+                    for (const auto& row : rows) {
+                        entries.push_back(catalogEntry(row));
+                    }
+                    // Unit first, so the rebuilt rows below are texted once in it.
+                    updateFiberLengthUnits();
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    withFiberWidget([&](CFiberWidget* widget) {
+                        widget->setFibers(entries);
+                        widget->setKnownTags(tags);
+                        widget->setNextPageAvailable(morePages);
+                    });
+                });
+        connect(collection, &FiberCollectionController::fiberRevealed, this,
+                [withFiberWidget, catalogEntry](const FiberCollectionController::CatalogRow& row) {
+                    const auto entry = catalogEntry(row);
+                    withFiberWidget([&](CFiberWidget* widget) { widget->revealFiber(entry); });
+                });
+        connect(collection, &FiberCollectionController::statusChanged, this,
+                [withFiberWidget](bool attached, const QString& text) {
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setStoreStatus(attached, text); });
+                });
+        connect(collection, &FiberCollectionController::selectionChanged, this,
+                [withFiberWidget](const FiberCollectionController::Selection& selection) {
+                    withFiberWidget([&](CFiberWidget* widget) {
+                        widget->setTraceSelection(selection.text, selection.toolTip, selection.pointCount,
+                                                  selection.index, selection.openable);
+                    });
+                });
+        connect(collection, &FiberCollectionController::annotationStatusChanged, this,
+                [withFiberWidget](const QString& text) {
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setAnnotationStatus(text); });
+                });
+        connect(collection, &FiberCollectionController::panelRequested, this, [this]() {
+            if (_statusDockPanelHost) {
+                _statusDockPanelHost->showDock(_fiberWidget);
+            } else {
+                _fiberWidget->show();
+                _fiberWidget->raise();
+            }
+        });
+        connect(_lineAnnotationController.get(), &LineAnnotationController::fibersChanged, this,
+                [this, withFiberWidget]() {
+                    const auto tags = _lineAnnotationController->knownFiberTags();
+                    withFiberWidget([&](CFiberWidget* widget) { widget->setKnownTags(tags); });
+                    updateLineAnnotationLengthLabel();
+                });
+
+        withFiberWidget([&](CFiberWidget* widget) {
+            widget->setDisplayOptions(collection->options());
+            connect(widget, &CFiberWidget::fiberDetailsRequested, this,
+                    [this, withFiberWidget, detailEntry](uint64_t fiberId) {
+                        const auto summary = _lineAnnotationController->fiberSummary(fiberId);
+                        if (!summary) return;
+                        const auto entry = detailEntry(*summary);
+                        withFiberWidget([&](CFiberWidget* listed) { listed->updateFiberDetails(entry); });
+                    },
+                    Qt::QueuedConnection);
+            connect(widget, &CFiberWidget::displayOptionsChanged, this,
+                    [collection, withFiberWidget](const FiberDisplayOptions& options) {
+                        collection->setOptions(options);
+                        withFiberWidget([&](CFiberWidget* listed) { listed->setDisplayOptions(options); });
+                    });
+            // The widget's store buttons choose where fibers are kept.
+            connect(widget, &CFiberWidget::generateFibersRequested, this, [this]() {
+                if (_fiberCollection) _fiberCollection->createCollection();
+            });
+            connect(widget, &CFiberWidget::attachStoreRequested, this, [this]() {
+                if (_menuController) _menuController->attachStore(false, "fiber");
+            });
+            connect(widget, &CFiberWidget::detachStoreRequested, this, [this]() {
+                try { _state->setStoreFor("fiber", std::nullopt); }
+                catch (const std::exception& error) { showStatusBarMessage(QString::fromUtf8(error.what()), 8000); }
+            });
+            connect(widget, &CFiberWidget::firstPageRequested, collection, &FiberCollectionController::firstPage);
+            connect(widget, &CFiberWidget::nextPageRequested, collection, &FiberCollectionController::nextPage);
+            connect(widget, &CFiberWidget::fiberActivated, collection,
+                    [collection](uint64_t fiberId) { collection->activateFiber(int64_t(fiberId)); });
+            connect(widget, &CFiberWidget::traceIndexChanged, collection, &FiberCollectionController::navigate);
+            connect(widget, &CFiberWidget::openInLineAnnotationRequested, collection,
+                    [collection](uint64_t fiberId) { collection->showInLineAnnotation(int64_t(fiberId)); });
+        });
         auto updateFiberMetricRows =
             [this, toFiberWidgetAlignment](
                 uint64_t fiberId,
@@ -6073,20 +3387,7 @@ void CWindow::CreateWidgets(void)
                                                          widgetAlignment,
                                                          widgetSpanAlignments);
                 }
-                if (_fiberSliceWidget) {
-                    _fiberSliceWidget->updateAlignmentMetrics(fiberId,
-                                                              widgetAlignment,
-                                                              widgetSpanAlignments);
-                }
             };
-        auto setFiberMetricsPending = [this](bool pending) {
-            if (_fiberWidget) {
-                _fiberWidget->setAlignmentMetricsPending(pending);
-            }
-            if (_fiberSliceWidget) {
-                _fiberSliceWidget->setAlignmentMetricsPending(pending);
-            }
-        };
         auto connectFiberWidget = [this](CFiberWidget* widget) {
             if (!widget || !_lineAnnotationController) {
                 return;
@@ -6107,6 +3408,14 @@ void CWindow::CreateWidgets(void)
                     &CFiberWidget::renameFiberFileRequested,
                     _lineAnnotationController.get(),
                     &LineAnnotationController::renameFiberFile);
+            connect(widget,
+                    &CFiberWidget::importFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::importFibers);
+            connect(widget,
+                    &CFiberWidget::exportFibersRequested,
+                    _lineAnnotationController.get(),
+                    &LineAnnotationController::exportFibers);
             connect(widget,
                     &CFiberWidget::metricsCalculationRequested,
                     _lineAnnotationController.get(),
@@ -6129,67 +3438,91 @@ void CWindow::CreateWidgets(void)
                     _lineAnnotationController.get(),
                     &LineAnnotationController::recalculateFiberHvClassification);
             connect(widget,
-                    &CFiberWidget::newAtlasFromFiberRequested,
+                    &CFiberWidget::addFibersToPointCollectionsRequested,
                     _lineAnnotationController.get(),
-                    &LineAnnotationController::createAtlasFromFiber);
+                    &LineAnnotationController::addFibersToPointCollections);
             connect(widget,
-                    &CFiberWidget::fiberSliceRequested,
+                    &CFiberWidget::addFibersToSpiralFitRequested,
                     this,
-                    [this](uint64_t fiberId) {
-                        if (_fiberWidget) {
-                            _fiberWidget->selectFiber(fiberId);
+                    [this](std::vector<uint64_t> fiberIds) {
+                        if (!_spiralWorkspace || !_lineAnnotationController) {
+                            return;
                         }
-                        if (_fiberSliceWidget) {
-                            _fiberSliceWidget->selectFiber(fiberId);
-                        }
-                        switchToFiberSliceWorkspace();
-                        if (_lineAnnotationController) {
-                            _lineAnnotationController->showFiberSlice(fiberId, _fiberSliceMdiArea);
-                        }
+                        _spiralWorkspace->addFibersToCurrentFit(fiberIds);
                     });
         };
-        connect(_lineAnnotationController.get(),
-                &LineAnnotationController::fibersChanged,
-                this,
-                updateFiberList);
-        connect(_lineAnnotationController.get(),
-                &LineAnnotationController::fiberAlignmentMetricsReset,
-                this,
-                setFiberMetricsPending);
         connect(_lineAnnotationController.get(),
                 &LineAnnotationController::fiberAlignmentMetricsUpdated,
                 this,
                 updateFiberMetricRows);
         connectFiberWidget(_fiberWidget);
-        connectFiberWidget(_fiberSliceWidget);
-        updateFiberList(_lineAnnotationController->fiberSummaries());
+        // The annotation frame (and so the cm conversion) follows the
+        // current volume; the lengths themselves do not change.
+        connect(_state, &CState::volumeChanged, this,
+                [this](const std::shared_ptr<Volume>&, const std::string&) {
+                    updateFiberLengthUnits();
+                });
     }
-    connect(_fiberController.get(), &FiberAnnotationController::crosshairModeChanged,
-            this, &CWindow::onFiberCrosshairModeChanged);
-    connect(_fiberController.get(), &FiberAnnotationController::requestFiberViewers,
-            this, &CWindow::onFiberViewersRequested);
-    connect(_fiberController.get(), &FiberAnnotationController::annotationFinished,
-            this, &CWindow::onFiberAnnotationFinished);
 
     ensureDockWidgetFeatures(_fiberWidget);
     connect(_fiberWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
     connect(_fiberWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
-    ensureDockWidgetFeatures(_fiberSliceWidget);
-    if (_fiberSliceWidget) {
-        connect(_fiberSliceWidget, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
-        connect(_fiberSliceWidget, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    _scene3DDock = new QDockWidget(tr("3D Viewer"), _segmentWorkspaceWindow);
+    _scene3DDock->setObjectName(QStringLiteral("scene3DDock"));
+    auto* scenePanel = new vc3d::scene3d::Scene3DPanel(_state, _viewerManager.get(), _scene3DDock);
+    _scene3DDock->setWidget(scenePanel);
+    ensureDockWidgetFeatures(_scene3DDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::RightDockWidgetArea, _scene3DDock);
+    _scene3DDock->hide();
+    connect(_scene3DDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(_scene3DDock, &QDockWidget::visibilityChanged, this, &CWindow::scheduleWindowStateSave);
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::detachRequested, this, [this] {
+        _scene3DDock->setFloating(!_scene3DDock->isFloating());
+        _scene3DDock->show();
+        _scene3DDock->raise();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::attachVolumeRequested, this, [this] {
+        if (_menuController) _menuController->attachVolume();
+    });
+    connect(scenePanel, &vc3d::scene3d::Scene3DPanel::importSurfaceRequested, this, [this] {
+        if (_menuController) _menuController->importIntoObjectStore();
+    });
+    _fibers3DDock = new QDockWidget(tr("Fibers 3D"), _segmentWorkspaceWindow);
+    _fibers3DDock->setObjectName(QStringLiteral("fibers3DDock"));
+    _fibers3DPanel = new vc3d::fibers3d::Fiber3DPanel(
+        _state, _viewerManager.get(), _lineAnnotationController.get(),
+        _fiberCollection.get(), _fibers3DDock);
+    _fibers3DDock->setWidget(_fibers3DPanel);
+    ensureDockWidgetFeatures(_fibers3DDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _fibers3DDock);
+    // Opt in without disturbing an existing main workspace layout. restoreState()
+    // later restores this dock's saved visibility, size, and floating state.
+    _fibers3DDock->hide();
+    connect(_fibers3DDock, &QDockWidget::topLevelChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DDock, &QDockWidget::dockLocationChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DDock, &QDockWidget::visibilityChanged,
+            this, &CWindow::scheduleWindowStateSave);
+    connect(_fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::detachRequested, this, [this]() {
+        _fibers3DDock->setFloating(!_fibers3DDock->isFloating());
+        _fibers3DDock->show();
+        _fibers3DDock->raise();
+    });
+    for (CFiberWidget* widget : {_fiberWidget}) {
+        if (!widget) continue;
+        connect(_fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::nativeFiberSelected,
+                widget, &CFiberWidget::selectFiber);
+        connect(widget, &CFiberWidget::fiberSelectionChanged,
+                _fibers3DPanel, &vc3d::fibers3d::Fiber3DPanel::selectNativeFiber);
     }
-    ensureDockWidgetFeatures(_atlasWorkspaceFiberDock);
-    if (_atlasWorkspaceFiberDock) {
-        connect(_atlasWorkspaceFiberDock, &QDockWidget::topLevelChanged, this, &CWindow::scheduleWindowStateSave);
-        connect(_atlasWorkspaceFiberDock, &QDockWidget::dockLocationChanged, this, &CWindow::scheduleWindowStateSave);
-    }
+
 
     // Tab the docks - keep Segmentation, Lasagna, Seeding, Point Collections, and Fibers together
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _lasagnaDock);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, ui.dockWidgetDistanceTransform);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _point_collection_widget);
-    _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _atlasControlDock);
     _segmentWorkspaceWindow->tabifyDockWidget(ui.dockWidgetSegmentation, _fiberWidget);
 
     // Make Segmentation dock the active tab by default
@@ -6199,10 +3532,26 @@ void CWindow::CreateWidgets(void)
         .contents = ui.dockWidgetViewerControlsContents,
         .viewScrollArea = ui.scrollAreaView,
         .viewContents = ui.dockWidgetViewContents,
-        .overlayScrollArea = ui.scrollAreaOverlay,
-        .overlayContents = ui.dockWidgetOverlayContents,
-        .compositeScrollArea = ui.scrollAreaComposite,
-        .compositeContents = ui.dockWidgetCompositeContents,
+        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
+        .showSurfaceNormals = ui.chkShowSurfaceNormals,
+        .normalArrowLengthLabel = ui.labelNormalArrowLength,
+        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
+        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
+        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
+        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
+        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
+        .zoomInButton = ui.btnZoomIn,
+        .zoomOutButton = ui.btnZoomOut,
+        .volumeWindowContainer = ui.volumeWindowContainer,
+        .overlayWindowContainer = ui.overlayWindowContainer,
+        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
+    };
+    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
+                                                                 _viewerManager.get(),
+                                                                 ui.dockWidgetViewerControlsContents);
+    ViewerCompositePanel::UiRefs compositeUi{
+        .scrollArea = ui.scrollAreaComposite,
+        .contents = ui.dockWidgetCompositeContents,
         .compositeEnabled = ui.chkCompositeEnabled,
         .compositeMode = ui.cmbCompositeMode,
         .layersInFront = ui.spinLayersInFront,
@@ -6216,139 +3565,59 @@ void CWindow::CreateWidgets(void)
         .materialLabel = ui.lblMaterial,
         .material = ui.spinMaterial,
         .reverseDirection = ui.chkReverseDirection,
-        .methodScaleLabel = ui.lblMethodScale,
-        .methodScale = ui.sliderMethodScale,
-        .methodScaleValue = ui.lblMethodScaleValue,
-        .methodParamLabel = ui.lblMethodParam,
-        .methodParam = ui.sliderMethodParam,
-        .methodParamValue = ui.lblMethodParamValue,
-        .blExtinctionLabel = ui.lblBLExtinction,
-        .blExtinction = ui.spinBLExtinction,
-        .blEmissionLabel = ui.lblBLEmission,
-        .blEmission = ui.spinBLEmission,
-        .blAmbientLabel = ui.lblBLAmbient,
-        .blAmbient = ui.spinBLAmbient,
-        .lightingEnabled = ui.chkLightingEnabled,
-        .lightAzimuthLabel = ui.lblLightAzimuth,
-        .lightAzimuth = ui.spinLightAzimuth,
-        .lightElevationLabel = ui.lblLightElevation,
-        .lightElevation = ui.spinLightElevation,
-        .lightDiffuseLabel = ui.lblLightDiffuse,
-        .lightDiffuse = ui.spinLightDiffuse,
-        .lightAmbientLabel = ui.lblLightAmbient,
-        .lightAmbient = ui.spinLightAmbient,
-        .useVolumeGradients = ui.chkUseVolumeGradients,
-        .shadowStepsLabel = ui.lblShadowSteps,
-        .shadowSteps = ui.spinShadowSteps,
-        .rakingEnabled = ui.chkRakingEnabled,
-        .rakingAzimuthLabel = ui.lblRakingAzimuth,
-        .rakingAzimuth = ui.spinRakingAzimuth,
-        .rakingElevationLabel = ui.lblRakingElevation,
-        .rakingElevation = ui.spinRakingElevation,
-        .rakingStrengthLabel = ui.lblRakingStrength,
-        .rakingStrength = ui.spinRakingStrength,
-        .rakingDepthLabel = ui.lblRakingDepth,
-        .rakingDepthScale = ui.spinRakingDepthScale,
-        .preNormalizeLayers = ui.chkPreNormalizeLayers,
-        .preHistEqLayers = ui.chkPreHistEqLayers,
-        .preTfEnabled = ui.chkPreTfEnabled,
-        .preTfX1 = ui.spinPreTfX1,
-        .preTfY1 = ui.spinPreTfY1,
-        .preTfKnot2Label = ui.lblPreTfKnot2,
-        .preTfX2 = ui.spinPreTfX2,
-        .preTfY2 = ui.spinPreTfY2,
-        .postTfEnabled = ui.chkPostTfEnabled,
-        .postTfX1 = ui.spinPostTfX1,
-        .postTfY1 = ui.spinPostTfY1,
-        .postTfKnot2Label = ui.lblPostTfKnot2,
-        .postTfX2 = ui.spinPostTfX2,
-        .postTfY2 = ui.spinPostTfY2,
-        .dvrAmbientLabel = ui.lblDvrAmbient,
-        .dvrAmbient = ui.spinDvrAmbient,
-        .pbrRoughnessLabel = ui.lblPbrRoughness,
-        .pbrRoughness = ui.spinPbrRoughness,
-        .pbrMetallicLabel = ui.lblPbrMetallic,
-        .pbrMetallic = ui.spinPbrMetallic,
         .planeCompositeXY = ui.chkPlaneCompositeXY,
         .planeCompositeXZ = ui.chkPlaneCompositeXZ,
         .planeCompositeYZ = ui.chkPlaneCompositeYZ,
         .planeLayersFront = ui.spinPlaneLayersFront,
         .planeLayersBehind = ui.spinPlaneLayersBehind,
-        .renderSettingsScrollArea = ui.scrollAreaRenderSettings,
-        .renderSettingsContents = ui.dockWidgetRenderSettingsContents,
-        .normalVisualizationContents = ui.dockWidgetNormalVisContents,
-        .showSurfaceNormals = ui.chkShowSurfaceNormals,
-        .normalArrowLengthLabel = ui.labelNormalArrowLength,
-        .normalArrowLengthSlider = ui.sliderNormalArrowLength,
-        .normalArrowLengthValueLabel = ui.labelNormalArrowLengthValue,
-        .normalMaxArrowsLabel = ui.labelNormalMaxArrows,
-        .normalMaxArrowsSlider = ui.sliderNormalMaxArrows,
-        .normalMaxArrowsValueLabel = ui.labelNormalMaxArrowsValue,
-        .preprocessingScrollArea = ui.scrollAreaPreprocessing,
-        .preprocessingContents = ui.dockWidgetPreprocessingContents,
-        .isoCutoff = ui.sliderIsoCutoff,
-        .isoCutoffValue = ui.lblIsoCutoffValue,
-        .postprocessingScrollArea = ui.scrollAreaPostprocessing,
-        .postprocessingContents = ui.dockWidgetPostprocessingContents,
-        .baseColormap = ui.baseColormapSelect,
-        .stretchValuesPost = ui.chkStretchValuesPost,
-        .removeSmallComponents = ui.chkRemoveSmallComponents,
-        .minComponentSizeLabel = ui.lblMinComponentSize,
-        .minComponentSize = ui.spinMinComponentSize,
-        .claheEnabled = ui.chkClaheEnabled,
-        .claheClipLimitLabel = ui.lblClaheClipLimit,
-        .claheClipLimit = ui.spinClaheClipLimit,
-        .claheTileSizeLabel = ui.lblClaheTileSize,
-        .claheTileSize = ui.spinClaheTileSize,
-        .zoomInButton = ui.btnZoomIn,
-        .zoomOutButton = ui.btnZoomOut,
-        .sliceStepSizeSpin = ui.spinSliceStepSize,
-        .volumeWindowContainer = ui.volumeWindowContainer,
-        .overlayWindowContainer = ui.overlayWindowContainer,
-        .intersectionOpacitySpin = ui.spinIntersectionOpacity,
-        .intersectionThicknessSpin = ui.doubleSpinIntersectionThickness,
+        .planeReverseDirection = ui.chkPlaneReverseDirection,
     };
-    _viewerControlsPanel = std::make_unique<ViewerControlsPanel>(viewerControlsUi,
-                                                                 _viewerManager.get(),
-                                                                 ui.dockWidgetViewerControlsContents);
+    _viewerCompositePanel = new ViewerCompositePanel(compositeUi, _viewerManager.get(), ui.dockWidgetComposite);
+    _viewerCompositePanel->setViewerManagers(
+        {_viewerManager.get(), _spiralWorkspace ? _spiralWorkspace->viewerManager() : nullptr});
+    attachScrollAreaToDock(ui.dockWidgetComposite,
+                           _viewerCompositePanel,
+                           QStringLiteral("dockWidgetCompositeContent"));
+
+    _inkDetectionDock = new QDockWidget(tr("Ink Detection"), this);
+    _inkDetectionDock->setObjectName(QStringLiteral("dockWidgetInkDetection"));
+    attachScrollAreaToDock(_inkDetectionDock,
+                           new ViewerInkDetectionPanel(_viewerManager.get(), _inkDetectionDock),
+                           QStringLiteral("dockWidgetInkDetectionContent"));
+
+    _transformsDock = new QDockWidget(tr("Transforms"), this);
+    _transformsDock->setObjectName(QStringLiteral("dockWidgetTransforms"));
+    auto* transformsPanel = new VolumeRegistrationsPanel(_state, _transformsDock);
+    attachScrollAreaToDock(_transformsDock,
+                           transformsPanel,
+                           QStringLiteral("dockWidgetTransformsContent"));
+
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomInRequested,
             this, &CWindow::onZoomIn);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::zoomOutRequested,
             this, &CWindow::onZoomOut);
-    connect(_viewerManager.get(), &ViewerManager::sliceStepSizeChanged,
-            this, &CWindow::onSliceStepSizeChanged);
+    connect(_viewerManager.get(), &ViewerManager::zScrollSensitivityChanged,
+            this, &CWindow::onZScrollSensitivityChanged);
     connect(_viewerControlsPanel.get(), &ViewerControlsPanel::statusMessageRequested,
             this, &CWindow::onShowStatusMessage);
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewControlsEnabled(!ui.grpVolManager || ui.grpVolManager->isEnabled());
     }
 
-    _surfaceAffineTransforms = std::make_unique<SurfaceAffineTransformController>(
-        SurfaceAffineTransformController::Deps{
-            .state = _state,
-            .viewerControlsPanel = _viewerControlsPanel.get(),
-            .viewerManager = _viewerManager.get(),
-            .segmentationModule = _segmentationModule.get(),
-            .surfacePanel = _surfacePanel.get(),
-            .axisAlignedSliceController = _axisAlignedSliceController.get(),
-            .dialogParent = this,
-            .showStatus = [this](const QString& text, int timeoutMs) {
-                onShowStatusMessage(text, timeoutMs);
-            },
-        },
-        this);
 
     _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetViewerControls);
     _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetVolumes, ui.dockWidgetViewerControls, Qt::Vertical);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, ui.dockWidgetOverlay);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _inkDetectionDock);
+    _segmentWorkspaceWindow->addDockWidget(Qt::LeftDockWidgetArea, _transformsDock);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetViewerControls, ui.dockWidgetOverlay, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(ui.dockWidgetOverlay, _inkDetectionDock, Qt::Vertical);
+    _segmentWorkspaceWindow->splitDockWidget(_inkDetectionDock, _transformsDock, Qt::Vertical);
 
     auto hideLegacyViewerDocks = [this]() {
-        for (QDockWidget* dock : { ui.dockWidgetPreprocessing,
-                                   ui.dockWidgetNormalVis,
+        for (QDockWidget* dock : { ui.dockWidgetNormalVis,
                                    ui.dockWidgetView,
-                                   ui.dockWidgetOverlay,
-                                   ui.dockWidgetRenderSettings,
-                                   ui.dockWidgetComposite,
-                                   ui.dockWidgetPostprocessing }) {
+                                        ui.dockWidgetComposite }) {
             if (!dock) {
                 continue;
             }
@@ -6365,9 +3634,6 @@ void CWindow::CreateWidgets(void)
             this, &CWindow::onSurfaceActivated);
     connect(_surfacePanel.get(), &SurfacePanelController::surfaceActivatedPreserveEditing,
             this, &CWindow::onSurfaceActivatedPreserveEditing);
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 
     // new and remove path buttons
     // connect(ui.btnNewPath, SIGNAL(clicked()), this, SLOT(OnNewPathClicked()));
@@ -6391,72 +3657,74 @@ void CWindow::CreateWidgets(void)
         VolumeOverlayController::UiRefs overlayUi{
             .volumeSelect = overlayVolumeSelect,
             .colormapSelect = ui.overlayColormapSelect,
+            .samplingMethodSelect = ui.overlayInterpolationSelect,
             .opacitySpin = ui.overlayOpacitySpin,
-            .thresholdSpin = ui.overlayThresholdSpin,
+            .intensityAsAlphaCheck = ui.overlayIntensityAsAlphaCheck,
+            .maxDisplayedResolutionSpin = ui.overlayMaxDisplayedResolutionSpin,
+            .compositeEnabledCheck = ui.chkOverlayComposite,
+            .compositeMethodSelect = ui.cmbOverlayCompositeMethod,
+            .compositeLayersFrontSpin = ui.spinOverlayCompositeLayersFront,
+            .compositeLayersBehindSpin = ui.spinOverlayCompositeLayersBehind,
         };
         _volumeOverlay->setUi(overlayUi);
         if (_viewerControlsPanel) {
             _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay->hasOverlaySelection());
         }
+        updateActiveWorkspaceViewerControls();
     }
 
-    // Setup surface overlay controls
-    connect(ui.chkSurfaceOverlay, &QCheckBox::toggled, [this](bool checked) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([checked](VolumeViewerBase* viewer) {
-            viewer->setSurfaceOverlayEnabled(checked);
-        });
-        ui.surfaceOverlaySelect->setEnabled(checked);
-        ui.spinOverlapThreshold->setEnabled(checked);
-    });
-
-    connect(ui.spinOverlapThreshold, qOverload<double>(&QDoubleSpinBox::valueChanged), [this](double value) {
-        if (!_viewerManager) return;
-        _viewerManager->forEachBaseViewer([value](VolumeViewerBase* viewer) {
-            viewer->setSurfaceOverlapThreshold(static_cast<float>(value));
-        });
-    });
-
-    // Initially disable surface overlay controls
-    ui.surfaceOverlaySelect->setEnabled(false);
-    ui.spinOverlapThreshold->setEnabled(false);
-
-    // Initialize surface overlay dropdown (will be populated when surfaces load)
-    updateSurfaceOverlayDropdown();
-
     connectVolumeSelector(volSelect);
+    // The working level: the volume opened at a coarser pyramid level, VC3D and
+    // the tools it runs working in that level's voxels. Objects are kept in the
+    // volume's own, so they show at every level.
+    if (ui.volSelect && ui.volSelect->layout()) {
+        _volumeLevelSpin = new QSpinBox(ui.volSelect);
+        _volumeLevelSpin->setObjectName(QStringLiteral("volumeLevelSpin"));
+        _volumeLevelSpin->setRange(0, vc::kMaxRemoteVolumeBaseScale);
+        _volumeLevelSpin->setPrefix(tr("L"));
+        _volumeLevelSpin->setToolTip(tr("Working level: work in this pyramid level's voxels (2^level of the "
+                                        "volume's own). Objects are kept in the volume's own voxels and show at "
+                                        "every level."));
+        ui.volSelect->layout()->addWidget(_volumeLevelSpin);
+        connect(_volumeLevelSpin, QOverload<int>::of(&QSpinBox::valueChanged), this, &CWindow::setVolumeLevel);
+        connect(_state, &CState::volumeChanged, this, [this]() { syncVolumeLevelControl(); });
+        syncVolumeLevelControl();
+    }
 
     auto* filterDropdown = ui.btnFilterDropdown;
-    auto* cmbPointSetFilter = ui.cmbPointSetFilter;
-    auto* btnPointSetFilterAll = ui.btnPointSetFilterAll;
-    auto* btnPointSetFilterNone = ui.btnPointSetFilterNone;
-    auto* cmbPointSetFilterMode = new QComboBox();
+    auto* cmbPointSetFilter = new QComboBox(this);
+    auto* btnPointSetFilterAll = new QPushButton(tr("All"), this);
+    auto* btnPointSetFilterNone = new QPushButton(tr("None"), this);
+    auto* cmbPointSetFilterMode = new QComboBox(this);
+    auto* spinFocusPointFilterDistance = new QDoubleSpinBox(this);
+    auto* spinSurfaceZLowerBound = new QDoubleSpinBox(this);
+    auto* spinSurfaceZUpperBound = new QDoubleSpinBox(this);
     cmbPointSetFilterMode->addItem("Any (OR)");
     cmbPointSetFilterMode->addItem("All (AND)");
-    ui.pointSetFilterLayout->insertWidget(1, cmbPointSetFilterMode);
 
     SurfacePanelController::FilterUiRefs filterUi;
     filterUi.dropdown = filterDropdown;
+    filterUi.currentOnly = ui.chkFilterCurrentOnly;
     filterUi.pointSet = cmbPointSetFilter;
     filterUi.pointSetAll = btnPointSetFilterAll;
     filterUi.pointSetNone = btnPointSetFilterNone;
     filterUi.pointSetMode = cmbPointSetFilterMode;
     filterUi.surfaceIdFilter = ui.lineEditSurfaceFilter;
-    filterUi.focusPointDistance = ui.spinFocusPointFilterDistance;
-    filterUi.zLowerBound = ui.spinSurfaceZLowerBound;
-    filterUi.zUpperBound = ui.spinSurfaceZUpperBound;
+    filterUi.focusPointDistance = spinFocusPointFilterDistance;
+    filterUi.zLowerBound = spinSurfaceZLowerBound;
+    filterUi.zUpperBound = spinSurfaceZUpperBound;
     _surfacePanel->configureFilters(filterUi, _state->pointCollection());
 
+    auto* tagDropdown = ui.btnTagDropdown;
     SurfacePanelController::TagUiRefs tagUi{
-        .approved = ui.chkApproved,
-        .defective = ui.chkDefective,
-        .reviewed = ui.chkReviewed,
-        .inspect = ui.chkInspect,
+        .dropdown = tagDropdown,
+        .approved = tagDropdown->addOption(tr("Approved"), QStringLiteral("chkApproved")),
+        .defective = tagDropdown->addOption(tr("Defective"), QStringLiteral("chkDefective")),
+        .reviewed = tagDropdown->addOption(tr("Reviewed"), QStringLiteral("chkReviewed")),
+        .inspect = tagDropdown->addOption(tr("Inspect"), QStringLiteral("chkInspect")),
     };
     _surfacePanel->configureTags(tagUi);
 
-    cmbSegmentationDir = ui.cmbSegmentationDir;
-    connect(cmbSegmentationDir, &QComboBox::currentIndexChanged, this, &CWindow::onSegmentationDirChanged);
 
     // Location input element (single QLineEdit for comma-separated values)
     lblLocFocus = ui.sliceFocus;
@@ -6470,6 +3738,26 @@ void CWindow::CreateWidgets(void)
     QPushButton* btnCopyCoords = ui.btnCopyCoords;
     connect(btnCopyCoords, &QPushButton::clicked, this, &CWindow::onCopyCoordinates);
 
+    const QRegularExpression coordinateTriple(
+        "^\\s*\\d+\\s*,\\s*\\d+\\s*,\\s*\\d+\\s*$");
+    ui.focusBBoxMin->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMin));
+    ui.focusBBoxMax->setValidator(
+        new QRegularExpressionValidator(coordinateTriple, ui.focusBBoxMax));
+    connect(ui.focusBBoxMin, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.focusBBoxMax, &QLineEdit::editingFinished,
+            this, &CWindow::onFocusBoundsEdited);
+    connect(ui.chkFocusBBox, &QCheckBox::toggled,
+            this, &CWindow::onFocusBoundsToggled);
+    connect(_state, &CState::focusBoundsChanged,
+            this, &CWindow::refreshFocusBoundsUi);
+    connect(_state, &CState::volumeChanged, this,
+            [this](std::shared_ptr<Volume>, const std::string&) {
+                refreshFocusBoundsUi();
+            });
+    refreshFocusBoundsUi();
+
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         bool showOverlays = settings.value(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS,
                                            vc3d::settings::viewer::SHOW_AXIS_OVERLAYS_DEFAULT).toBool();
@@ -6477,30 +3765,17 @@ void CWindow::CreateWidgets(void)
         chkAxisOverlays->setChecked(showOverlays);
         connect(chkAxisOverlays, &QCheckBox::toggled, this, &CWindow::onAxisOverlayVisibilityToggled);
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        bool moveOnSurfaceChanged = settings.value(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE,
-                                                   vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE_DEFAULT).toBool();
-        QSignalBlocker blocker(chkMoveOnSurfaceChanged);
-        chkMoveOnSurfaceChanged->setChecked(moveOnSurfaceChanged);
-        connect(chkMoveOnSurfaceChanged, &QCheckBox::toggled, this, &CWindow::onMoveOnSurfaceChangedToggled);
+    // Deliberately not persisted: the coordinate frame gizmo is on by default
+    // every session, matching the checkbox's designer state.
+    if (auto* chkCoordinateFrames = ui.chkCoordinateFrames) {
+        connect(chkCoordinateFrames, &QCheckBox::toggled, this, [](bool show) {
+            for (auto* manager : ViewerManager::allManagers()) {
+                if (manager) {
+                    manager->setShowCoordinateFrames(show);
+                }
+            }
+        });
     }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        bool showPlaneIntersectionLines = settings.value(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES,
-                                                         vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES_DEFAULT).toBool();
-        QSignalBlocker blocker(chkPlaneIntersectionLines);
-        chkPlaneIntersectionLines->setChecked(showPlaneIntersectionLines);
-        connect(chkPlaneIntersectionLines, &QCheckBox::toggled,
-                this, &CWindow::onPlaneIntersectionLinesToggled);
-    }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        int storedOpacity = settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
-                                           spinAxisOverlayOpacity->value()).toInt();
-        storedOpacity = std::clamp(storedOpacity, spinAxisOverlayOpacity->minimum(), spinAxisOverlayOpacity->maximum());
-        QSignalBlocker blocker(spinAxisOverlayOpacity);
-        spinAxisOverlayOpacity->setValue(storedOpacity);
-        connect(spinAxisOverlayOpacity, qOverload<int>(&QSpinBox::valueChanged), this, &CWindow::onAxisOverlayOpacityChanged);
-    }
-
     if (auto* btnResetRot = ui.btnResetAxisRotations) {
         connect(btnResetRot, &QPushButton::clicked, this, &CWindow::onResetAxisAlignedRotations);
     }
@@ -6514,24 +3789,15 @@ void CWindow::CreateWidgets(void)
         connect(chkAxisAlignedSlices, &QCheckBox::toggled, this, &CWindow::onAxisAlignedSlicesToggled);
     }
 
-    connect(ui.btnEditMask, &QPushButton::pressed, this, &CWindow::onEditMaskPressed);
-    connect(ui.btnAppendMask, &QPushButton::pressed, this, &CWindow::onAppendMaskPressed);  // Add this
-
     if (chkAxisAlignedSlices) {
         onAxisAlignedSlicesToggled(chkAxisAlignedSlices->isChecked());
     }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        onAxisOverlayOpacityChanged(spinAxisOverlayOpacity->value());
-    }
+    onAxisOverlayOpacityChanged(settings.value(vc3d::settings::viewer::AXIS_OVERLAY_OPACITY,
+                                               vc3d::settings::viewer::AXIS_OVERLAY_OPACITY_DEFAULT).toInt());
     if (auto* chkAxisOverlays = ui.chkAxisOverlays) {
         onAxisOverlayVisibilityToggled(chkAxisOverlays->isChecked());
     }
-    if (auto* chkMoveOnSurfaceChanged = ui.chkMoveOnSurfaceChanged) {
-        onMoveOnSurfaceChangedToggled(chkMoveOnSurfaceChanged->isChecked());
-    }
-    if (auto* chkPlaneIntersectionLines = ui.chkPlaneIntersectionLines) {
-        onPlaneIntersectionLinesToggled(chkPlaneIntersectionLines->isChecked());
-    }
+    onMoveOnSurfaceChangedToggled(moveOnSurfaceChangeEnabled());
 
 }
 
@@ -6539,16 +3805,6 @@ void CWindow::CreateWidgets(void)
 // Create actions
 void CWindow::keyPressEvent(QKeyEvent* event)
 {
-    // Let fiber controller handle Escape first
-    if (event->key() == Qt::Key_Escape && _fiberController && _fiberController->handleEscape()) {
-        event->accept();
-        return;
-    }
-
-    // Fiber animation (P key)
-    if (_fiberController && _fiberController->handleKeyPress(event))
-        return;
-
     if (event->key() == vc3d::keybinds::keypress::ToggleVolumeOverlay.key &&
         event->modifiers() == vc3d::keybinds::keypress::ToggleVolumeOverlay.modifiers) {
         toggleVolumeOverlayVisibility();
@@ -6624,18 +3880,21 @@ void CWindow::keyPressEvent(QKeyEvent* event)
         }
     }
 
-    // Shift+G decreases slice step size, Shift+H increases it
+    // Shift+G decreases Z-scroll sensitivity, Shift+H increases it. The
+    // preference is global, so keep every workspace's viewers in sync.
     if (event->modifiers() == vc3d::keybinds::keypress::SliceStepDecrease.modifiers && _viewerManager) {
         if (event->key() == vc3d::keybinds::keypress::SliceStepDecrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::max(1, currentStep - 1);
-            _viewerManager->setSliceStepSize(newStep);
+            const double sensitivity = _viewerManager->zScrollSensitivity() - 0.1;
+            for (auto* manager : ViewerManager::allManagers()) {
+                manager->setZScrollSensitivity(sensitivity);
+            }
             event->accept();
             return;
         } else if (event->key() == vc3d::keybinds::keypress::SliceStepIncrease.key) {
-            int currentStep = _viewerManager->sliceStepSize();
-            int newStep = std::min(100, currentStep + 1);
-            _viewerManager->setSliceStepSize(newStep);
+            const double sensitivity = _viewerManager->zScrollSensitivity() + 0.1;
+            for (auto* manager : ViewerManager::allManagers()) {
+                manager->setZScrollSensitivity(sensitivity);
+            }
             event->accept();
             return;
         }
@@ -6673,6 +3932,7 @@ void CWindow::keyReleaseEvent(QKeyEvent* event)
 void CWindow::resizeEvent(QResizeEvent* event)
 {
     QMainWindow::resizeEvent(event);
+    QTimer::singleShot(0, this, &CWindow::updateProjectNameLabel);
     scheduleWindowStateSave();
 }
 
@@ -6693,6 +3953,8 @@ void CWindow::saveWindowState()
     }
     if (_workspaceTabs) {
         settings.setValue(WORKSPACE_TAB_SETTING, _workspaceTabs->currentIndex());
+        if (auto* workspace = _workspaceTabs->currentWidget())
+            settings.setValue(WORKSPACE_ID_SETTING, workspace->property("workspaceId").toString());
     }
     settings.setValue(vc3d::settings::window::RESTORE_DISABLED, false);
     settings.setValue(vc3d::settings::window::RESTORE_IN_PROGRESS, false);
@@ -6705,29 +3967,18 @@ void CWindow::saveWindowState()
 
 void CWindow::closeEvent(QCloseEvent* event)
 {
-    // Flush a render-bench recording (if any) before teardown.
-    if (_benchRecorder && _benchRecorder->attached()) {
-        _benchRecorder->save();
+    if (_spiralWorkspace && !_spiralCloseGuardBypass
+        && _spiralWorkspace->hasPendingBrushWork()) {
+        event->ignore();
+        _spiralWorkspace->requestSessionExit([this]() {
+            _spiralCloseGuardBypass = true;
+            close();
+        });
+        return;
     }
-    // Tell ViewerManager to stop maintaining the SurfacePatchIndex. The
-    // CState teardown below iterates every tracked surface and sets it to
-    // nullptr, which would otherwise trigger an O(N) rtree->remove() per
-    // surface — easily 10+ seconds on a flattened segment with millions
-    // of cells.
-    if (_viewerManager) {
-        _viewerManager->beginShutdown();
-    }
-    // Flush any pending debounced approval-mask save before teardown so the
-    // last few seconds of approvals aren't lost on exit. No-op if nothing
-    // is pending.
-    if (_segmentationModule && _segmentationModule->overlay()) {
-        _segmentationModule->overlay()->flushPendingApprovalMaskSave();
-    }
+    _destroyingWindow = true;
     if (_lineAnnotationController) {
         _lineAnnotationController->saveOpenFibers();
-    }
-    if (_state && _state->vpkg()) {
-        try { _state->vpkg()->saveAutosave(); } catch (...) {}
     }
     saveWindowState();
     event->accept();
@@ -6736,45 +3987,11 @@ void CWindow::closeEvent(QCloseEvent* event)
 void CWindow::setWidgetsEnabled(bool state)
 {
     ui.grpVolManager->setEnabled(state);
+    ui.btnOpenDataCatalog->setEnabled(!state);
     if (_viewerControlsPanel) {
         _viewerControlsPanel->setViewControlsEnabled(state);
         _viewerControlsPanel->setOverlayWindowAvailable(_volumeOverlay && _volumeOverlay->hasOverlaySelection());
     }
-}
-
-auto CWindow::InitializeVolumePkg(const std::string& nVpkgPath) -> bool
-{
-    _state->setVpkg(nullptr);
-    updateNormalGridAvailability();
-    if (_segmentationModule && _segmentationModule->editingEnabled()) {
-        _segmentationModule->setEditingEnabled(false);
-    }
-    if (_segmentationModule) {
-        _segmentationModule->setAnnotateMode(false);
-    }
-    if (_segmentationWidget) {
-        if (!_segmentationModule || _segmentationWidget->isEditingEnabled()) {
-            _segmentationWidget->setEditingEnabled(false);
-        }
-        _segmentationWidget->setAvailableVolumes({}, QString());
-        _segmentationWidget->setVolumePackagePath(QString());
-    }
-
-    try {
-        _state->setVpkg(VolumePkg::load(nVpkgPath));
-    } catch (const std::exception& e) {
-        Logger()->error("Failed to initialize volpkg: {}", e.what());
-    }
-
-    if (_state->vpkg() == nullptr) {
-        Logger()->error("Cannot open project: {}", nVpkgPath);
-        QMessageBox::warning(
-            this, "Error",
-            "Project failed to load. Falling back to a new blank project.");
-        _state->setVpkg(VolumePkg::newEmpty());
-        return false;
-    }
-    return true;
 }
 
 // Update the widgets
@@ -6783,10 +4000,12 @@ void CWindow::UpdateView(void)
     if (!_state->hasVpkg() && _state->currentVolume() == nullptr) {
         setWidgetsEnabled(false);  // Disable Widgets for User
         ui.lblVpkgName->setText("[ No Volume Package Loaded ]");
+        updateVolumePackageEmptyState();
         return;
     }
 
     setWidgetsEnabled(true);  // Enable Widgets for User
+    updateVolumePackageEmptyState();
 
     // show volume package name
     UpdateVolpkgLabel(0);
@@ -6794,6 +4013,13 @@ void CWindow::UpdateView(void)
     syncVolumeSelectionControls();
 
     update();
+}
+
+void CWindow::updateVolumePackageEmptyState()
+{
+    const bool hasOpenPackage = _state && (_state->hasVpkg() || _state->currentVolume() != nullptr);
+    const bool catalogVisible = _menuController && _menuController->isOpenDataCatalogVisible();
+    ui.btnOpenDataCatalog->setVisible(!hasOpenPackage && !catalogVisible);
 }
 
 void CWindow::UpdateVolpkgLabel(int filterCounter)
@@ -6807,9 +4033,71 @@ void CWindow::UpdateVolpkgLabel(int filterCounter)
     }
 }
 
+void CWindow::startDraftRecovery()
+{
+    using namespace vc3d::settings;
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const int seconds = settings.value(object_store::DRAFT_CHECKPOINT_SECONDS,
+                                       object_store::DRAFT_CHECKPOINT_SECONDS_DEFAULT).toInt();
+    auto* drafts = _state->sessionDrafts();
+    if (seconds <= 0 || !drafts) return;
+    auto directory = settings.value(object_store::DRAFT_DIRECTORY).toString().trimmed();
+    if (directory.isEmpty())
+        directory = QStandardPaths::writableLocation(QStandardPaths::AppDataLocation) + QStringLiteral("/drafts");
+    QString message;
+    if (!drafts->start(directory.toStdString(), seconds * 1000)) {
+        message = tr("Crash recovery of unsaved edits is off: %1").arg(drafts->error());
+    } else if (const auto recovered = drafts->recoveredDrafts(); !recovered.empty()) {
+        message = tr("Unsaved edits of %n surface(s) were recovered from an earlier session; "
+                     "open a surface to restore or discard them.", nullptr, int(recovered.size()));
+    }
+    connect(drafts, &SessionDrafts::checkpointFailed, this, [this](const QString& error) {
+        showStatusBarMessage(tr("Unsaved edits are not crash-safe: the draft checkpoint failed: %1").arg(error), 0);
+    });
+    connect(drafts, &SessionDrafts::checkpointRestored, this, [this]() {
+        showStatusBarMessage(tr("Draft checkpoints work again."), 5000);
+    });
+    connect(drafts, &SessionDrafts::pendingResolved, this, [this](const QString& text) { showStatusBarMessage(text, 10000); });
+    if (!message.isEmpty())
+        QTimer::singleShot(0, this, [this, message]() { showStatusBarMessage(message, 15000); });
+}
+
 void CWindow::onShowStatusMessage(QString text, int timeout)
 {
-    statusBar()->showMessage(text, timeout);
+    showStatusBarMessage(text, timeout);
+}
+
+void CWindow::showStatusBarMessage(const QString& text, int timeout)
+{
+    if (!_statusMessageLabel) {
+        if (statusBar()) {
+            statusBar()->showMessage(text, timeout);
+        }
+        return;
+    }
+
+    _statusMessageLabel->setText(text);
+    _statusMessageLabel->setToolTip(text);
+
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+        if (timeout > 0) {
+            _statusMessageTimer->start(timeout);
+        }
+    }
+}
+
+void CWindow::clearStatusBarMessage()
+{
+    if (_statusMessageTimer) {
+        _statusMessageTimer->stop();
+    }
+    if (_statusMessageLabel) {
+        _statusMessageLabel->clear();
+        _statusMessageLabel->setToolTip(QString());
+    } else if (statusBar()) {
+        statusBar()->clearMessage();
+    }
 }
 
 void CWindow::onSegmentationGrowthStatusChanged(bool running)
@@ -6837,75 +4125,237 @@ void CWindow::onSegmentationGrowthStatusChanged(bool running)
         _segmentationGrowthStatusText = tr("Surface growth in progress - surface selection locked");
         _segmentationGrowthWarning->setText(_segmentationGrowthStatusText);
         _segmentationGrowthWarning->setVisible(true);
-        statusBar()->showMessage(_segmentationGrowthStatusText, 0);
+        showStatusBarMessage(_segmentationGrowthStatusText, 0);
     } else if (_segmentationGrowthWarning) {
         _segmentationGrowthWarning->clear();
         _segmentationGrowthWarning->setVisible(false);
-        if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
-            statusBar()->clearMessage();
+        if (_statusMessageLabel && _statusMessageLabel->text() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
+        } else if (statusBar()->currentMessage() == _segmentationGrowthStatusText) {
+            clearStatusBarMessage();
         }
         _segmentationGrowthStatusText.clear();
     }
 }
 
-void CWindow::onSliceStepSizeChanged(int newSize)
+void CWindow::onZScrollSensitivityChanged(double sensitivity)
 {
-    // Update status bar label
-    if (_sliceStepLabel) {
-        _sliceStepLabel->setText(tr("Step: %1").arg(newSize));
-    }
+    Q_UNUSED(sensitivity);
+    updateSharedStatusLabel();
+}
 
-    // Save to settings
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, newSize);
+void CWindow::onSharedCacheStatsChanged(const QStringList& items)
+{
+    if (!items.isEmpty())
+        _sharedCacheStatsItems = items;
+    updateSharedStatusLabel();
+}
 
-    if (_viewerControlsPanel) {
-        _viewerControlsPanel->setSliceStepSize(newSize);
+void CWindow::updateFiberLengthUnits()
+{
+    if (_destroyingWindow) {
+        return;
     }
+    // Fiber lengths are in the open volume's voxels.
+    std::optional<double> voxelSizeUm;
+    if (const auto volume = _state ? _state->currentVolume() : nullptr; volume && volume->voxelSize() > 0) {
+        voxelSizeUm = volume->voxelSize();
+    }
+    if (_fiberWidget) {
+        _fiberWidget->setAnnotationVoxelSizeUm(voxelSizeUm);
+    }
+    updateLineAnnotationLengthLabel();
+}
+
+void CWindow::updateLineAnnotationLengthLabel()
+{
+    if (_destroyingWindow || !_lineAnnotationLengthLabel) {
+        return;
+    }
+    auto* dialog = _workspaceTabs
+        ? qobject_cast<LineAnnotationDialog*>(_workspaceTabs->currentWidget())
+        : nullptr;
+    const uint64_t fiberId = (dialog && _lineAnnotationController)
+        ? _lineAnnotationController->fiberIdForDialog(dialog)
+        : 0;
+    const auto summary = fiberId != 0 ? _lineAnnotationController->fiberSummary(fiberId) : std::nullopt;
+    if (!summary) {
+        _lineAnnotationLengthLabel->clear();
+        _lineAnnotationLengthLabel->hide();
+        return;
+    }
+    // Fiber lengths are in the open volume's voxels, as in the Fibers dock.
+    const auto volume = _state->currentVolume();
+    const std::optional<double> voxelSizeUm =
+        volume && volume->voxelSize() > 0 ? std::optional(volume->voxelSize()) : std::nullopt;
+    _lineAnnotationLengthLabel->setText(
+        tr("Fiber length %1").arg(vc3d::fiber_length::formatLength(summary->annotatedLengthVx, voxelSizeUm)));
+    _lineAnnotationLengthLabel->show();
+}
+
+void CWindow::updateSharedStatusLabel()
+{
+    if (!_sharedCacheStatsLabel)
+        return;
+
+    QStringList items = _sharedCacheStatsItems;
+    if (items.isEmpty())
+        items << tr("RAM --  disk -- GiB  net --");
+    if (_viewerManager) {
+        items << tr("Z sens: %1")
+            .arg(_viewerManager->zScrollSensitivity(), 0, 'f', 1);
+    }
+    _sharedCacheStatsLabel->setText(items.join(QStringLiteral("  ")));
 }
 
 // Open volume package
-void CWindow::OpenVolume(const QString& path)
+bool CWindow::OpenVolume(const QString& path,
+                         bool interactive,
+                         QString* errorMessage,
+                         const QString& preferredVolumeId,
+                         VolumeOpenError* openError)
 {
+    if (errorMessage) {
+        errorMessage->clear();
+    }
+    if (openError) {
+        *openError = VolumeOpenError::None;
+    }
     QString aVpkgPath = path;
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
 
     if (aVpkgPath.isEmpty()) {
+        if (!interactive) {
+            if (errorMessage) {
+                *errorMessage = tr("Project path is empty.");
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
+            }
+            return false;
+        }
         aVpkgPath = QFileDialog::getOpenFileName(
             this, tr("Open Project"), settings.value(vc3d::settings::project::DEFAULT_PATH).toString(),
-            tr("Project (*.volpkg.json);;All files (*.*)"),
+            tr("Project (*.vcproj)"),
             nullptr, QFileDialog::DontResolveSymlinks | QFileDialog::ReadOnly | QFileDialog::DontUseNativeDialog);
         if (aVpkgPath.isEmpty()) {
             Logger()->info("Open project canceled");
-            return;
+            return false;
         }
     }
 
-    if (!InitializeVolumePkg(aVpkgPath.toStdString())) {
-        return;
+    // Projects are written as the user; a headless open uses the settings' name.
+    const QString author = interactive && _menuController ? _menuController->objectStoreAuthor()
+                                                          : CState::storeAuthor();
+    if (author.isEmpty()) {
+        return false;
+    }
+    std::shared_ptr<VolumePkg> package;
+    QString loadError;
+    try {
+        vc::project::LoadOptions options;
+        options.catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
+        package = VolumePkg::open(aVpkgPath.toStdString(), options);
+    } catch (const std::exception& e) {
+        Logger()->error("Failed to open project: {}", e.what());
+        loadError = QString::fromUtf8(e.what());
+    }
+    if (!package) {
+        Logger()->error("Cannot open project: {}", aVpkgPath.toStdString());
+        const QString message = loadError.isEmpty()
+            ? tr("Project failed to load.")
+            : tr("Project failed to load: %1").arg(loadError);
+        if (errorMessage) {
+            *errorMessage = message;
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        if (interactive) {
+            QMessageBox::warning(this, tr("Error"), message);
+        }
+        return false;
     }
 
-    // Check version number
-    if (_state->vpkg()->version() < VOLPKG_MIN_VERSION) {
-        const auto msg = "Volume package is version " +
-                         std::to_string(_state->vpkg()->version()) +
-                         " but this program requires version " +
-                         std::to_string(VOLPKG_MIN_VERSION) + "+.";
-        Logger()->error(msg);
-        QMessageBox::warning(this, tr("ERROR"), QString(msg.c_str()));
-        _state->setVpkg(nullptr);
-        updateNormalGridAvailability();
-        return;
+    if (!preferredVolumeId.isEmpty()) {
+        const auto ids = package->volumeIDs();
+        const auto id = preferredVolumeId.toStdString();
+        if (std::find(ids.begin(), ids.end(), id) == ids.end()) {
+            if (errorMessage) {
+                *errorMessage = tr("Unknown volume id: %1").arg(preferredVolumeId);
+            }
+            if (openError) {
+                *openError = VolumeOpenError::VolumeNotFound;
+            }
+            return false;
+        }
+        try {
+            (void)package->volume(id);
+        } catch (const std::exception& e) {
+            if (errorMessage) {
+                *errorMessage = tr("Failed to load volume %1: %2")
+                                    .arg(preferredVolumeId, QString::fromUtf8(e.what()));
+            }
+            if (openError) {
+                *openError = VolumeOpenError::PackageLoadFailed;
+            }
+            return false;
+        }
     }
 
-    refreshCurrentVolumePackageUi(QString(), true);
+    // Line-annotation sessions must end — finalized and saved — while the
+    // package they belong to is still the active one; after the swap, their
+    // close path would save into the new package. A refusal (a running
+    // optimization, a failed finalization) aborts the switch with the
+    // workspace intact.
+    if (_state->prepareStoreSwitch && !_state->prepareStoreSwitch()) {
+        if (errorMessage) {
+            *errorMessage = tr("Pending edits could not be saved; "
+                               "the project was not switched.");
+        }
+        if (openError) {
+            *openError = VolumeOpenError::PackageLoadFailed;
+        }
+        return false;
+    }
+
+    CloseVolume();
+    // Without a choice, the volume the user last viewed in the project.
+    const auto ids = package->volumeIDs();
+    const auto remembered = QString::fromStdString(package->currentVolumeId());
+    const QString volumeId = !preferredVolumeId.isEmpty() ? preferredVolumeId
+        : std::find(ids.begin(), ids.end(), remembered.toStdString()) != ids.end() ? remembered : QString();
+    _state->setVpkg(std::move(package));
+    refreshCurrentVolumePackageUi(volumeId);
     if (_menuController) {
         _menuController->updateRecentVolpkgList(aVpkgPath);
     }
 
-    if (_fileWatcher) {
-        _fileWatcher->startWatching();
+    return true;
+}
+
+void CWindow::attachStore(const QString& path)
+{
+    try {
+        if (!_state->hasVpkg()) throw std::runtime_error("no project is open");
+        _state->attachStore(path.toStdString(), CState::storeAuthor());
+    } catch (const std::exception& error) {
+        const auto message = tr("Cannot attach store %1: %2").arg(path, QString::fromUtf8(error.what()));
+        qWarning().noquote() << message;
+        statusBar()->showMessage(message, 10000);
     }
+}
+
+bool CWindow::openVolumePackage(const QString& path,
+                                bool interactive,
+                                QString* errorMessage,
+                                const QString& preferredVolumeId,
+                                VolumeOpenError* openError)
+{
+    const bool opened = OpenVolume(
+        path, interactive, errorMessage, preferredVolumeId, openError);
+    UpdateView();
+    return opened;
 }
 
 std::vector<QComboBox*> CWindow::volumeSelectionControls() const
@@ -6918,6 +4368,9 @@ std::vector<QComboBox*> CWindow::volumeSelectionControls() const
         if (selector) {
             selectors.push_back(selector.data());
         }
+    }
+    if (_spiralWorkspace && _spiralWorkspace->volumeSelectionControl()) {
+        selectors.push_back(_spiralWorkspace->volumeSelectionControl());
     }
     return selectors;
 }
@@ -6948,11 +4401,147 @@ void CWindow::connectVolumeSelector(QComboBox* selector)
             });
 }
 
+QString CWindow::lastVolumeSettingKeyForCurrentPackage() const
+{
+    if (!_state || !_state->vpkg()) {
+        return {};
+    }
+
+    QString projectPath = QString::fromStdString(_state->vpkg()->path().string());
+    if (projectPath.isEmpty()) {
+        return {};
+    }
+
+    const QFileInfo info(projectPath);
+    QString stablePath = info.canonicalFilePath();
+    if (stablePath.isEmpty()) {
+        stablePath = info.absoluteFilePath();
+    }
+    if (stablePath.isEmpty()) {
+        stablePath = projectPath;
+    }
+
+    return QStringLiteral("%1%2").arg(
+        QString::fromLatin1(vc3d::settings::project::LAST_VOLUME_PREFIX),
+        QString::fromLatin1(QUrl::toPercentEncoding(stablePath)));
+}
+
+QString CWindow::rememberedVolumeIdForCurrentPackage() const
+{
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return {};
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(key).toString();
+}
+
+void CWindow::rememberCurrentVolumeForPackage(const QString& volumeId) const
+{
+    if (volumeId.isEmpty() || !_state || !_state->vpkg() ||
+        !_state->vpkg()->hasVolume(volumeId.toStdString())) {
+        return;
+    }
+
+    const QString key = lastVolumeSettingKeyForCurrentPackage();
+    if (key.isEmpty()) {
+        return;
+    }
+
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    settings.setValue(key, volumeId);
+}
+
+std::optional<vcr::catalog::Affine> CWindow::volumeTransformForSwitch(const vc::objects::VolumeVoxels& from,
+                                                                      const vc::objects::VolumeVoxels& to) const
+{
+    // The store's resolution (catalog registrations, its own and its route
+    // choices); without a store, the cached catalog's registrations.
+    vc::objects::VolumeTransforms transforms;
+    if (const auto attachment = _state->storeFor("volume_transform")) {
+        transforms = _state->objectStoreSession()->volumeTransforms(*attachment);
+    } else if (const auto catalog = vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)))) {
+        transforms.graph.addCatalog(*catalog);
+    }
+    return transforms.toVolume(nlohmann::json{{"coordinates", vc::objects::volumeCoordinates(from)}}, to.volume, to.scale);
+}
+
+void CWindow::setVolumeLevel(int level)
+{
+    const auto volume = _state->currentVolume();
+    if (!volume || !volume->isRemote() || level == volume->baseScaleLevel()) return;
+    if (_segmentationModule && _segmentationModule->editingEnabled()) {
+        statusBar()->showMessage(tr("Stop editing the surface before changing the working level."), 5000);
+        syncVolumeLevelControl();
+        return;
+    }
+    if (_segmentationModule) {
+        const auto save = _segmentationModule->autosaveStatus();
+        if (save.saveInProgress || save.pending || save.dirtyAfterSave) {
+            if (!save.saveInProgress) _segmentationModule->flushAutosave();
+            statusBar()->showMessage(tr("Finishing the surface save before changing the working level…"), 2000);
+            QTimer::singleShot(100, this, [this, volume, level] {
+                if (_state->currentVolume() == volume && _volumeLevelSpin && _volumeLevelSpin->value() == level)
+                    setVolumeLevel(level);
+            });
+            return;
+        }
+        if (_segmentationModule->hasActiveSession()) _segmentationModule->endEditingSession();
+    }
+    const auto navigation = _viewerManager ? _viewerManager->captureNavigation() : nullptr;
+    const auto oldVoxels = _state->annotationVolume().value_or(
+        vc::project::annotationVolume(_state->vpkg().get(), *volume));
+    std::optional<SurfaceCatalog::Opened> reopened;
+    std::optional<vcr::catalog::Affine> transform;
+    try {
+        // Prepare geometry before persisting the new level: a failed surface
+        // read must leave both the project and the current view untouched.
+        auto nextVoxels = vc::objects::VolumeVoxels(oldVoxels);
+        nextVoxels.scale *= std::ldexp(1.0, volume->baseScaleLevel() - level);
+        transform = volumeTransformForSwitch(oldVoxels, nextVoxels);
+        if (_surfacePanel && _surfacePanel->opened() && _state->surface("segmentation")) {
+            const auto& opened = *_surfacePanel->opened();
+            reopened = SurfaceCatalog::open(_state->objectStoreSession(), opened.pin.attachment,
+                                            nextVoxels, opened.surface->id,
+                                            opened.current ? std::nullopt : std::optional(opened.pin.reference()));
+        }
+        _state->vpkg()->setVolumeLevel(volume->id(), level);
+    } catch (const std::exception& error) {
+        QMessageBox::warning(this, tr("Working Level"),
+                             tr("Could not open %1 at level %2:\n%3")
+                                 .arg(QString::fromStdString(volume->id())).arg(level).arg(QString::fromUtf8(error.what())));
+        syncVolumeLevelControl();
+        return;
+    }
+    // Drop the old-frame draft before changing the frame it is declared in.
+    if (reopened) _state->setSurface("segmentation", nullptr);
+    setVolume(_state->vpkg()->volume(volume->id()));
+    if (reopened) {
+        const auto surface = reopened->surface;
+        _surfacePanel->replaceOpenedSurface(std::move(*reopened));
+        _state->setActiveSurface(surface->id, surface);
+        _state->setSurface("segmentation", surface, false, true);
+        if (_segmentationModule) _segmentationModule->onActiveSegmentChanged(surface.get());
+        _axisAlignedSliceController->applyOrientation(surface.get());
+    }
+    if (navigation && transform) _viewerManager->restoreNavigation(navigation, *transform);
+    refreshVolumeSelectionUi(QString::fromStdString(volume->id()));
+}
+
+void CWindow::syncVolumeLevelControl()
+{
+    if (!_volumeLevelSpin) return;
+    const auto volume = _state ? _state->currentVolume() : nullptr;
+    const QSignalBlocker blocker(_volumeLevelSpin);
+    _volumeLevelSpin->setValue(volume ? volume->baseScaleLevel() : 0);
+    _volumeLevelSpin->setEnabled(volume && volume->isRemote());
+}
+
 QWidget* CWindow::createAnnotationVolumeSelector(QWidget* parent)
 {
     auto* volumeSelector = new VolumeSelector(parent);
     volumeSelector->setLabelVisible(false);
-    volumeSelector->setBrowseEnabled(false);
     if (auto* combo = volumeSelector->comboBox()) {
         combo->setObjectName(QStringLiteral("annotationVolumeSelect"));
         combo->setMinimumWidth(130);
@@ -6992,8 +4581,11 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     QVector<QPair<QString, QString>> volumeEntries;
+    QVector<QPair<QString, QString>> openDataVolumeIdMap;
+    std::set<QString> preferredOpenDataSourceIds;
     std::vector<QString> orderedIds;
     QString activeCandidate = preferredVolumeId;
+    const bool hasExplicitPreferredVolume = !activeCandidate.isEmpty();
     QString currentComboId;
     for (QComboBox* selector : selectors) {
         if (selector && selector->currentIndex() >= 0) {
@@ -7014,18 +4606,47 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         return false;
     };
 
+    auto openDataVolumeIdMappedToLoadedId = [&](const QString& catalogVolumeId) {
+        for (const auto& mapping : openDataVolumeIdMap) {
+            if (mapping.first == catalogVolumeId) {
+                return mapping.second;
+            }
+        }
+        return QString{};
+    };
+
     QString bestGrowthVolumeId;
     bool preferredVolumeFound = false;
-    const auto volumeIds = _state->vpkg()->volumeIDs();
+    const auto volumeIds = vc3d::orderedDisplayVolumeIds(*_state->vpkg());
+    const auto volumeSuffixes = vc3d::volumeDisplaySuffixes(*_state->vpkg());
     for (const auto& id : volumeIds) {
         try {
             auto vol = _state->vpkg()->volume(id);
             const QString idStr = QString::fromStdString(id);
             const QString nameStr = QString::fromStdString(vol->name());
-            const QString label = nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr);
+            const QString label = vc3d::volumeDisplayLabel(*_state->vpkg(), id,
+                nameStr.isEmpty() ? idStr : QStringLiteral("%1 (%2)").arg(nameStr, idStr),
+                volumeSuffixes.value(idStr));
 
             orderedIds.push_back(idStr);
             volumeEntries.append({idStr, label});
+            // A catalog volume id maps to a loaded volume showing it, its
+            // own zarr at level 0 first.
+            if (const auto view = _state->vpkg()->catalogView(id)) {
+                const QString catalogVolumeId = QString::fromStdString(view->volumeId);
+                const bool preferredOpenDataSource = view->source && view->level == 0;
+                const auto existing = std::find_if(
+                    openDataVolumeIdMap.begin(), openDataVolumeIdMap.end(),
+                    [&](const auto& mapping) { return mapping.first == catalogVolumeId; });
+                if (existing == openDataVolumeIdMap.end()) {
+                    openDataVolumeIdMap.append({catalogVolumeId, idStr});
+                } else if (preferredOpenDataSource &&
+                           !preferredOpenDataSourceIds.contains(catalogVolumeId)) {
+                    existing->second = idStr;
+                }
+                if (preferredOpenDataSource)
+                    preferredOpenDataSourceIds.insert(catalogVolumeId);
+            }
 
             const QString loweredName = nameStr.toLower();
             const QString loweredId = idStr.toLower();
@@ -7048,7 +4669,13 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
     }
 
     if (!activeCandidate.isEmpty() && !hasVolume(activeCandidate)) {
-        activeCandidate.clear();
+        activeCandidate = openDataVolumeIdMappedToLoadedId(activeCandidate);
+    }
+    if (activeCandidate.isEmpty() && !hasExplicitPreferredVolume) {
+        const QString rememberedVolumeId = rememberedVolumeIdForCurrentPackage();
+        if (!rememberedVolumeId.isEmpty() && hasVolume(rememberedVolumeId)) {
+            activeCandidate = rememberedVolumeId;
+        }
     }
     if (activeCandidate.isEmpty() && !currentComboId.isEmpty() && hasVolume(currentComboId)) {
         activeCandidate = currentComboId;
@@ -7068,6 +4695,9 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
         selector->clear();
         for (const auto& [id, label] : volumeEntries) {
             selector->addItem(label, QVariant(id));
+            const int row = selector->count() - 1;
+            const auto sourcePath = vc3d::volumeDisplayPath(*_state->vpkg(), id.toStdString());
+            selector->setItemData(row, sourcePath, Qt::ToolTipRole);
         }
         if (activeCandidate.isEmpty()) {
             if (selector->count() > 0) {
@@ -7077,6 +4707,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
             const int activeIndex = selector->findData(activeCandidate);
             selector->setCurrentIndex(activeIndex >= 0 ? activeIndex : 0);
         }
+        vc3d::refreshVolumeComboTooltip(selector);
     }
 
     QString activeId;
@@ -7138,13 +4769,7 @@ void CWindow::refreshVolumeSelectionUi(const QString& preferredVolumeId)
 
 void CWindow::CloseVolume(void)
 {
-    if (_fileWatcher) {
-        _fileWatcher->stopWatching();
-    }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->clearPreview(false);
-    }
 
     // Tear down active segmentation editing before surfaces disappear to avoid
     // dangling pointers inside the edit manager when the underlying surfaces
@@ -7160,6 +4785,9 @@ void CWindow::CloseVolume(void)
 
     // CState::closeAll emits volumeClosing, clears surfaces, vpkg, volume, points
     _state->closeAll();
+    if (_spiralWorkspace) {
+        _spiralWorkspace->synchronizeVolume(nullptr);
+    }
 
     updateNormalGridAvailability();
     if (_segmentationWidget) {
@@ -7168,8 +4796,6 @@ void CWindow::CloseVolume(void)
     }
 
     if (_surfacePanel) {
-        _surfacePanel->clear();
-        _surfacePanel->setVolumePkg(nullptr);
         _surfacePanel->resetTagUi();
     }
 
@@ -7182,10 +4808,19 @@ void CWindow::CloseVolume(void)
     if (_volumeOverlay) {
         _volumeOverlay->clearVolumePkg();
     }
-
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
+    for (QComboBox* selector : volumeSelectionControls()) {
+        if (!selector) continue;
+        const QSignalBlocker blocker(selector);
+        selector->clear();
+        selector->setEnabled(false);
     }
+    if (_viewerManager) {
+        _viewerManager->setOverlayVolume(nullptr, {});
+    }
+    if (_spiralWorkspace && _spiralWorkspace->viewerManager()) {
+        _spiralWorkspace->viewerManager()->setOverlayVolume(nullptr, {});
+    }
+
 }
 
 // Handle open request
@@ -7205,36 +4840,13 @@ auto CWindow::can_change_volume_() -> bool
     return false;
 }
 
-void CWindow::onVolumeClicked(cv::Vec3f vol_loc, cv::Vec3f normal, Surface *surf, Qt::MouseButton buttons, Qt::KeyboardModifiers modifiers)
-{
-    // Let fiber annotation controller consume the click if in WaitingForFirstClick mode
-    if (_fiberController && _fiberController->handleVolumeClick(vol_loc, normal, surf, buttons, modifiers))
-        return;
-
-    if (modifiers & Qt::ShiftModifier) {
-        return;
-    }
-    else if (modifiers & Qt::ControlModifier) {
-        std::cout << "clicked on vol loc " << vol_loc << std::endl;
-        // Get the surface ID from the surface collection
-        std::string surfId;
-        if (_state && surf) {
-            surfId = _state->findSurfaceId(surf);
-        }
-        centerFocusAt(vol_loc, normal, surfId);
-    }
-    else {
-    }
-}
-
-void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
+void CWindow::onSurfaceActivated(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    // Look up the shared_ptr by ID
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    if (_state && !newSurfId.empty() && surface) {
+        _state->setActiveSurface(newSurfId, surface);
     } else {
         _state->clearActiveSurface();
     }
@@ -7256,7 +4868,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             } catch (const std::exception& e) {
                 qWarning() << "Failed to activate surface"
                            << surfaceId
-                           << "while it may still be writing:"
+                           << ":"
                            << e.what();
                 _state->clearActiveSurface();
                 _state->setSurface("segmentation", nullptr, false, false);
@@ -7264,24 +4876,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
             }
         }
 
-        // Load corr_points_results for the new segment
-        if (_point_collection_widget) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _point_collection_widget->loadCorrPointsResults(
-                    quadSurf->path / "corr_points_results.json");
-            } else {
-                _point_collection_widget->clearCorrPointsResults();
-            }
-        }
-        if (_atlasControlDock) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
-            } else {
-                _atlasControlDock->clearResults();
-            }
-        }
+        loadLasagnaResults(surf.get());
     }
 
     const bool moveOnSurfaceChange = moveOnSurfaceChangeEnabled();
@@ -7331,7 +4926,7 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
         } catch (const std::exception& e) {
             qWarning() << "Failed to apply surface orientation for"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
@@ -7340,50 +4935,18 @@ void CWindow::onSurfaceActivated(const QString& surfaceId, QuadSurface* surface)
     }
 
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
-        _surfacePanel->refreshFiltersOnly();
+        _surfacePanel->applyFilters();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
-
-    maybeAttachBenchRecorder();
 }
 
-void CWindow::maybeAttachBenchRecorder()
-{
-    if (!_benchRecorder || _benchRecorder->attached())
-        return;
-    auto* viewer = segmentationViewer();
-    if (!viewer || !viewer->currentVolume() || !viewer->currentSurface())
-        return;
-
-    RenderBenchRecorder::Header h;
-    // The replay driver reopens via OpenVolume(), which wants the .volpkg.json
-    // file path (vpkg()->path()), not the parent directory vpkgPath() returns.
-    auto vpkg = _state ? _state->vpkg() : nullptr;
-    h.volpkgPath = vpkg ? QString::fromStdString(vpkg->path().string()) : QString();
-    h.volumeId = QString::fromStdString(viewer->currentVolume()->id());
-    h.volpkgIsRemote = viewer->currentVolume()->isRemote();
-    h.segmentId = QString::fromStdString(viewer->surfName() == "segmentation"
-                                             ? _state->activeSurfaceId()
-                                             : viewer->surfName());
-    if (auto* gv = viewer->graphicsView()) {
-        h.viewportW = gv->viewport()->width();
-        h.viewportH = gv->viewport()->height();
-    }
-    h.cacheSizeGB = _cacheSizeBytes / (1024ULL * 1024ULL * 1024ULL);
-    h.vc3dCommit = QString::fromStdString(ProjectInfo::RepositoryShortHash()).trimmed();
-    _benchRecorder->attach(viewer, std::move(h));
-}
-
-void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSurface* surface)
+void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, const std::shared_ptr<QuadSurface>& surface)
 {
     const std::string previousSurfId = _state->activeSurfaceId();
     const std::string newSurfId = surfaceId.toStdString();
 
-    if (_state->vpkg() && !newSurfId.empty()) {
-        _state->setActiveSurface(newSurfId, _state->vpkg()->getSurface(newSurfId));
+    if (_state && !newSurfId.empty() && surface) {
+        _state->setActiveSurface(newSurfId, surface);
     } else {
         _state->clearActiveSurface();
     }
@@ -7398,31 +4961,14 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
         } catch (const std::exception& e) {
             qWarning() << "Failed to activate surface"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
             surf.reset();
         }
 
-        // Load corr_points_results for the new segment
-        if (_point_collection_widget) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _point_collection_widget->loadCorrPointsResults(
-                    quadSurf->path / "corr_points_results.json");
-            } else {
-                _point_collection_widget->clearCorrPointsResults();
-            }
-        }
-        if (_atlasControlDock) {
-            auto quadSurf = std::dynamic_pointer_cast<QuadSurface>(surf);
-            if (quadSurf && !quadSurf->path.empty()) {
-                _atlasControlDock->loadResults(quadSurf->path / "atlas_control_points_results.json");
-            } else {
-                _atlasControlDock->clearResults();
-            }
-        }
+        loadLasagnaResults(surf.get());
 
         const bool wantsEditing = _segmentationWidget && _segmentationWidget->isEditingEnabled();
         if (wantsEditing) {
@@ -7458,7 +5004,7 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
         } catch (const std::exception& e) {
             qWarning() << "Failed to apply surface orientation for"
                        << surfaceId
-                       << "while it may still be writing:"
+                       << ":"
                        << e.what();
             _state->clearActiveSurface();
             _state->setSurface("segmentation", nullptr, false, false);
@@ -7467,12 +5013,9 @@ void CWindow::onSurfaceActivatedPreserveEditing(const QString& surfaceId, QuadSu
     }
 
     if (_surfacePanel && _surfacePanel->isCurrentOnlyFilterEnabled()) {
-        _surfacePanel->refreshFiltersOnly();
+        _surfacePanel->applyFilters();
     }
 
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
 }
 
 void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> surf)
@@ -7489,145 +5032,6 @@ void CWindow::onSurfaceWillBeDeleted(std::string name, std::shared_ptr<Surface> 
     // (the ID remains valid for lookup - will just return nullptr if surface is gone)
 }
 
-void CWindow::onEditMaskPressed(void)
-{
-    auto surf = _state->activeSurface().lock();
-    if (!surf)
-        return;
-
-    std::filesystem::path path = surf->path/"mask.tif";
-
-    // If mask already exists, just open it
-    if (std::filesystem::exists(path)) {
-        QDesktopServices::openUrl(QUrl::fromLocalFile(path.string().c_str()));
-        return;
-    }
-
-    if (_maskRenderInProgress)
-        return;
-    _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
-    statusBar()->showMessage(tr("Rendering mask..."));
-
-    auto* watcher = new QFutureWatcher<void>(this);
-    connect(watcher, &QFutureWatcher<void>::finished, this,
-            [this, watcher, surf, path]() {
-                watcher->deleteLater();
-                _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
-
-                statusBar()->showMessage(tr("Mask saved"), 3000);
-                QDesktopServices::openUrl(QUrl::fromLocalFile(
-                    QString::fromStdString(path.string())));
-            });
-
-    watcher->setFuture(QtConcurrent::run([surf, path]() {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<cv::Vec3f> coords;
-        render_binary_mask(surf.get(), mask, coords, 1.0f);
-        cv::imwrite(path.string(), mask);
-
-        surf->meta["date_last_modified"] = get_surface_time_str();
-        surf->save_meta();
-    }));
-}
-
-void CWindow::onAppendMaskPressed(void)
-{
-    auto surf = _state->activeSurface().lock();
-    if (!surf || !_state->currentVolume()) {
-        if (!surf) {
-            QMessageBox::warning(this, tr("Error"), tr("No surface selected."));
-        } else {
-            QMessageBox::warning(this, tr("Error"), tr("No volume loaded."));
-        }
-        return;
-    }
-
-    if (_maskRenderInProgress)
-        return;
-    _maskRenderInProgress = true;
-    ui.btnEditMask->setEnabled(false);
-    ui.btnAppendMask->setEnabled(false);
-    statusBar()->showMessage(tr("Rendering mask..."));
-
-    std::filesystem::path path = surf->path/"mask.tif";
-    auto volume = _state->currentVolume();
-
-    auto* watcher = new QFutureWatcher<QString>(this);
-    connect(watcher, &QFutureWatcher<QString>::finished, this,
-            [this, watcher, path]() {
-                watcher->deleteLater();
-                _maskRenderInProgress = false;
-                ui.btnEditMask->setEnabled(true);
-                ui.btnAppendMask->setEnabled(true);
-
-                try {
-                    QString msg = watcher->result();
-                    statusBar()->showMessage(msg, 3000);
-                    QDesktopServices::openUrl(QUrl::fromLocalFile(
-                        QString::fromStdString(path.string())));
-                } catch (const std::exception& e) {
-                    QMessageBox::critical(this, tr("Error"),
-                                         tr("Failed to render surface: %1").arg(e.what()));
-                    statusBar()->clearMessage();
-                }
-            });
-
-    watcher->setFuture(QtConcurrent::run([surf, volume, path]() -> QString {
-        cv::Mat_<uint8_t> mask;
-        cv::Mat_<uint8_t> img;
-        std::vector<cv::Mat> existing_layers;
-
-        if (std::filesystem::exists(path)) {
-            cv::imreadmulti(path.string(), existing_layers, cv::IMREAD_UNCHANGED);
-
-            if (existing_layers.empty())
-                throw std::runtime_error("Could not read existing mask file.");
-
-            mask = existing_layers[0];
-            cv::Size maskSize = mask.size();
-
-            {
-                cv::Size rawSize = surf->rawPointsPtr()->size();
-                cv::Vec3f ptr(0, 0, 0);
-                cv::Vec3f offset(-rawSize.width/2.0f, -rawSize.height/2.0f, 0);
-                float surfScale = surf->scale()[0];
-                cv::Mat_<cv::Vec3f> coords;
-                surf->gen(&coords, nullptr, maskSize, ptr, surfScale, offset);
-                img.create(coords.size());
-                render_image_from_coords(coords, img, volume.get());
-            }
-            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-            existing_layers.push_back(img);
-            atomicImwriteMulti(path, existing_layers);
-
-            QString msg = QString("Appended surface image to existing mask (now %1 layers)")
-                              .arg(existing_layers.size());
-
-            surf->meta["date_last_modified"] = get_surface_time_str();
-            surf->save_meta();
-            return msg;
-
-        } else {
-            cv::Mat_<cv::Vec3f> coords;
-            render_binary_mask(surf.get(), mask, coords, 1.0f);
-            render_surface_image(surf.get(), mask, img, volume.get(), 0, 1.0f);
-            cv::normalize(img, img, 0, 255, cv::NORM_MINMAX, CV_8U);
-
-            std::vector<cv::Mat> layers = {mask, img};
-            atomicImwriteMulti(path, layers);
-
-            surf->meta["date_last_modified"] = get_surface_time_str();
-            surf->save_meta();
-            return QString("Created new surface mask with image data");
-        }
-    }));
-}
-
 QString CWindow::getCurrentVolumePath() const
 {
     auto volume = _state->currentVolume();
@@ -7635,46 +5039,9 @@ QString CWindow::getCurrentVolumePath() const
         return QString();
     }
     if (volume->isRemote()) {
-        return QString::fromStdString(volume->remoteUrl());
+        return QString::fromStdString(volume->remoteLocator());
     }
     return QString::fromStdString(volume->path().string());
-}
-
-void CWindow::onSegmentationDirChanged(int index)
-{
-    if (!_state->vpkg() || index < 0 || !cmbSegmentationDir) {
-        return;
-    }
-
-    std::string newDir = cmbSegmentationDir->itemText(index).toStdString();
-
-    // Only reload if the directory actually changed
-    if (newDir != _state->vpkg()->getSegmentationDirectory()) {
-        // Clear the current segmentation surface first to ensure viewers update
-        _state->setSurface("segmentation", nullptr, true);
-
-        // Clear current surface selection
-        _state->clearActiveSurface();
-        treeWidgetSurfaces->clearSelection();
-
-        if (_surfacePanel) {
-            _surfacePanel->resetTagUi();
-        }
-
-        // Set the new directory in the VolumePkg
-        _state->vpkg()->setSegmentationDirectory(newDir);
-
-        // Reset stride user override for the new directory.
-        if (_viewerManager) {
-            _viewerManager->resetStrideUserOverride();
-        }
-        if (_surfacePanel) {
-            _surfacePanel->loadSurfaces(true);
-        }
-
-        // Update the status bar to show the change
-        statusBar()->showMessage(tr("Switched to %1 directory").arg(QString::fromStdString(newDir)), 3000);
-    }
 }
 
 
@@ -7739,8 +5106,110 @@ void CWindow::onManualLocationChanged()
     centerFocusAt(cv::Vec3f(x, y, z), cv::Vec3f(0, 0, 1), std::string());
 
     if (_surfacePanel) {
-        _surfacePanel->refreshFiltersOnly();
+        _surfacePanel->applyFilters();
     }
+}
+
+void CWindow::refreshFocusBoundsUi()
+{
+    if (_fiberMapWorkspace) {
+        // Map geometry indexes the annotation volume, as stored bounds do.
+        _fiberMapWorkspace->setFocusBounds(_state ? _state->activeAnnotationFocusBounds() : std::nullopt);
+    }
+    if (!ui.chkFocusBBox || !ui.focusBBoxMin || !ui.focusBBoxMax) {
+        return;
+    }
+
+    std::optional<Rect3D> bounds = _state ? _state->focusBounds() : std::nullopt;
+    if (!bounds && _state && _state->currentVolume()) {
+        const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+        bounds = Rect3D{{0.0f, 0.0f, 0.0f},
+                        {static_cast<float>(std::max(0, width - 1)),
+                         static_cast<float>(std::max(0, height - 1)),
+                         static_cast<float>(std::max(0, depth - 1))}};
+    }
+
+    const QSignalBlocker checkBlocker(ui.chkFocusBBox);
+    const QSignalBlocker minBlocker(ui.focusBBoxMin);
+    const QSignalBlocker maxBlocker(ui.focusBBoxMax);
+    ui.chkFocusBBox->setChecked(_state && _state->focusBoundsEnabled());
+    const bool haveVolume = _state && _state->currentVolume();
+    ui.chkFocusBBox->setEnabled(haveVolume);
+    ui.focusBBoxMin->setEnabled(haveVolume);
+    ui.focusBBoxMax->setEnabled(haveVolume);
+    if (!bounds) {
+        ui.focusBBoxMin->clear();
+        ui.focusBBoxMax->clear();
+        return;
+    }
+    const auto formatPoint = [](const cv::Vec3f& point) {
+        return QStringLiteral("%1, %2, %3")
+            .arg(static_cast<int>(std::lround(point[0])))
+            .arg(static_cast<int>(std::lround(point[1])))
+            .arg(static_cast<int>(std::lround(point[2])));
+    };
+    ui.focusBBoxMin->setText(formatPoint(bounds->low));
+    ui.focusBBoxMax->setText(formatPoint(bounds->high));
+}
+
+void CWindow::onFocusBoundsEdited()
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto parsePoint = [](const QString& text) -> std::optional<cv::Vec3f> {
+        const QStringList parts = text.trimmed().split(',');
+        if (parts.size() != 3) {
+            return std::nullopt;
+        }
+        cv::Vec3f point;
+        for (int axis = 0; axis < 3; ++axis) {
+            bool ok = false;
+            const int value = parts[axis].trimmed().toInt(&ok);
+            if (!ok) {
+                return std::nullopt;
+            }
+            point[axis] = static_cast<float>(value);
+        }
+        return point;
+    };
+
+    auto low = parsePoint(ui.focusBBoxMin->text());
+    auto high = parsePoint(ui.focusBBoxMax->text());
+    if (!low || !high) {
+        refreshFocusBoundsUi();
+        return;
+    }
+
+    const auto [width, height, depth] = _state->currentVolume()->shapeXyz();
+    const cv::Vec3f volumeHigh{
+        static_cast<float>(std::max(0, width - 1)),
+        static_cast<float>(std::max(0, height - 1)),
+        static_cast<float>(std::max(0, depth - 1))};
+    for (int axis = 0; axis < 3; ++axis) {
+        (*low)[axis] = std::clamp((*low)[axis], 0.0f, volumeHigh[axis]);
+        (*high)[axis] = std::clamp((*high)[axis], 0.0f, volumeHigh[axis]);
+    }
+    _state->setFocusBounds(Rect3D{*low, *high});
+    refreshFocusBoundsUi();
+}
+
+void CWindow::onFocusBoundsToggled(bool enabled)
+{
+    if (!_state || !_state->currentVolume()) {
+        refreshFocusBoundsUi();
+        return;
+    }
+    if (enabled && !_state->focusBounds()) {
+        onFocusBoundsEdited();
+        if (!_state->focusBounds()) {
+            refreshFocusBoundsUi();
+            return;
+        }
+    }
+    _state->setFocusBoundsEnabled(enabled);
 }
 
 void CWindow::onZoomIn()
@@ -7752,6 +5221,8 @@ void CWindow::onZoomIn()
 
 void CWindow::onFocusPOIChanged(std::string name, POI* poi)
 {
+    // Slice-plane reorientation and viewer recentering are handled centrally
+    // by ViewerManager::handleFocusPoiChanged; only Main-specific UI here.
     if (name == "focus" && poi) {
         lblLocFocus->setText(QString("%1, %2, %3")
             .arg(static_cast<int>(poi->p[0]))
@@ -7759,33 +5230,24 @@ void CWindow::onFocusPOIChanged(std::string name, POI* poi)
             .arg(static_cast<int>(poi->p[2])));
 
         if (_surfacePanel) {
-            _surfacePanel->refreshFiltersOnly();
-        }
-
-        _axisAlignedSliceController->applyOrientation();
-
-        if (!poi->suppressViewerRecenter) {
-            const cv::Vec3f focusPosition = poi->p;
-            QTimer::singleShot(0, this, [this, focusPosition]() {
-                recenterPlaneViewersOn(focusPosition);
-            });
+            _surfacePanel->applyFilters();
         }
     }
 }
 
-void CWindow::onPointDoubleClicked(uint64_t pointId)
+void CWindow::onPointDoubleClicked(vc::PointRef point)
 {
-    auto point_opt = _state->pointCollection()->getPoint(pointId);
+    auto point_opt = _state->pointCollection()->getPoint(point);
     if (point_opt) {
         centerFocusAt(point_opt->p, cv::Vec3f(0, 0, 0), "");
     }
 }
 
-void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
+void CWindow::onConvertPointToAnchor(vc::PointRef point)
 {
-    auto point_opt = _state->pointCollection()->getPoint(pointId);
+    auto point_opt = _state->pointCollection()->getPoint(point);
     if (!point_opt) {
-        statusBar()->showMessage(tr("Point not found"), 2000);
+        showStatusBarMessage(tr("Point not found"), 2000);
         return;
     }
 
@@ -7793,31 +5255,30 @@ void CWindow::onConvertPointToAnchor(uint64_t pointId, uint64_t collectionId)
     auto seg_surface = _state->surface("segmentation");
     auto* quad_surface = dynamic_cast<QuadSurface*>(seg_surface.get());
     if (!quad_surface) {
-        statusBar()->showMessage(tr("No active segmentation surface for anchor conversion"), 3000);
+        showStatusBarMessage(tr("No active segmentation surface for anchor conversion"), 3000);
         return;
     }
 
     // Find the 2D grid location of this point on the surface
-    cv::Vec3f ptr(0, 0, 0);
-    auto* patchIndex = _viewerManager ? _viewerManager->surfacePatchIndex() : nullptr;
-    float dist = quad_surface->pointTo(ptr, point_opt->p, 4.0, 1000, patchIndex);
-
-    if (dist > 10.0) {
-        statusBar()->showMessage(tr("Point is too far from surface (distance: %1)").arg(dist), 3000);
+    constexpr float kMaxDistance = 10.0f;
+    const auto hit = _viewerManager ? _viewerManager->locate(*quad_surface, point_opt->p, kMaxDistance) : std::nullopt;
+    if (!hit) {
+        showStatusBarMessage(tr("Point is farther than %1 voxels from the surface").arg(kMaxDistance), 3000);
         return;
     }
+    const cv::Vec3f ptr = hit->ptr;
 
     // Get the raw grid location (internal coordinates)
     cv::Vec3f loc_3d = quad_surface->loc_raw(ptr);
     cv::Vec2f anchor2d(loc_3d[0], loc_3d[1]);
 
     // Set the anchor2d on the collection
-    _state->pointCollection()->setCollectionAnchor2d(collectionId, anchor2d);
+    _state->pointCollection()->setCollectionAnchor2d(point.collectionId, anchor2d);
 
     // Remove the point (it's now represented by the anchor)
-    _state->pointCollection()->removePoint(pointId);
+    _state->pointCollection()->removePoint(point);
 
-    statusBar()->showMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
+    showStatusBarMessage(tr("Converted point to anchor at grid position (%1, %2)").arg(anchor2d[0]).arg(anchor2d[1]), 3000);
 }
 
 void CWindow::onZoomOut()
@@ -7832,7 +5293,7 @@ void CWindow::onCopyCoordinates()
     QString coords = lblLocFocus->text().trimmed();
     if (!coords.isEmpty()) {
         QApplication::clipboard()->setText(coords);
-        statusBar()->showMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
+        showStatusBarMessage(tr("Coordinates copied to clipboard: %1").arg(coords), 2000);
     }
 }
 
@@ -7843,16 +5304,13 @@ void CWindow::onResetAxisAlignedRotations()
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->refreshAll();
     }
-    statusBar()->showMessage(tr("All plane rotations reset"), 2000);
+    showStatusBarMessage(tr("All plane rotations reset"), 2000);
 }
 
 void CWindow::onAxisOverlayVisibilityToggled(bool enabled)
 {
     if (_planeSlicingOverlay) {
         _planeSlicingOverlay->setAxisAlignedEnabled(enabled && _axisAlignedSliceController->isEnabled());
-    }
-    if (auto* spinAxisOverlayOpacity = ui.spinAxisOverlayOpacity) {
-        spinAxisOverlayOpacity->setEnabled(_axisAlignedSliceController->isEnabled() && enabled);
     }
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::SHOW_AXIS_OVERLAYS, enabled ? "1" : "0");
@@ -7870,7 +5328,7 @@ void CWindow::onAxisOverlayOpacityChanged(int value)
 
 void CWindow::onAxisAlignedSlicesToggled(bool enabled)
 {
-    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays, ui.spinAxisOverlayOpacity);
+    _axisAlignedSliceController->setEnabled(enabled, ui.chkAxisOverlays);
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::USE_AXIS_ALIGNED_SLICES, enabled ? "1" : "0");
 }
@@ -7880,38 +5338,9 @@ void CWindow::onMoveOnSurfaceChangedToggled(bool enabled)
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
     settings.setValue(vc3d::settings::viewer::RESET_VIEW_ON_SURFACE_CHANGE, enabled ? "1" : "0");
 
-    if (!_viewerManager) {
-        return;
+    for (auto* manager : ViewerManager::allManagers()) {
+        manager->setResetViewOnSurfaceChangeDefault(enabled);
     }
-
-    const bool editingActive = _segmentationModule && _segmentationModule->editingEnabled();
-    _viewerManager->forEachBaseViewer([this, enabled, editingActive](VolumeViewerBase* viewer) {
-        if (!viewer) {
-            return;
-        }
-        _viewerManager->setResetDefaultFor(viewer, enabled);
-        if (editingActive && viewer->surfName() == "segmentation") {
-            viewer->setResetViewOnSurfaceChange(false);
-            return;
-        }
-        viewer->setResetViewOnSurfaceChange(enabled);
-    });
-}
-
-void CWindow::onPlaneIntersectionLinesToggled(bool enabled)
-{
-    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-    settings.setValue(vc3d::settings::viewer::SHOW_PLANE_INTERSECTION_LINES, enabled ? "1" : "0");
-
-    if (!_viewerManager) {
-        return;
-    }
-
-    _viewerManager->forEachBaseViewer([enabled](VolumeViewerBase* viewer) {
-        if (viewer) {
-            viewer->setPlaneIntersectionLinesVisible(enabled);
-        }
-    });
 }
 
 void CWindow::onSegmentationEditingModeChanged(bool enabled)
@@ -7929,35 +5358,16 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         enabled = already;
     }
 
-    std::optional<std::string> recentlyEditedId;
-    if (!enabled) {
-        if (auto* activeSurface = _segmentationModule->activeBaseSurface()) {
-            recentlyEditedId = activeSurface->id;
-        }
-    }
-
     // Set flag BEFORE beginEditingSession so the surface change doesn't reset view
     if (_viewerManager) {
-        _viewerManager->forEachBaseViewer([this, enabled](VolumeViewerBase* viewer) {
-            if (!viewer) {
-                return;
-            }
-            if (viewer->surfName() == "segmentation") {
-                bool defaultReset = _viewerManager->resetDefaultFor(viewer);
-                if (enabled) {
-                    viewer->setResetViewOnSurfaceChange(false);
-                } else {
-                    viewer->setResetViewOnSurfaceChange(defaultReset);
-                }
-            }
-        });
+        _viewerManager->setSegmentationResetViewSuppressed(enabled);
     }
 
     if (enabled) {
         auto activeSurfaceShared = std::dynamic_pointer_cast<QuadSurface>(_state->surface("segmentation"));
 
         if (!_segmentationModule->beginEditingSession(activeSurfaceShared)) {
-            statusBar()->showMessage(tr("Unable to start segmentation editing"), 3000);
+            showStatusBarMessage(tr("Unable to start segmentation editing"), 3000);
             if (_segmentationWidget && _segmentationWidget->isEditingEnabled()) {
                 QSignalBlocker blocker(_segmentationWidget);
                 _segmentationWidget->setEditingEnabled(false);
@@ -7975,19 +5385,12 @@ void CWindow::onSegmentationEditingModeChanged(bool enabled)
         }
     } else {
         _segmentationModule->endEditingSession();
-
-        if (recentlyEditedId && !recentlyEditedId->empty()) {
-            _fileWatcher->markSegmentRecentlyEdited(*recentlyEditedId);
-        }
     }
 
     const QString message = enabled
         ? tr("Segmentation editing enabled")
         : tr("Segmentation editing disabled");
-    statusBar()->showMessage(message, 2000);
-    if (_surfaceAffineTransforms) {
-        _surfaceAffineTransforms->refresh();
-    }
+    showStatusBarMessage(message, 2000);
 }
 
 void CWindow::onSegmentationStopToolsRequested()
@@ -7997,7 +5400,7 @@ void CWindow::onSegmentationStopToolsRequested()
     }
     if (_cmdRunner) {
         _cmdRunner->cancel();
-        statusBar()->showMessage(tr("Cancelling running tools..."), 3000);
+        showStatusBarMessage(tr("Cancelling running tools..."), 3000);
     }
 }
 
@@ -8007,9 +5410,11 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
                                         bool inpaintOnly)
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
+
+    updateNormalGridAvailability();
 
     SegmentationGrower::Context context{
         _segmentationModule.get(),
@@ -8024,8 +5429,7 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
         _state->currentVolume(),
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
-        _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _normalGridPath
     };
 
     if (!_segmentationGrower->start(volumeContext, method, direction, steps, inpaintOnly)) {
@@ -8033,177 +5437,14 @@ void CWindow::onGrowSegmentationSurface(SegmentationGrowthMethod method,
     }
 }
 
-void CWindow::updateSurfaceOverlayDropdown()
-{
-    if (!ui.surfaceOverlaySelect) {
-        return;
-    }
-
-    // Disconnect previous model's signals if any
-    if (_surfaceOverlayModel) {
-        disconnect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
-                   this, &CWindow::onSurfaceOverlaySelectionChanged);
-    }
-
-    // Create new model
-    _surfaceOverlayModel = new QStandardItemModel(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setModel(_surfaceOverlayModel);
-
-    // Use a QListView to properly show checkboxes
-    auto* listView = new QListView(ui.surfaceOverlaySelect);
-    ui.surfaceOverlaySelect->setView(listView);
-
-    // Get current segmentation directory for filtering
-    std::string currentDir;
-    if (_state->vpkg()) {
-        currentDir = _state->vpkg()->getSegmentationDirectory();
-    }
-
-    // Add "All" item at the top
-    auto* allItem = new QStandardItem(tr("All"));
-    allItem->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-    allItem->setData(Qt::Unchecked, Qt::CheckStateRole);
-    allItem->setData(QStringLiteral("__all__"), Qt::UserRole);
-    _surfaceOverlayModel->appendRow(allItem);
-
-    if (_state) {
-        const auto names = _state->surfaceNames();
-        for (const auto& name : names) {
-            // Only add QuadSurfaces (actual segmentations), skip PlaneSurfaces
-            auto surf = _state->surface(name);
-            auto* quadSurf = dynamic_cast<QuadSurface*>(surf.get());
-            if (!quadSurf) {
-                continue;
-            }
-
-            // Filter by current segmentation directory
-            if (!currentDir.empty() && !surf->path.empty()) {
-                std::string surfDir = surf->path.parent_path().filename().string();
-                if (surfDir != currentDir) {
-                    continue;
-                }
-            }
-
-            auto* item = new QStandardItem(QString::fromStdString(name));
-            item->setFlags(Qt::ItemIsUserCheckable | Qt::ItemIsEnabled);
-            item->setData(Qt::Unchecked, Qt::CheckStateRole);
-            item->setData(QString::fromStdString(name), Qt::UserRole);
-
-            // Assign persistent color if not already assigned
-            if (_surfaceOverlayColorAssignments.find(name) == _surfaceOverlayColorAssignments.end()) {
-                _surfaceOverlayColorAssignments[name] = _nextSurfaceOverlayColorIndex++;
-            }
-            size_t colorIdx = _surfaceOverlayColorAssignments[name];
-
-            // Create color swatch icon (16x16 colored square)
-            QPixmap swatch(16, 16);
-            swatch.fill(getOverlayColor(colorIdx));
-            item->setIcon(QIcon(swatch));
-
-            _surfaceOverlayModel->appendRow(item);
-        }
-    }
-
-    // Connect model's dataChanged signal for checkbox state changes
-    connect(_surfaceOverlayModel, &QStandardItemModel::dataChanged,
-            this, &CWindow::onSurfaceOverlaySelectionChanged);
-}
-
-void CWindow::onSurfaceOverlaySelectionChanged(const QModelIndex& topLeft,
-                                                const QModelIndex& /*bottomRight*/,
-                                                const QVector<int>& roles)
-{
-    if (!roles.contains(Qt::CheckStateRole) || !_surfaceOverlayModel || !_viewerManager) {
-        return;
-    }
-
-    // Check if "All" was toggled (row 0)
-    QStandardItem* changedItem = _surfaceOverlayModel->itemFromIndex(topLeft);
-    if (changedItem && changedItem->data(Qt::UserRole).toString() == QStringLiteral("__all__")) {
-        bool allChecked = changedItem->checkState() == Qt::Checked;
-
-        // Block signals while updating all items
-        {
-            QSignalBlocker blocker(_surfaceOverlayModel);
-            for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-                QStandardItem* item = _surfaceOverlayModel->item(row);
-                if (item) {
-                    item->setCheckState(allChecked ? Qt::Checked : Qt::Unchecked);
-                }
-            }
-        }
-    }
-
-    // Build map of selected surfaces with colors
-    std::map<std::string, cv::Vec3b> selectedSurfaces;
-    int checkedCount = 0;
-    int totalSurfaces = 0;
-
-    for (int row = 1; row < _surfaceOverlayModel->rowCount(); ++row) {
-        QStandardItem* item = _surfaceOverlayModel->item(row);
-        if (!item) continue;
-
-        totalSurfaces++;
-        if (item->checkState() == Qt::Checked) {
-            checkedCount++;
-            std::string name = item->data(Qt::UserRole).toString().toStdString();
-            size_t colorIdx = _surfaceOverlayColorAssignments[name];
-            selectedSurfaces[name] = getOverlayColorBGR(colorIdx);
-        }
-    }
-
-    // Update "All" checkbox state (partial/full/none) without triggering recursion
-    {
-        QSignalBlocker blocker(_surfaceOverlayModel);
-        QStandardItem* allItem = _surfaceOverlayModel->item(0);
-        if (allItem) {
-            if (checkedCount == 0) {
-                allItem->setCheckState(Qt::Unchecked);
-            } else if (checkedCount == totalSurfaces && totalSurfaces > 0) {
-                allItem->setCheckState(Qt::Checked);
-            } else {
-                allItem->setCheckState(Qt::PartiallyChecked);
-            }
-        }
-    }
-
-    // Propagate to all viewers
-    _viewerManager->forEachBaseViewer([&selectedSurfaces](VolumeViewerBase* viewer) {
-        viewer->setSurfaceOverlays(selectedSurfaces);
-    });
-}
-
-QColor CWindow::getOverlayColor(size_t index) const
-{
-    static const std::vector<QColor> palette = {
-        QColor(80, 180, 255),   // sky blue
-        QColor(180, 80, 220),   // violet
-        QColor(80, 220, 200),   // aqua/teal
-        QColor(220, 80, 180),   // magenta
-        QColor(80, 130, 255),   // medium blue
-        QColor(160, 80, 255),   // purple
-        QColor(80, 255, 220),   // cyan
-        QColor(255, 80, 200),   // hot pink
-        QColor(120, 220, 80),   // lime green
-        QColor(80, 180, 120),   // spring green
-        QColor(150, 200, 255),  // light sky blue
-        QColor(200, 150, 230),  // light violet
-    };
-    return palette[index % palette.size()];
-}
-
-cv::Vec3b CWindow::getOverlayColorBGR(size_t index) const
-{
-    QColor c = getOverlayColor(index);
-    return cv::Vec3b(c.blue(), c.green(), c.red());
-}
-
 void CWindow::onCopyWithNtRequested()
 {
     if (!_segmentationGrower) {
-        statusBar()->showMessage(tr("Segmentation growth is unavailable."), 4000);
+        showStatusBarMessage(tr("Segmentation growth is unavailable."), 4000);
         return;
     }
+
+    updateNormalGridAvailability();
 
     SegmentationGrower::Context context{
         _segmentationModule.get(),
@@ -8218,8 +5459,7 @@ void CWindow::onCopyWithNtRequested()
         _state->currentVolume(),
         _state->currentVolumeId(),
         _state->segmentationGrowthVolumeId().empty() ? _state->currentVolumeId() : _state->segmentationGrowthVolumeId(),
-        _normalGridPath,
-        _segmentationWidget ? _segmentationWidget->normal3dZarrPath() : QString()
+        _normalGridPath
     };
 
     if (!_segmentationGrower->startCopyWithNt(volumeContext)) {
@@ -8227,7 +5467,7 @@ void CWindow::onCopyWithNtRequested()
     }
 }
 
-void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
+void CWindow::onFocusViewsRequested(uint64_t collectionId, std::optional<vc::PointRef> point)
 {
     if (!_state) return;
     auto* pointCollection = _state->pointCollection();
@@ -8254,8 +5494,8 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
 
     // Determine focus position
     cv::Vec3f focusPos = centroid;
-    if (pointId != 0) {
-        auto point_opt = pointCollection->getPoint(pointId);
+    if (point) {
+        auto point_opt = pointCollection->getPoint(*point);
         if (point_opt) focusPos = point_opt->p;
     }
 
@@ -8330,16 +5570,24 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         planeShared->setNormal(normal);
         planeShared->setInPlaneRotation(0.0f);
 
+        // Keep the volumetric-camera azimuth folded into the plane (see
+        // AxisAlignedSliceController::applyOrientation).
+        float inPlaneRot = AxisAlignedSliceController::azimuthInPlaneRotation(
+            *planeShared,
+            _axisAlignedSliceController
+                ? _axisAlignedSliceController->volumetricAzimuthDeg(planeName)
+                : 0.0f);
+
         // Adjust in-plane rotation so Z projects "up"
         const cv::Vec3f upAxis(0.0f, 0.0f, 1.0f);
         const cv::Vec3f projectedUp = projectVectorOntoPlane(upAxis, normal);
         const cv::Vec3f desiredUp = normalizeOrZero(projectedUp);
         if (cv::norm(desiredUp) > kEpsilon) {
             const cv::Vec3f currentUp = planeShared->basisY();
-            const float delta = signedAngleBetween(currentUp, desiredUp, normal);
-            if (std::abs(delta) > kEpsilon) {
-                planeShared->setInPlaneRotation(delta);
-            }
+            inPlaneRot += signedAngleBetween(currentUp, desiredUp, normal);
+        }
+        if (std::abs(inPlaneRot) > kEpsilon) {
+            planeShared->setInPlaneRotation(inPlaneRot);
         }
 
         _state->setSurface(planeName, planeShared);
@@ -8374,86 +5622,61 @@ void CWindow::onFocusViewsRequested(uint64_t collectionId, uint64_t pointId)
         _planeSlicingOverlay->refreshAll();
     }
 
-    statusBar()->showMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
+    showStatusBarMessage(tr("Focused & aligned view to %1 points").arg(pts.size()), 3000);
 }
 
-// ---- Fiber annotation slots -------------------------------------------------
-
-void CWindow::onNewFiberRequested()
+namespace {
+// The project's store, then the stores beside it.
+std::vector<vc::objects::AttachmentIdentity> openStores(const CState& state)
 {
-    if (_fiberController) {
-        _fiberController->beginNewFiber();
-    }
+    std::vector<vc::objects::AttachmentIdentity> stores;
+    for (const auto& attached : state.attachedStores()) stores.push_back(attached);
+    return stores;
+}
 }
 
-void CWindow::onFiberCrosshairModeChanged(bool active)
+void CWindow::updateHostedStatus()
 {
-    if (!_viewerManager) return;
-    _viewerManager->forEachBaseViewer([active](VolumeViewerBase* v) {
-        if (v->graphicsView()) {
-            v->graphicsView()->setCursor(active ? Qt::CrossCursor : Qt::ArrowCursor);
+    const auto session = _state->objectStoreSession();
+    const auto pending = session->pendingSubmissions();
+    QStringList texts, tips;
+    bool failing = false;
+    for (const auto& attachment : openStores(*_state)) {
+        std::optional<vc::objects::HostedFreshness> freshness;
+        try { freshness = session->freshness(attachment); } catch (const std::exception&) { continue; }
+        if (!freshness) continue;
+        const auto endpoint = QString::fromStdString(session->location(attachment));
+        const auto checked = freshness->checkedAtUs
+            ? QDateTime::fromMSecsSinceEpoch(*freshness->checkedAtUs / 1000).toLocalTime().toString(QStringLiteral("HH:mm:ss"))
+            : QString();
+        QString text;
+        if (!freshness->error.empty()) {
+            failing = true;
+            text = checked.isEmpty() ? tr("%1: disconnected").arg(endpoint)
+                                     : tr("%1: disconnected, last current %2").arg(endpoint, checked);
+            tips << tr("%1: %2").arg(endpoint, QString::fromStdString(freshness->error));
+        } else if (!checked.isEmpty()) {
+            text = tr("%1: current as of %2").arg(endpoint, checked);
+        } else {
+            text = tr("%1: unknown").arg(endpoint);
         }
-    });
+        const auto waiting = std::count_if(pending.begin(), pending.end(),
+                                           [&](const auto& p) { return p.storeUuid == attachment.storeUuid; });
+        if (waiting) text += tr(" · %n save(s) pending", nullptr, int(waiting));
+        if (freshness->status)
+            tips << tr("%1: store %2, generation %3, commit %4")
+                        .arg(endpoint, QString::fromStdString(freshness->status->storeUuid))
+                        .arg(QString::fromStdString(freshness->status->generation))
+                        .arg(freshness->status->commitSequence);
+        texts << text;
+    }
+    if (texts.isEmpty()) {
+        _hostedStatusLabel->hide();
+        return;
+    }
+    _hostedStatusLabel->setText(texts.join(QStringLiteral("  ")));
+    _hostedStatusLabel->setToolTip(tips.join(QStringLiteral("\n")));
+    _hostedStatusLabel->setStyleSheet(failing ? QStringLiteral("color: #d28b00; font-weight: 600;") : QString());
+    _hostedStatusLabel->show();
 }
 
-void CWindow::onFiberViewersRequested()
-{
-    if (!_fiberController) return;
-
-    constexpr int N = FiberAnnotationController::kNumViews;
-
-    QMdiSubWindow* subWindows[N] = {};
-
-    for (int i = 0; i < N; ++i) {
-        QString title = (i == 0) ? tr("Fiber Ref") : tr("Fiber Annotate");
-
-        auto* baseViewer = newConnectedViewer(
-            FiberAnnotationController::fiberSurfaceName(i), title, mdiArea);
-        auto* viewer = baseViewer
-            ? qobject_cast<CChunkedVolumeViewer*>(baseViewer->asQObject())
-            : nullptr;
-        if (!viewer) continue;
-
-        _fiberController->setFiberViewer(i, viewer);
-
-        // Isolate from segmentation module and global focus POI
-        disconnect(_state, &CState::poiChanged, viewer, &CTiledVolumeViewer::onPOIChanged);
-        if (_segmentationModule)
-            disconnect(viewer, nullptr, _segmentationModule.get(), nullptr);
-
-        // Only the last view (annotation) handles clicks
-        if (i == N - 1) {
-            connect(viewer, &CTiledVolumeViewer::sendVolumeClicked,
-                    _fiberController.get(), &FiberAnnotationController::onAnnotationViewerClicked);
-        }
-
-        if (_state->currentVolume())
-            viewer->OnVolumeChanged(_state->currentVolume());
-
-        subWindows[i] = qobject_cast<QMdiSubWindow*>(viewer->parentWidget());
-        if (subWindows[i])
-            subWindows[i]->show();
-    }
-
-    // Layout: 2 columns × 1 row — ref on the left, annotate on the right.
-    QRect area = mdiArea->contentsRect();
-    int colW = area.width() / 2;
-    int rowH = area.height();
-
-    for (int i = 0; i < N; ++i) {
-        if (!subWindows[i]) continue;
-        int x = area.x() + i * colW;
-        int y = area.y();
-        subWindows[i]->setGeometry(x, y, colW, rowH);
-    }
-}
-
-void CWindow::onFiberAnnotationFinished(uint64_t fiberId)
-{
-    if (_fiberWidget) {
-        _fiberWidget->selectFiber(fiberId);
-    }
-    if (_fiberSliceWidget) {
-        _fiberSliceWidget->selectFiber(fiberId);
-    }
-}

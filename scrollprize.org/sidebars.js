@@ -11,112 +11,89 @@
 
 // @ts-check
 
-const brandHeader = {
-  type: 'html',
-  value:
-    '<a class="navbar__brand custom-top-header" href="/"><div class="navbar__logo"><img src="/img/social/favicon-64x64.png" alt="Vesuvius Challenge Logo" class="themedImage_ToTc themedImage--dark_i4oU"></div><b class="navbar__title text--truncate">Vesuvius Challenge</b></a>',
-};
-
 /** @type {import('@docusaurus/plugin-content-docs').SidebarsConfig} */
 const sidebars = {
-  // Single, unified menu used across the whole site so every important page is
-  // reachable from one coherent navigation surface.
-  overviewSidebar: [
-    brandHeader,
+  // One sidebar per navbar section; the sidebar is a "within this section"
+  // nav, not a second copy of the site menu. Docs that aren't listed in any
+  // sidebar (landing, get_started, prizes, open problems, faq, press, jobs,
+  // villa_model, livestream) render standalone with no left sidebar.
+  // Retired pages stay reachable inside the section they belong to, in a
+  // collapsed archive group, because journals and Discord still link them.
+  // A navbar item opens a section via `type: 'docSidebar'` (or, for the
+  // Tutorials dropdown, src/theme/NavbarItem/DropdownNavbarItem), which also
+  // keeps the item highlighted on every page of its sidebar.
+  tutorialsSidebar: [
     {
       type: 'category',
-      label: 'Overview',
-      link: { type: 'doc', id: 'landing' },
+      label: 'Tutorials & In-depth',
+      collapsible: false,
       items: [
-        { type: 'doc', id: 'get_started' },
-        { type: 'doc', id: 'prizes' },
-        { type: 'doc', id: 'unwrapping' },
-        { type: 'doc', id: 'master_plan' },
+        { type: 'doc', id: 'tutorial_VC3D' },
+        { type: 'doc', id: 'tutorial_spiral' },
+        { type: 'doc', id: 'winding_annotations' },
+        { type: 'doc', id: 'tutorial5' },
+        {
+          type: 'link',
+          label: 'Scroll Anatomy',
+          href: 'https://github.com/ScrollPrize/villa/blob/main/SCROLL_ANATOMY.md',
+        },
       ],
     },
     {
       type: 'category',
-      label: 'Data',
+      label: 'Older tutorials',
       collapsible: true,
       collapsed: true,
-      link: { type: 'doc', id: 'data' },
       items: [
-        { type: 'doc', id: 'data_browser', label: 'Data Browser' },
-        { type: 'doc', id: 'data_segments' },
-        { type: 'doc', id: 'data_datasets' },
-        { type: 'doc', id: 'data_fragments' },
-      ],
-    },
-    {
-      type: 'category',
-      label: 'Tutorials',
-      collapsible: true,
-      collapsed: true,
-      link: { type: 'doc', id: 'tutorial' },
-      items: [
+        { type: 'doc', id: 'tutorial' },
         { type: 'doc', id: 'tutorial1' },
         { type: 'doc', id: 'tutorial2' },
         { type: 'doc', id: 'tutorial3' },
-        { type: 'doc', id: 'tutorial5' },
         { type: 'doc', id: 'segmentation' },
-        { type: 'doc', id: 'ink_detection' },
+        { type: 'doc', id: 'unwrapping' },
         { type: 'doc', id: 'tutorial_VC' },
       ],
     },
-    { type: 'doc', id: 'faq' },
+  ],
+  dataSidebar: [
+    {
+      type: 'category',
+      label: 'Data',
+      collapsible: false,
+      items: [
+        { type: 'doc', id: 'data_browser' },
+        { type: 'doc', id: 'data' },
+        { type: 'doc', id: 'data_datasets' },
+      ],
+    },
+  ],
+  milestonesSidebar: [
     {
       type: 'category',
       label: 'Milestones & Results',
-      link: { type: 'doc', id: 'winners' },
+      collapsible: false,
       items: [
+        { type: 'doc', id: 'winners', label: 'Prize Winners' },
         { type: 'doc', id: 'firstscroll' },
-        { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'grandprize' },
-        { type: 'doc', id: 'grand_prize' },
+        { type: 'doc', id: 'firstletters' },
         { type: 'doc', id: 'community_projects' },
       ],
     },
     {
       type: 'category',
-      label: 'The Scrolls',
-      link: { type: 'doc', id: 'background' },
-      items: [
-        { type: 'doc', id: 'villa_model' },
-        { type: 'doc', id: 'livestream' },
-      ],
-    },
-    {
-      type: 'link',
-      label: 'Discord',
-      href: 'https://discord.gg/V4fJhvtaQn',
-    },
-    {
-      type: 'link',
-      label: 'Mailing list',
-      href: 'https://scrollprize.substack.com/',
-    },
-    {
-      type: 'link',
-      label: '𝕏',
-      href: 'https://x.com/scrollprize',
-    },
-    {
-      type: 'link',
-      label: 'Donate',
-      href: 'https://donate.stripe.com/aEUg101vt9eN8gM144',
-    },
-    { type: 'doc', id: 'jobs' },
-    {
-      type: 'category',
-      label: 'Archive',
+      label: 'Past prize rounds',
       collapsible: true,
       collapsed: true,
       items: [
-        { type: 'doc', id: '28_2024_prizes' },
         { type: 'doc', id: '30_2024_gp_submissions' },
+        { type: 'doc', id: '28_2024_prizes' },
+        { type: 'doc', id: 'submissions_closed' },
+        { type: 'doc', id: 'grand_prize' },
         { type: 'doc', id: 'open_source_prizes' },
         { type: 'doc', id: 'private_prizes' },
-        { type: 'doc', id: 'submissions_closed' },
+        { type: 'doc', id: 'ink_detection' },
+        { type: 'doc', id: 'master_plan' },
       ],
     },
   ],

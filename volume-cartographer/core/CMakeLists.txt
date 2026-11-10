@@ -1,73 +1,70 @@
 configure_file(src/Version.cpp.in Version.cpp)
 
+add_library(vc_fiber_view STATIC src/FiberView.cpp)
+target_include_directories(vc_fiber_view PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+target_compile_features(vc_fiber_view PUBLIC cxx_std_20)
+target_link_libraries(vc_fiber_view PUBLIC vc_object_store::vc_geometry)
+set_target_properties(vc_fiber_view PROPERTIES POSITION_INDEPENDENT_CODE ON)
+
 add_library(vc_core
+        src/SheetSeed.cpp
+        src/SheetWalk.cpp
+        src/SheetFront.cpp
+        src/SheetNormalField.cpp
+        src/PolylineObj.cpp
+        src/OutputDirectory.cpp
+        src/TexturedMesh.cpp
         src/GridStore.cpp
         src/NormalGridVolume.cpp
         src/normalgridtools.cpp
-        src/Segmentation.cpp
         src/Volume.cpp
         src/VolumePkg.cpp
-        src/SurfacePatchIndex.cpp
-        src/PointIndex.cpp
+        src/ProjectDocument.cpp
+        src/ProjectCreation.cpp
+        src/SurfaceQuerySet.cpp
         src/Logging.cpp
         src/CrashHandler.cpp
-        src/VolpkgConvert.cpp
+        src/AnonymousPages.cpp
+        src/UnixSocket.cpp
         src/SparseChunkSpool.cpp
-        src/Slicing.cpp
-        src/Compositing.cpp
-        src/AffineTransform.cpp
         src/PlaneSurface.cpp
         src/Surface.cpp
         src/QuadSurface.cpp
-        src/Render.cpp
-        src/Tiff.cpp
-        src/Zarr.cpp
-        src/VcDataset.cpp
+        src/ImageMat.cpp
+        src/QuadSurfaceStore.cpp
+        src/StoreSurfaces.cpp
+        src/SurfaceMeshing.cpp
         src/LoadJson.cpp
         src/RemoteUrl.cpp
-        src/HttpFetch.cpp
-        src/PostProcess.cpp
+        src/RemoteCacheSettings.cpp
+        src/CudaSampling.cpp
         src/Geometry.cpp
         src/PointCollections.cpp
-        src/surface_metrics.cpp
-        src/Thinning.cpp
+        src/StoredCollection.cpp
         src/Umbilicus.cpp
-        src/render/ChunkCache.cpp
-        src/render/ChunkedPlaneSampler.cpp
-        src/render/Colormaps.cpp
-        src/render/PostProcess.cpp
-        src/render/ZarrChunkFetcher.cpp
-        ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src/vc_merge_tifxyz_grid.cpp
         ${CMAKE_CURRENT_BINARY_DIR}/Version.cpp
 )
 
-# Grid-resolution helpers (vc_merge_tifxyz_grid) live in apps/src but are
-# compiled into vc_core so the unit tests link them without the binary.
-target_include_directories(vc_core PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/../apps/src)
-
 target_link_libraries(vc_core
+    PUBLIC vc_object_store::vc_resident_geometry vc_object_store::vc_objects vc_object_store::vc_object_formats vc_reader::catalog vc_reader::reader
+        vc_reader::transforms
         PUBLIC
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
-        opencv_calib3d
-        opencv_video
+        ${VC_OPENCV_CALIB_TARGETS}
         nlohmann_json::nlohmann_json
         OpenMP::OpenMP_CXX
-        TIFF::TIFF
-        OpenABF
-        CURL::libcurl
 )
 
-# utils header-only library + vendored c3d codec.
-target_link_libraries(vc_core PUBLIC
-    $<BUILD_INTERFACE:utils>
-    $<BUILD_INTERFACE:utils_c3d_codec>
-)
 target_link_libraries(vc_core PRIVATE
-    Blosc::blosc
     ${VC_LIBBACKTRACE}
 )
+
+# Winsock for the AF_UNIX compat layer (UnixSocket.cpp). PUBLIC because
+# consumers (vc_tracer, VC3D) call send()/recv() directly.
+if(WIN32)
+    target_link_libraries(vc_core PUBLIC ws2_32)
+endif()
 
 # Neutral PCH carrier shared by vc_core, downstream vc_* libs, and CLI apps.
 # Keep this separate from vc_core: shared-library targets add export macros
@@ -108,7 +105,6 @@ if(VC_USE_PCH)
         "$<$<COMPILE_LANGUAGE:CXX>:<string_view>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/core.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgproc.hpp>>"
-        "$<$<COMPILE_LANGUAGE:CXX>:<opencv2/imgcodecs.hpp>>"
         "$<$<COMPILE_LANGUAGE:CXX>:<nlohmann/json.hpp>>"
         CACHE INTERNAL "PCH header list shared by vc_* and downstream targets")
 
@@ -121,73 +117,118 @@ if(VC_USE_PCH)
     target_link_libraries(vc_common_pch PRIVATE
         opencv_core
         opencv_imgproc
-        opencv_imgcodecs
         nlohmann_json::nlohmann_json
-        OpenMP::OpenMP_CXX
-        TIFF::TIFF)
+        OpenMP::OpenMP_CXX)
     target_precompile_headers(vc_common_pch PRIVATE ${VC_PCH_HEADERS})
     target_precompile_headers(vc_core REUSE_FROM vc_common_pch)
 endif()
-
-add_library(vc_flattening src/ABFFlattening.cpp)
-target_link_libraries(vc_flattening PUBLIC vc_core OpenABF)
 
 add_library(vc_inpaint src/InpaintSurface.cpp)
 target_link_libraries(vc_inpaint PUBLIC vc_core PRIVATE Ceres::ceres)
 
 add_library(vc_lasagna
+    src/lasagna/ChannelSampler.cpp
+    src/lasagna/Catalog.cpp
     src/lasagna/Dataset.cpp
-    src/lasagna/EclMaxflow.cpp
-    src/lasagna/EclMaxflowCut.cpp
     src/lasagna/LaplaceAmgx.cpp
     src/lasagna/LaplaceRank.cpp
     src/lasagna/LasagnaNormalSampler.cpp
     src/lasagna/LineViewBuilder.cpp
     src/lasagna/LineOptimizer.cpp
+    src/lasagna/LineSpline.cpp
     src/lasagna/Manifest.cpp
     src/lasagna/MaxflowGraph.cpp
+    src/lasagna/ProjectVolumes.cpp
 )
-if(VC_ENABLE_ECL_MAXFLOW)
-    target_sources(vc_lasagna PRIVATE src/lasagna/EclMaxflow.cu)
-    set_source_files_properties(src/lasagna/EclMaxflow.cpp PROPERTIES HEADER_FILE_ONLY ON)
-    target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_ECL_MAXFLOW=1)
-    target_include_directories(vc_lasagna PRIVATE
-        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/src
-        ${CMAKE_SOURCE_DIR}/libs/ECL-MaxFlow/lib)
-    set_source_files_properties(src/lasagna/EclMaxflow.cu PROPERTIES
-        LANGUAGE CUDA
-        CUDA_SEPARABLE_COMPILATION OFF)
-    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD 20)
-    set_property(TARGET vc_lasagna PROPERTY CUDA_STANDARD_REQUIRED ON)
-endif()
 if(VC_ENABLE_AMGX)
     target_compile_definitions(vc_lasagna PUBLIC VC_ENABLE_AMGX=1)
     target_link_libraries(vc_lasagna PRIVATE AMGX::amgx)
 endif()
 target_link_libraries(vc_lasagna PUBLIC vc_core PRIVATE Ceres::ceres)
+find_package(LAPACK QUIET)
+target_link_libraries(vc_lasagna PRIVATE Eigen3::Eigen)
+if(LAPACK_FOUND AND UNIX AND NOT APPLE)
+    target_link_libraries(vc_lasagna PRIVATE ${LAPACK_LIBRARIES})
+    target_compile_definitions(vc_lasagna PRIVATE VC_POOLING_LAPACK)
+endif()
 
-add_library(vc_atlas
-    src/Atlas.cpp
-    src/AtlasConstraints.cpp
-    src/FiberIntersections.cpp
+add_library(vc_fiber_tracer
+    src/fiber_tracer/FiberReferenceReplayBenchmark.cpp
+    src/fiber_tracer/BinaryBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceSeed.cpp
+    src/fiber_tracer/FiberTraceBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceConstraints.cpp
+    src/fiber_tracer/FiberTraceWindingBeliefPropagation.cpp
+    src/fiber_tracer/FiberTraceWindingLeastSquares.cpp
+    src/fiber_tracer/FiberTraceWindingOrderedCuts.cpp
+    src/fiber_tracer/LasagnaNormalAlignment.cpp
+    src/fiber_tracer/FiberAnchors.cpp
+    src/fiber_tracer/FiberAnchorObjectives.cpp
+    src/fiber_tracer/FiberAnchorFinalEvaluation.cpp
+    src/fiber_tracer/FiberAxisTensor.cpp
+    src/fiber_tracer/FiberGraph.cpp
+    src/fiber_tracer/FiberletChunkGraph.cpp
+    src/fiber_tracer/FiberletCropTrace.cpp
+    src/fiber_tracer/FiberLocalScoring.cpp
+    src/fiber_tracer/FiberPaths.cpp
+    src/fiber_tracer/FiberReplayMetric.cpp
+    src/fiber_tracer/FiberReverseConsistency.cpp
+    src/fiber_tracer/FiberReferenceReplayCore.cpp
+    src/fiber_tracer/FiberChunkTrace.cpp
+    src/fiber_tracer/FiberChunkFilter.cpp
+    src/fiber_tracer/FiberChunkGpuBridge.cpp
+    src/fiber_tracer/FiberChunkTensor.cpp
+    src/fiber_tracer/FiberChunkRoute.cpp
+    src/fiber_tracer/FiberLiveBridge.cpp
+    src/fiber_tracer/FiberEvaluation.cpp
+    src/fiber_tracer/FiberReplayVisualization.cpp
+    src/fiber_tracer/FiberletCropVisualization.cpp
+    src/fiber_tracer/FiberCaseQueue.cpp
+    src/fiber_tracer/PolylineGeometry.cpp
+    src/fiber_tracer/FiberletStorage.cpp
+    src/fiber_tracer/FiberletDataset.cpp
+    src/fiber_tracer/FiberletQuantization.cpp
+    src/fiber_tracer/FiberletOnDemand.cpp
+    src/fiber_tracer/FiberletPipeline.cpp
+    src/fiber_tracer/FiberTrace.cpp
+    src/fiber_tracer/FiberVolumeCoverage.cpp
+    src/fiber_tracer/FiberStreamVolume.cpp
+    src/fiber_tracer/FiberSideStripIntersections.cpp
 )
-target_link_libraries(vc_atlas PUBLIC vc_core vc_lasagna PRIVATE Ceres::ceres)
+target_link_libraries(vc_fiber_tracer PUBLIC vc_core vc_lasagna PRIVATE Eigen3::Eigen Ceres::ceres)
+target_link_libraries(vc_fiber_tracer PRIVATE ${CMAKE_DL_LIBS})
+
+# Optional backend; CPU builds do not need a CUDA toolkit.
+option(VC_BUILD_FIBER_CHUNK_CUDA "Build resident CUDA chunk tracing backend" OFF)
+if(VC_BUILD_FIBER_CHUNK_CUDA)
+    enable_language(CUDA)
+    add_library(vc_fiber_chunk_cuda SHARED src/fiber_tracer/FiberChunkGpu.cu)
+    target_compile_definitions(vc_fiber_chunk_cuda PRIVATE VC_CHUNK_GPU_LIBRARY)
+    add_executable(benchmark_fiber_chunk_cuda src/fiber_tracer/FiberChunkGpu.cu)
+    foreach(target vc_fiber_chunk_cuda benchmark_fiber_chunk_cuda)
+        target_include_directories(${target} PRIVATE include)
+        target_link_libraries(${target} PRIVATE nlohmann_json::nlohmann_json vc_reader::headers)
+        set_target_properties(${target} PROPERTIES CUDA_STANDARD 20 CUDA_STANDARD_REQUIRED ON)
+        target_compile_options(${target} PRIVATE $<$<COMPILE_LANGUAGE:CUDA>:--fmad=false;--expt-relaxed-constexpr>)
+    endforeach()
+endif()
+if(VC_TESTING)
+    target_compile_definitions(vc_fiber_tracer PRIVATE VC_TESTING)
+endif()
 
 add_library(vc_tracer
     src/GrowPatch.cpp
+    src/SheetGrowth.cpp
     src/GrowSurface.cpp
     src/SurfTrackerData.cpp
     src/NeuralTracerConnection.cpp
-    src/ChunkedTensor.cpp
     src/growth_strategies/CandidateOrdering.cpp
-    src/growth_strategies/ComponentPruning.cpp
     src/growth_strategies/GrowthConfig.cpp
 )
-target_link_libraries(vc_tracer PUBLIC vc_core vc_flattening Ceres::ceres)
-target_include_directories(vc_tracer PRIVATE ${CMAKE_CURRENT_SOURCE_DIR}/../libs/edt)
+target_link_libraries(vc_tracer PUBLIC vc_core Ceres::ceres)
 
 if(VC_USE_PCH)
-    foreach(_lib vc_flattening vc_inpaint vc_lasagna vc_atlas vc_tracer)
+    foreach(_lib vc_inpaint vc_lasagna vc_fiber_tracer vc_tracer)
         target_precompile_headers(${_lib} REUSE_FROM vc_common_pch)
     endforeach()
 endif()

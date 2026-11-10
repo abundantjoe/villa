@@ -2,6 +2,8 @@
 
 #include <opencv2/core/types.hpp>
 
+#include <array>
+#include <atomic>
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
@@ -22,31 +24,31 @@ struct NormalSampleWithDerivative {
     bool hasDerivative = false;
 };
 
-struct NormalPrefetchReport {
-    uint64_t requestedChunks = 0;
-    uint64_t chunksRead = 0;
-};
-
 struct NormalBatchReport {
-    NormalPrefetchReport prefetch;
-    double prefetchMs = 0.0;
     double materializeMs = 0.0;
 };
 
 class NormalSampler {
 public:
+    [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
+        const std::vector<cv::Vec3d>& volumePoints,
+        bool withDerivative,
+        int parallelThreads,
+        std::vector<NormalSampleWithDerivative>& samples) const
+    {
+        (void)parallelThreads;
+        return sampleNormalBatch(volumePoints, withDerivative, samples);
+    }
     virtual ~NormalSampler() = default;
+    [[nodiscard]] virtual bool supportsConcurrentSampling() const noexcept
+    {
+        return false;
+    }
     [[nodiscard]] virtual NormalSample sampleNormal(const cv::Vec3d& volumePoint) const = 0;
     [[nodiscard]] virtual NormalSampleWithDerivative sampleNormalWithDerivative(
         const cv::Vec3d& volumePoint) const
     {
         return {sampleNormal(volumePoint), cv::Matx33d::zeros(), false};
-    }
-    [[nodiscard]] virtual NormalPrefetchReport prefetchNormalSamples(
-        const std::vector<cv::Vec3d>& /*volumePoints*/,
-        bool /*withDerivative*/) const
-    {
-        return {};
     }
     [[nodiscard]] virtual NormalBatchReport sampleNormalBatch(
         const std::vector<cv::Vec3d>& volumePoints,
@@ -54,10 +56,8 @@ public:
         std::vector<NormalSampleWithDerivative>& samples) const
     {
         using Clock = std::chrono::steady_clock;
-        const auto prefetchStart = Clock::now();
+        const auto start = Clock::now();
         NormalBatchReport report;
-        report.prefetch = prefetchNormalSamples(volumePoints, withDerivative);
-        const auto prefetchEnd = Clock::now();
         samples.clear();
         samples.resize(volumePoints.size());
         for (size_t index = 0; index < volumePoints.size(); ++index) {
@@ -68,11 +68,8 @@ public:
                       cv::Matx33d::zeros(),
                       false};
         }
-        const auto materializeEnd = Clock::now();
-        report.prefetchMs = std::chrono::duration<double, std::milli>(
-            prefetchEnd - prefetchStart).count();
         report.materializeMs = std::chrono::duration<double, std::milli>(
-            materializeEnd - prefetchEnd).count();
+            Clock::now() - start).count();
         return report;
     }
 };
@@ -143,6 +140,13 @@ struct LineOptimizationConfig {
     // Optional previous line used to initialize control-point reoptimization.
     // Indices correspond to line positions.
     std::vector<cv::Vec3d> initialLinePoints;
+    // Cooperative cancellation: when set and it becomes true, solve entry
+    // points throw LineOptimizationCancelled and the Ceres iteration callback
+    // aborts the running solve within one iteration. The pointee must outlive
+    // the solve (the caller typically owns it through a shared_ptr captured
+    // by the worker). An aborted or thrown-out-of solve leaves no usable
+    // result; callers are expected to discard it.
+    const std::atomic<bool>* cancelFlag = nullptr;
 };
 
 } // namespace vc::lasagna

@@ -1,0 +1,458 @@
+#pragma once
+
+#include <algorithm>
+#include <cmath>
+#include <filesystem>
+#include <fstream>
+#include <optional>
+#include <stdexcept>
+#include <string>
+#include <unordered_set>
+#include <vector>
+
+#include <nlohmann/json.hpp>
+#include <opencv2/core/types.hpp>
+#include "vc/fiber_tracer/FiberDisplay.hpp"
+#include <vc_object_store/Uuid.hpp>
+
+namespace vc::fiber_tracer
+{
+struct Vc3dFiberJson {
+    double width = 0.0;
+    double widthGapFraction = kDefaultFiberWidthGapFraction;
+    int version = 4;
+    std::string uuid;
+    std::string optimizationMode = "lasagna";
+    std::vector<cv::Vec3d> linePoints;
+    std::vector<cv::Vec3d> controlPoints;
+    std::vector<nlohmann::json> segmentMetadata;
+};
+
+namespace detail
+{
+
+inline void requireExactKeys(const nlohmann::json& value, const std::unordered_set<std::string>& keys, const std::string& context)
+{
+    if (!value.is_object() || value.size() != keys.size()) {
+        throw std::runtime_error(context + " has missing or unknown fields");
+    }
+    for (const auto& [key, item] : value.items()) {
+        (void)item;
+        if (!keys.contains(key)) {
+            throw std::runtime_error(context + " contains unknown field: " + key);
+        }
+    }
+}
+
+inline void validateSegmentMetadata(const nlohmann::json& value, int fiberVersion = 4)
+{
+    if (fiberVersion != 4) throw std::runtime_error("Fiber transfer requires version 4");
+    if (!value.is_object())
+        throw std::runtime_error("segment_to_next must be an object");
+    std::unordered_set<std::string> keys{
+        "optimizer", "metadata_version", "tracer_version",
+        "interp_goal", "interp_mode", "metric", "msg",
+        "normal_manifest", "fiber_manifest", "trace_to_base_scale",
+        "meeting_error_base_voxels", "meeting_error_ratio",
+        "meeting_source", "failure_code", "failure_detail",
+        "lasagna_failure_code", "lasagna_failure_detail", "config"};
+    const bool haveTags = value.contains("tags");
+    if (haveTags) {
+        keys.insert("tags");
+    }
+    requireExactKeys(value, keys, "segment_to_next");
+    if (haveTags) {
+        const auto& tags = value.at("tags");
+        if (!tags.is_array())
+            throw std::runtime_error("segment_to_next tags must be an array");
+        for (const auto& tag : tags) {
+            if (!tag.is_string())
+                throw std::runtime_error("segment_to_next tags entries must be strings");
+        }
+    }
+    if (value.at("optimizer").get<std::string>() != "native_fiber_trace3d")
+        throw std::runtime_error("unsupported segment_to_next optimizer");
+    const int metadataVersion = value.at("metadata_version").get<int>();
+    const int tracerVersion = value.at("tracer_version").get<int>();
+    const bool current = metadataVersion == 3 && tracerVersion == 2;
+    if (!current) {
+        throw std::runtime_error("unsupported segment_to_next optimizer or version");
+    }
+    if (!value.at("normal_manifest").is_string() ||
+        !value.at("fiber_manifest").is_string()) {
+        throw std::runtime_error("segment_to_next manifests must be strings");
+    }
+    if (!value.at("trace_to_base_scale").is_number())
+        throw std::runtime_error("segment_to_next scale is invalid");
+    const double scale = value.at("trace_to_base_scale").get<double>();
+    if (!std::isfinite(scale) || scale <= 0.0)
+        throw std::runtime_error("segment_to_next scale is invalid");
+    const std::string goal = value.at("interp_goal").get<std::string>();
+    const std::string mode = value.at("interp_mode").get<std::string>();
+    if (goal != "global" && goal != "cspline" && goal != "lasagna" && goal != "trace")
+        throw std::runtime_error("segment_to_next interpolation goal is invalid");
+    if (mode != "cspline" && mode != "lasagna" && mode != "trace")
+        throw std::runtime_error("segment_to_next interpolation mode is invalid");
+    const auto& metric = value.at("metric");
+    if (!metric.is_null() && (!metric.is_number() ||
+        !std::isfinite(metric.get<double>()) || metric.get<double>() < 0.0)) {
+        throw std::runtime_error("segment_to_next metric is invalid");
+    }
+    if (mode == "cspline" && !metric.is_null())
+        throw std::runtime_error("cspline segment_to_next cannot contain metric");
+    for (const char* key : {"msg", "meeting_source", "failure_code",
+                            "failure_detail", "lasagna_failure_code",
+                            "lasagna_failure_detail"}) {
+        if (!value.at(key).is_string())
+            throw std::runtime_error("segment_to_next diagnostic is not a string");
+    }
+    const bool haveError = !value.at("meeting_error_base_voxels").is_null();
+    const bool haveRatio = !value.at("meeting_error_ratio").is_null();
+    if (mode == "trace") {
+        if (metric.is_null() || !haveError || !haveRatio ||
+            value.at("meeting_source").get<std::string>().empty() ||
+            !value.at("failure_code").get<std::string>().empty() ||
+            !value.at("failure_detail").get<std::string>().empty() ||
+            value.at("normal_manifest").get<std::string>().empty() ||
+            value.at("fiber_manifest").get<std::string>().empty()) {
+            throw std::runtime_error("trace segment_to_next is inconsistent");
+        }
+        const double error = value.at("meeting_error_base_voxels").get<double>();
+        const double ratio = value.at("meeting_error_ratio").get<double>();
+        if (!std::isfinite(error) || error < 0.0 ||
+            !std::isfinite(ratio) || ratio < 0.0) {
+            throw std::runtime_error("trace meeting diagnostics are invalid");
+        }
+    } else if (haveError || haveRatio ||
+               !value.at("meeting_source").get<std::string>().empty()) {
+        throw std::runtime_error(
+            "non-trace segment_to_next contains meeting diagnostics");
+    }
+    const auto& config = value.at("config");
+    requireExactKeys(
+        config,
+        {"step_voxels",
+         "cone_angle_degrees",
+         "cone_angle_step_degrees",
+         "cone_grid_size",
+         "beam_width",
+         "beam_prune_distance_voxels",
+         "beam_lookahead_steps",
+         "smoothness_weight",
+         "smoothness_normal_weight",
+         "smoothness_tangent_weight",
+         "smoothness_free_angle_degrees",
+         "cumulative_smoothness_steps",
+         "cumulative_smoothness_tangent_weight",
+         "initial_free_angle_degrees",
+         "max_step_factor",
+         "meeting_accept_max_error_ratio",
+         "endpoint_accept_threshold_base_voxels"},
+        "segment_to_next config");
+    for (const auto& [key, item] : config.items()) {
+        if (!item.is_number() || !std::isfinite(item.get<double>())) {
+            throw std::runtime_error("segment_to_next config field is invalid: " + key);
+        }
+    }
+    for (const char* key : {"step_voxels", "cone_angle_degrees",
+                            "cone_angle_step_degrees", "beam_prune_distance_voxels",
+                            "max_step_factor", "endpoint_accept_threshold_base_voxels"}) {
+        if (config.at(key).get<double>() <= 0.0)
+            throw std::runtime_error(
+                "segment_to_next config field must be positive: " + std::string(key));
+    }
+    for (const char* key : {"smoothness_weight", "smoothness_normal_weight",
+                            "smoothness_tangent_weight", "smoothness_free_angle_degrees",
+                            "cumulative_smoothness_tangent_weight",
+                            "initial_free_angle_degrees"}) {
+        if (config.at(key).get<double>() < 0.0)
+            throw std::runtime_error(
+                "segment_to_next config field must be non-negative: " + std::string(key));
+    }
+    for (const char* key : {"cone_grid_size", "beam_width", "beam_lookahead_steps",
+                            "cumulative_smoothness_steps"}) {
+        if (!config.at(key).is_number_integer())
+            throw std::runtime_error(
+                "segment_to_next config integer field is invalid: " + std::string(key));
+    }
+    if (config.at("cone_grid_size").get<int>() <= 0 ||
+        config.at("beam_width").get<int>() <= 0 ||
+        config.at("beam_lookahead_steps").get<int>() < 0 ||
+        config.at("cumulative_smoothness_steps").get<int>() < 0) {
+        throw std::runtime_error("segment_to_next config contains invalid integer values");
+    }
+    const double ratio = config.at("meeting_accept_max_error_ratio").get<double>();
+    if (ratio < 0.0 || ratio > 1.0)
+        throw std::runtime_error("segment_to_next meeting ratio config is invalid");
+}
+
+inline cv::Vec3d pointFromJson(const nlohmann::json& value, const std::string& context)
+{
+    if (!value.is_array() || value.size() != 3) {
+        throw std::runtime_error(context + " point must be [x, y, z]");
+    }
+    cv::Vec3d point{value.at(0).get<double>(), value.at(1).get<double>(), value.at(2).get<double>()};
+    if (!std::isfinite(point[0]) || !std::isfinite(point[1]) || !std::isfinite(point[2])) {
+        throw std::runtime_error(context + " point contains non-finite coordinates");
+    }
+    return point;
+}
+
+}  // namespace detail
+
+inline std::vector<cv::Vec3d> vc3dFiberPointArrayFromJson(const nlohmann::json& root, const std::string& key, int version, const std::string& context)
+{
+    if (version != 4) throw std::runtime_error(context + " requires fiber version 4");
+    if (!root.contains(key) || !root.at(key).is_array()) {
+        throw std::runtime_error(context + " is missing array " + key);
+    }
+    std::vector<cv::Vec3d> points;
+    const auto& array = root.at(key);
+    points.reserve(array.size());
+    for (size_t index = 0; index < array.size(); ++index) {
+        const auto& value = array[index];
+        if (key != "control_points") {
+            points.push_back(detail::pointFromJson(value, context));
+            continue;
+        }
+        if (!value.is_object()) {
+            throw std::runtime_error(context + " version-4 control point must be an object");
+        }
+        for (const auto& [field, item] : value.items()) {
+            (void)item;
+            if (field != "position" && field != "segment_to_next" && field != "tags" && field != "display_normal" && field != "display_normal_source" && field != "direction") {
+                throw std::runtime_error(context + " control point contains unknown field: " + field);
+            }
+        }
+        // Editor hints do not alter the reference polyline or span eligibility.
+        for (const auto* field : {"direction", "display_normal"}) {
+            if (value.contains(field)) detail::pointFromJson(value.at(field), context);
+        }
+        if (value.contains("display_normal_source") && !value.at("display_normal_source").is_string())
+            throw std::runtime_error(context + " display_normal_source must be a string");
+        points.push_back(detail::pointFromJson(value.at("position"), context));
+        (void)displayNormalFromJson(value);
+        (void)displayNormalSourceFromJson(value);
+        (void)controlDirectionFromJson(value);
+        // Optional per-control-point tags (e.g. "kollesis_termination"): an
+        // array of strings, written by VC3D only when non-empty.
+        if (value.contains("tags")) {
+            const auto& tags = value.at("tags");
+            if (!tags.is_array()) {
+                throw std::runtime_error(context + " control point tags must be an array");
+            }
+            for (const auto& tag : tags) {
+                if (!tag.is_string()) {
+                    throw std::runtime_error(context + " control point tags entries must be strings");
+                }
+            }
+        }
+        if (index + 1 == array.size()) {
+            if (value.contains("segment_to_next")) {
+                throw std::runtime_error(context + " final control point cannot contain segment_to_next");
+            }
+        } else if (value.contains("segment_to_next")) {
+            detail::validateSegmentMetadata(value.at("segment_to_next"), version);
+        }
+    }
+    return points;
+}
+
+inline Vc3dFiberJson parseVc3dFiberJson(const nlohmann::json& root,
+                                       const std::string& context)
+{
+    if (!root.is_object() || root.value("type", std::string{}) != "vc3d_fiber")
+        throw std::runtime_error(context + " is not a vc3d_fiber JSON object");
+
+    Vc3dFiberJson fiber;
+    if (!root.contains("uuid") || !root.at("uuid").is_string() ||
+        !vc::objects::util::isUuid(root.at("uuid").get<std::string>()))
+        throw std::runtime_error(context + " requires an explicit valid uuid");
+    fiber.uuid = root.at("uuid").get<std::string>();
+    fiber.width = fiberWidthFromJson(root);
+    fiber.widthGapFraction = fiberWidthGapFromJson(root);
+    fiber.version = root.value("version", 0);
+    if (fiber.version != 4)
+        throw std::runtime_error(context + " has unsupported vc3d_fiber version");
+
+    if (root.contains("optimization_mode")) {
+        if (!root.at("optimization_mode").is_string())
+            throw std::runtime_error(context + " optimization_mode must be a string");
+        fiber.optimizationMode = root.at("optimization_mode").get<std::string>();
+    }
+    if (fiber.optimizationMode != "lasagna" &&
+        fiber.optimizationMode != "native_fiber_trace3d") {
+        throw std::runtime_error(context + " optimization_mode is invalid");
+    }
+
+    fiber.linePoints = vc3dFiberPointArrayFromJson(
+        root, "line_points", fiber.version, context);
+    fiber.controlPoints = vc3dFiberPointArrayFromJson(
+        root, "control_points", fiber.version, context);
+    fiber.segmentMetadata.resize(fiber.controlPoints.size());
+    const auto& controls = root.at("control_points");
+    for (size_t index = 0; index + 1 < controls.size(); ++index)
+        if (controls.at(index).contains("segment_to_next"))
+            fiber.segmentMetadata[index] = controls.at(index).at("segment_to_next");
+    return fiber;
+}
+
+inline std::vector<size_t> vc3dControlPointLineIndices(const Vc3dFiberJson& fiber,
+                                                     const std::string& context)
+{
+    if (fiber.linePoints.size() < 2 || fiber.controlPoints.size() < 2)
+        throw std::runtime_error("fiber needs at least two line/control points: " + context);
+    std::vector<size_t> indices;
+    for (const auto& cp : fiber.controlPoints) {
+        const auto found = std::find(fiber.linePoints.begin(), fiber.linePoints.end(), cp);
+        if (found == fiber.linePoints.end())
+            throw std::runtime_error("control point is not an exact line point; refusing to guess: " + context);
+        const size_t index = size_t(found - fiber.linePoints.begin());
+        if (!indices.empty() && index <= indices.back())
+            throw std::runtime_error("control points are not strictly increasing along line: " + context);
+        indices.push_back(index);
+    }
+    return indices;
+}
+
+// Canonical selection is shared by replay-set and its reference-prefetch export.
+// Each run retains original line coordinates/arcs; gaps never become edges.
+inline nlohmann::json vc3dEvaluationReferencePlan(const Vc3dFiberJson& fiber,
+                                                const std::string& context)
+{
+    const auto indices = vc3dControlPointLineIndices(fiber, context);
+    std::vector<double> arcs(fiber.linePoints.size(), 0);
+    for (size_t i = 1; i < arcs.size(); ++i)
+        arcs[i] = arcs[i - 1] + cv::norm(fiber.linePoints[i] - fiber.linePoints[i - 1]);
+    nlohmann::json result{{"policy", "cp-bounded-no-lasagna-v1"},
+        {"original_length_base_voxels", arcs.back()}, {"eligible_length_base_voxels", 0.0},
+        {"runs", nlohmann::json::array()}, {"excluded", nlohmann::json::array()},
+        {"cp_spans", nlohmann::json::array()}};
+    const auto exclude = [&](size_t begin, size_t end, const char* reason) {
+        if (end > begin) result["excluded"].push_back({{"line_indices", {begin, end}},
+            {"original_arcs_base", {arcs[begin], arcs[end]}}, {"reason", reason}});
+    };
+    exclude(0, indices.front(), "extrapolated");
+    exclude(indices.back(), fiber.linePoints.size() - 1, "extrapolated");
+    std::optional<size_t> begin;
+    const auto finish = [&](size_t end) {
+        if (!begin) return;
+        const double length = arcs[end] - arcs[*begin];
+        if (!(length > 0)) throw std::runtime_error("degenerate eligible run: " + context);
+        nlohmann::json points = nlohmann::json::array();
+        for (size_t i = *begin; i <= end; ++i) {
+            const auto& p = fiber.linePoints[i]; points.push_back({p[0], p[1], p[2]});
+        }
+        result["runs"].push_back({{"run_index", result["runs"].size()},
+            {"line_indices", {*begin, end}}, {"original_arcs_base", {arcs[*begin], arcs[end]}},
+            {"length_base_voxels", length}, {"points_base_xyz", std::move(points)}});
+        result["eligible_length_base_voxels"] = result["eligible_length_base_voxels"].get<double>() + length;
+        begin.reset();
+    };
+    for (size_t i = 0; i + 1 < indices.size(); ++i) {
+        if (fiber.segmentMetadata.at(i).is_null())
+            throw std::runtime_error("evaluation requires per-span tracing metadata: " + context);
+        const auto mode = fiber.segmentMetadata.at(i).at("interp_mode").get<std::string>();
+        result["cp_spans"].push_back({{"control_point_indices", {i, i + 1}},
+            {"line_indices", {indices[i], indices[i + 1]}}, {"actual_interp_mode", mode},
+            {"eligible", mode != "lasagna"}});
+        if (mode == "lasagna") {
+            finish(indices[i]); exclude(indices[i], indices[i + 1], "lasagna");
+        } else if (!begin) begin = indices[i];
+    }
+    finish(indices.back());
+    result["status"] = result["runs"].empty() ? "excluded" : "eligible";
+    return result;
+}
+
+// VC3D's rule for the span tags derived from point tags, at the JSON level
+// for tools that rewrite control points (the lasagna probe): a span carries
+// `gap` exactly when both its endpoint controls carry the `break` point tag,
+// and a gap span never carries `damaged`. Other span tags are left alone; the
+// `tags` array is omitted when empty. Must agree with
+// vc3d::line_annotation::syncGapSpanTags.
+inline void normalizeGapSpanTagsJson(nlohmann::json& controls)
+{
+    if (!controls.is_array()) {
+        return;
+    }
+    const auto hasBreak = [](const nlohmann::json& control) {
+        if (!control.is_object() || !control.contains("tags") || !control.at("tags").is_array()) {
+            return false;
+        }
+        for (const auto& tag : control.at("tags")) {
+            if (tag.is_string() && tag.get<std::string>() == "break") {
+                return true;
+            }
+        }
+        return false;
+    };
+    for (size_t index = 0; index + 1 < controls.size(); ++index) {
+        auto& control = controls.at(index);
+        if (!control.is_object() || !control.contains("segment_to_next") ||
+            !control.at("segment_to_next").is_object()) {
+            continue;
+        }
+        auto& segment = control.at("segment_to_next");
+        std::vector<std::string> tags;
+        if (segment.contains("tags") && segment.at("tags").is_array()) {
+            for (const auto& tag : segment.at("tags")) {
+                if (tag.is_string()) {
+                    tags.push_back(tag.get<std::string>());
+                }
+            }
+        }
+        const bool gap = hasBreak(control) && hasBreak(controls.at(index + 1));
+        std::vector<std::string> kept;
+        for (const auto& tag : tags) {
+            if (tag == "gap" || (gap && tag == "damaged")) {
+                continue;
+            }
+            kept.push_back(tag);
+        }
+        if (gap) {
+            kept.push_back("gap");
+        }
+        std::sort(kept.begin(), kept.end());
+        kept.erase(std::unique(kept.begin(), kept.end()), kept.end());
+        if (kept.empty()) {
+            segment.erase("tags");
+        } else {
+            segment["tags"] = kept;
+        }
+    }
+}
+
+inline nlohmann::json makeLasagnaSegmentMetadataJson(
+    const std::string& interpolationGoal,
+    const std::string& normalManifest,
+    double traceToBaseScale,
+    const nlohmann::json& config,
+    const nlohmann::json& metric,
+    const std::string& message = "lasagna")
+{
+    nlohmann::json result{
+        {"optimizer", "native_fiber_trace3d"},
+        {"metadata_version", 3},
+        {"tracer_version", 2},
+        {"interp_goal", interpolationGoal},
+        {"interp_mode", "lasagna"},
+        {"metric", metric},
+        {"msg", message},
+        {"normal_manifest", normalManifest},
+        {"fiber_manifest", ""},
+        {"trace_to_base_scale", traceToBaseScale},
+        {"meeting_error_base_voxels", nullptr},
+        {"meeting_error_ratio", nullptr},
+        {"meeting_source", ""},
+        {"failure_code", ""},
+        {"failure_detail", ""},
+        {"lasagna_failure_code", ""},
+        {"lasagna_failure_detail", ""},
+        {"config", config},
+    };
+    detail::validateSegmentMetadata(result);
+    return result;
+}
+
+}  // namespace vc::fiber_tracer

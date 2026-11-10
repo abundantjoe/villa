@@ -1,9 +1,14 @@
 # Segmentation Editing Architecture (Gaussian Vertex Mode)
-*last update 10/25*
 ## Purpose and Scope
 
 The segmentation editor lets annotators reshape an existing `QuadSurface` by
 pulling its grid vertices with a Gaussian falloff. Editing operates directly on every valid vertex in the surface.
+The surface is an object in the attached object store; edits are committed to it
+as new geometry revisions. Editing a surface of an Open Data catalog store edits
+it in the user's store as the same surface: the catalog version, as stored, is
+its first revision there (`SurfaceCatalog::importCatalogSurface`), and
+**Reset to Open Data Version** restores it. **History...** in the surface panel
+views or restores any revision.
 
 Unless noted otherwise, paths are relative to `apps/VC3D`.
 
@@ -20,23 +25,41 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    added or updated whenever a drag mutates a vertex. No falloff data is cached;
    neighbours are recomputed on demand.
 3. **Interaction loop** – The module listens to mouse events from every
-   `CVolumeViewer`, resolves the nearest vertex via
+   `VolumeViewerBase`, resolves the nearest vertex via
    `SegmentationEditManager::worldToGridIndex`, and drives the drag lifecycle:
    * `beginActiveDrag` snapshots the local neighbourhood inside the configured
      radius.
    * `updateActiveDrag` applies the Gaussian falloff to that sample set.
    * `commitActiveDrag` clears temporary caches once the drag ends.
-   The module pushes preview updates back to `CSurfaceCollection` so the viewers
-   render changes in real time.
-4. **Overlay feedback** – `SegmentationOverlayController` now renders a single
+   The module republishes the edited surface as the `segmentation` surface of
+   `CState` so the viewers render changes in real time.
+4. **Overlay feedback** – `SegmentationOverlayController` renders a single
    active marker plus the currently affected neighbours (as reported by
    `SegmentationEditManager::recentTouched`). During a drag it projects the
    Gaussian radius into viewer space so users understand the footprint.
 5. **Persistence** – "Apply" simply bakes the current base grid into the
    original snapshot and clears the edit map (this also happens automatically
    after each committed drag). "Reset" discards active drags and copies the
-   original snapshot back onto the base surface. A session ends by clearing
-   overlay state and cached snapshots.
+   original snapshot back onto the base surface. Committing to the store is the
+   module's autosave: `segmentation/SurfaceStoreEdit` publishes the vertices of
+   the touched rectangle that changed as one sparse geometry edit (a different
+   grid size, after growth or a crop, publishes a whole new geometry) and
+   re-pins the surface from the commit's receipt. The store's revision history
+   replaces backups. A session ends by clearing overlay state and cached
+   snapshots.
+6. **Crash recovery** – the open surface is a draft of the store session
+   (CState, then the edit manager as edits land). `SessionDrafts` checkpoints
+   changed drafts every `object_store/draft_checkpoint_seconds` (default 30;
+   0 turns recovery off) to `object_store/draft_directory` (default: `drafts`
+   in the application data directory), independently of autosave. Saves are
+   durable (`submitDurably`): the request is written before it is sent, the
+   draft stays open and is marked saved, and a save whose hosted store did not
+   answer stays pending until the next save (or a later reattachment) resolves
+   it. After a crash, opening a surface with recovered edits asks to restore
+   them (reapplied on the version on screen, then autosaved; a newer version
+   is named first), keep them for later, or discard them. Only vertex
+   positions are recovered, not mask/channel edits; a second VC3D instance
+   runs without recovery (the directory serves one session).
 
 
 ## Component Overview
@@ -46,7 +69,7 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 | `SegmentationWidget` | Minimal Qt sidebar with an editing toggle, Gaussian controls (radius/sigma in grid steps), and Apply/Reset/Stop affordances. Growth volume selection is still exposed for downstream tooling. |
 | `SegmentationModule` | Binds the widget, edit manager, overlay, and viewers. Routes input events, maintains drag/hover state, updates overlays, and exposes helper signals (status messages, growth requests). |
 | `SegmentationEditManager` | Owns the undo snapshot (`_originalPoints`), the in-place preview pointer, vertex edit map, Gaussian sampling cache for active drags, and dirty tracking. Provides helpers to map world coordinates to grid indices and to query vertex positions. |
-| `SegmentationOverlayController` | Draws the active vertex marker, affected neighbours, optional mask overlay points, and the projected Gaussian radius. |
+| `SegmentationOverlayController` | Draws the active vertex marker, affected neighbours, the surface mask tool's points, and the projected Gaussian radius. |
 | `QuadSurface` (core layer) | Stores the dense `cv::Mat_<cv::Vec3f>` grid and metadata that represent the segmentation patch. |
 
 
@@ -54,7 +77,9 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
 
 1. **Begin** – `SegmentationModule::beginEditingSession` primes the edit manager
    with the base surface, updates overlay parameters, and republishes that same
-   surface through the shared collection so viewers refresh immediately.
+   surface through the shared collection so viewers refresh immediately. The
+   surface's `SurfaceStoreEdit` pins the version being edited
+   (`requireCurrent`); a read-only store or a stale pin refuses the session.
 2. **Edit** – All vertex mutations occur directly on the base surface while the
    module keeps `_originalPoints` as the reset snapshot. The module
    continuously mirrors dirty state back to the widget so the UI can flag
@@ -64,7 +89,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
    surface). `resetPreview` clears the edit map and copies `_originalPoints`
    back into the base surface.
 4. **End** – `SegmentationModule::endEditingSession` cancels any active drag,
-   clears overlay markers, and drops the cached snapshot state.
+   commits a pending autosave, releases the hold, clears overlay markers, and
+   drops the cached snapshot state.
 
 
 ## Gaussian Falloff Workflow
@@ -92,11 +118,8 @@ Unless noted otherwise, paths are relative to `apps/VC3D`.
   move and the overlay highlights the active footprint.
 - **Left click release** – Commits the drag and leaves the surface in its new
   state. Escape cancels the drag and restores the touched vertices.
-- **Mouse wheel** – Adjusts the radius in quarter-step increments while showing
+- **Ctrl + mouse wheel** – Adjusts the radius in quarter-step increments while showing
   a transient status message. The overlay radius indicator updates immediately.
-
-Ctrl/Alt modifiers previously reserved for handle management are currently
-unused.
 
 ### Keyboard
 
@@ -105,15 +128,18 @@ unused.
 
 ## Overlay Behaviour
 
-`SegmentationOverlayController` receives:
+`SegmentationModule::refreshOverlay` builds a
+`SegmentationOverlayController::State` and hands it to `applyState`, which
+skips the redraw when the state is unchanged. The fields used by Gaussian
+editing are:
 
-- `setActiveVertex(optional<VertexMarker>)` – Active or hovered vertex (row,
-  col, world).
-- `setTouchedVertices(vector<VertexMarker>)` – The neighbours that were updated
-  during the last drag frame.
-- `setGaussianParameters(radiusSteps, sigmaSteps, gridStepWorld)` – Used to
+- `activeMarker` – Active or hovered vertex (row, col, world).
+- `neighbours` – The vertices updated during the last drag frame (from
+  `SegmentationEditManager::recentTouched`).
+- `gaussianRadiusSteps`, `gaussianSigmaSteps`, `gridStepWorld` – Used to
   project the radius indicator when an active drag is present.
-- Optional mask overlay data for tooling parity.
+- `surfaceMaskPoints` – The surface mask tool's points, in surface
+  coordinates.
 
 The controller renders simple filled circles for neighbours, a highlighted circle
 for the active vertex, and (during drag) an outline representing the world-space

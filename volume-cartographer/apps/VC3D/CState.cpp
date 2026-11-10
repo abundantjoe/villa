@@ -1,27 +1,100 @@
 #include "CState.hpp"
+#include <vc_object_store/Uuid.hpp>
+#include "PointCollectionSync.hpp"
+#include "SessionDrafts.hpp"
+
+#include "OpenDataResourceSelection.hpp"
 #include "VCSettings.hpp"
+#include "OpenedVolumes.hpp"
 
 #include <algorithm>
 #include <cmath>
+#include <limits>
 #include <exception>
 #include <thread>
 #include <optional>
 #include <QSettings>
+#include <QTimer>
+#include <QCoreApplication>
+#include <QProcess>
+#include <QStandardPaths>
+#include <QEventLoop>
+#include <QThread>
+#include <future>
+#include <vc_reader/sftp.hpp>
 
 #include "vc/core/types/VolumePkg.hpp"
+#include <vc_object_store/geometry/Geometry.hpp>
+#include <vc_object_store/objects/CatalogStore.hpp>
+#include <vc_object_store/Uuid.hpp>
 #include "vc/core/types/Volume.hpp"
 #include "vc/core/util/QuadSurface.hpp"
 #include "vc/core/util/Surface.hpp"
 #include "vc/ui/VCCollection.hpp"
 #include "vc/core/util/PlaneSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
 
 namespace {
 
-bool isValidSurfacePoint(const cv::Vec3f& point)
+vc::objects::AttachmentIdentity connectHostedStore(
+    const std::shared_ptr<vc::objects::ObjectStoreSession>& session,
+    const std::string& endpoint, const vc::objects::HostedSessionOptions& options)
 {
-    return point[0] != -1.0f && point[1] != -1.0f && point[2] != -1.0f
-        && std::isfinite(point[0]) && std::isfinite(point[1]) && std::isfinite(point[2]);
+    const auto* app = QCoreApplication::instance();
+    if (!vcr::sftp::isSftpUrl(endpoint) || !app || QThread::currentThread() != app->thread())
+        return session->attachHosted(endpoint, options);
+    // SSH asks the GUI for host trust/passwords. Keep its queued prompts alive
+    // while preventing another user-initiated project switch during attachment.
+    auto connection = std::async(std::launch::async, [session, endpoint, options] {
+        return session->attachHosted(endpoint, options);
+    });
+    QEventLoop loop;
+    QTimer timer;
+    QObject::connect(&timer, &QTimer::timeout, &loop, [&] {
+        if (connection.wait_for(std::chrono::seconds(0)) == std::future_status::ready) loop.quit();
+    });
+    timer.start(20);
+    loop.exec(QEventLoop::ExcludeUserInputEvents);
+    return connection.get();
+}
+
+std::shared_ptr<const vcr::catalog::RegistrationGraph> catalogTransformSnapshot()
+{
+    const auto catalog=vcr::catalog::cachedManifest(vcr::catalog::catalogCacheFile(std::string(vcr::catalog::kDefaultManifestUrl)));
+    if(!catalog)return {};
+    auto graph=std::make_shared<vcr::catalog::RegistrationGraph>();
+    graph->addCatalog(*catalog);
+    return graph;
+}
+
+// Viewers re-query regions as the view moves: keep verified geometry per read
+// connection well beyond the store's default (16 MB) so warm queries skip
+// reloading and re-hashing chunks.
+vc::objects::OpenOptions viewerOpenOptions()
+{
+    vc::objects::OpenOptions options;
+    options.catalogTransforms = catalogTransformSnapshot();
+    options.geometryCacheBytes = size_t(256) << 20;
+    options.surfaceTiles = CState::surfaceGeometryCache();
+    return options;
+}
+
+size_t surfaceGeometryCacheBytes()
+{
+    QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    const auto gb = settings.value(vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB,
+                                   vc3d::settings::viewer_cache::SURFACE_GEOMETRY_CACHE_GB_DEFAULT).toLongLong();
+    return size_t(std::max<qlonglong>(0, gb)) << 30;
+}
+
+// The box spanned by `box`'s corners scaled by `scale` (positive).
+Rect3D scaledBox(const Rect3D& box, double scale)
+{
+    Rect3D result;
+    for (int axis = 0; axis < 3; ++axis) {
+        result.low[axis] = std::min(box.low[axis], box.high[axis]) * float(scale);
+        result.high[axis] = std::max(box.low[axis], box.high[axis]) * float(scale);
+    }
+    return result;
 }
 
 struct SurfaceFocusPoint {
@@ -43,13 +116,14 @@ std::optional<SurfaceFocusPoint> focusPointAtGrid(QuadSurface& surface, int row,
     if (!surface.isQuadValid(row, col)) {
         return std::nullopt;
     }
-    const cv::Vec3f normal = surface.gridNormal(row, col);
+    cv::Vec3f normal;
+    surface.pointAt(float(col), float(row), nullptr, normal.val);
     if (!std::isfinite(normal[0]) || !std::isfinite(normal[1]) || !std::isfinite(normal[2])) {
         return std::nullopt;
     }
 
     const cv::Vec3f point = (*points)(row, col);
-    if (!isValidSurfacePoint(point)) {
+    if (!vc::geometry::validSurfacePoint(point)) {
         return std::nullopt;
     }
 
@@ -179,11 +253,47 @@ std::unique_ptr<POI> createSegmentationFocusPoi(CState* state, QuadSurface& surf
 
 } // namespace
 
-CState::CState(size_t cacheSizeBytes, QObject* parent)
+CState::CState(QObject* parent, CState* objectStoreOwner, std::size_t cacheBytes)
     : QObject(parent)
-    , _cacheSizeBytes(cacheSizeBytes)
 {
+    _objectStoreOwner = objectStoreOwner;
+    _objectStoreSession = objectStoreOwner ? objectStoreOwner->objectStoreSession()
+                                          : std::make_shared<vc::objects::ObjectStoreSession>();
+    if (objectStoreOwner) {
+        _openedVolumes = objectStoreOwner->_openedVolumes;
+    } else {
+        using namespace vc3d::settings;
+        const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+        const auto gib = settings.value(perf::RAM_CACHE_SIZE_GB, perf::RAM_CACHE_SIZE_GB_DEFAULT).toULongLong();
+        const auto gpuGib = settings.value(perf::RENDER_CUDA, perf::RENDER_CUDA_DEFAULT).toBool()
+            ? settings.value(perf::RENDER_GPU_CACHE_GB, perf::RENDER_GPU_CACHE_GB_DEFAULT).toULongLong()
+            : 0;
+        _openedVolumes = std::make_shared<OpenedVolumes>(cacheBytes ? cacheBytes : std::size_t(gib) << 30,
+                                                         std::size_t(gpuGib) << 30);
+    }
+    // Open Data surfaces are fetched from the catalog on the first read reaching them.
+    if (!objectStoreOwner)
+        _objectStoreSession->setGeometryFetcher(vc::objects::kCatalogMetaKey, vc::objects::fetchCatalogSurface);
+    qRegisterMetaType<vc::objects::StoreSessionEvent>();
+    if(objectStoreOwner) {
+        connect(objectStoreOwner, &CState::objectStoreChanged, this, &CState::objectStoreChanged);
+        connect(objectStoreOwner, &CState::objectStoreObservationFailed, this, &CState::objectStoreObservationFailed);
+        connect(objectStoreOwner, &CState::storeRoutesChanged, this, &CState::storeRoutesChanged);
+    } else {
+        auto* journalTimer = new QTimer(this);
+        journalTimer->setInterval(250);
+        connect(journalTimer, &QTimer::timeout, this, &CState::pollObjectStoreChanges);
+        journalTimer->start();
+    }
     _pointCollection = new VCCollection(this);
+    if (!objectStoreOwner) _pointCollectionSync = new vc3d::PointCollectionSync(this);
+    if (!objectStoreOwner) {
+        _sessionDrafts = new SessionDrafts(_objectStoreSession, this);
+        // A store attached again may answer saves left pending.
+        connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+            if (event.kind == vc::objects::StoreSessionEvent::Kind::Attached) _sessionDrafts->resolvePending();
+        });
+    }
 
     setSurface("xy plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,0,1}));
@@ -191,38 +301,433 @@ CState::CState(size_t cacheSizeBytes, QObject* parent)
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{0,1,0}));
     setSurface("yz plane",
         std::make_shared<PlaneSurface>(cv::Vec3f{2000,2000,2000}, cv::Vec3f{1,0,0}));
+    connect(this, &CState::objectStoreChanged, this, [this](const vc::objects::StoreSessionEvent& event) {
+        // The umbilicus is read through the store's volume mapping, so a
+        // registration change moves it too.
+        if (!event.touches({"umbilicus", "volume_transform", "volume_transform_choice"})) return;
+        emit umbilicusChanged();
+    });
 }
 
-CState::~CState() = default;
+CState::~CState()
+{
+    if (_objectStoreOwner) return;
+    for (const auto& attachment : _attachedStores) {
+        try { _objectStoreSession->detach(attachment); } catch (...) {}
+    }
+}
+
+namespace {
+QString configuredAuthor()
+{
+    const QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
+    return settings.value(vc3d::settings::viewer::USERNAME).toString().trimmed();
+}
+bool namesAuthor(const QString& author) { return !author.isEmpty() && author != QStringLiteral("anon"); }
+}
+
+QString CState::storeAuthor()
+{
+    auto author = configuredAuthor();
+    if (!namesAuthor(author))
+        author = qEnvironmentVariable("USER", qEnvironmentVariable("USERNAME", "vc3d"));
+    return author;
+}
+
+vc::objects::HostedSessionOptions CState::hostedOptions(const QString& author)
+{
+    vc::objects::HostedSessionOptions options;
+    options.author = author.toStdString();
+    options.cacheDirectory = vc::settings::remoteCachePath();
+    options.diskCacheBytes = vc::settings::remoteCacheMaxBytes();
+    options.minFreeBytes = vc::settings::remoteCacheMinFreeBytes();
+    return options;
+}
+
+vc::objects::AttachmentIdentity CState::attachHostedStore(const std::string& endpoint, const QString& author)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->attachHostedStore(endpoint, author);
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    const auto attachment = connectHostedStore(_objectStoreSession, endpoint, hostedOptions(author));
+    const auto id = vc::objects::util::newUuid();
+    auto data = _vpkg->document().data();
+    data["stores"].push_back({{"id", id}, {"location", endpoint}, {"hosted", true}, {"read_only", false}});
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { _objectStoreSession->detach(attachment); throw; }
+    _attachedStores.push_back(attachment);
+    _storeReferences.emplace(id, attachment);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    return attachment;
+}
+
+bool CState::storeAuthorConfigured() { return namesAuthor(configuredAuthor()); }
+
+vc::objects::OpenOptions CState::storeOpenOptions(const QString& author, bool readOnly)
+{
+    auto options = viewerOpenOptions();
+    options.author = author.toStdString();
+    options.readOnly = readOnly;
+    return options;
+}
+
+std::optional<vc::objects::AttachmentIdentity> CState::storeReference(const std::string& id) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeReference(id);
+    const auto found = _storeReferences.find(id);
+    return found == _storeReferences.end() ? std::nullopt : std::optional(found->second);
+}
+std::optional<vc::objects::AttachmentIdentity> CState::pointCollectionStore(uint64_t collectionId) const
+{
+    return _pointCollectionSync ? _pointCollectionSync->storeOf(collectionId) : std::nullopt;
+}
+std::optional<std::string> CState::storeReferenceId(const vc::objects::AttachmentIdentity& attachment) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeReferenceId(attachment);
+    for (const auto& [id, store] : _storeReferences)
+        if (store == attachment) return id;
+    return std::nullopt;
+}
+std::optional<vc::objects::AttachmentIdentity> CState::sampleStore() const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->sampleStore();
+    if (!_vpkg || !_vpkg->document().data().contains("open_data")) return std::nullopt;
+    return storeReference(_vpkg->document().data().at("open_data").at("store"));
+}
+std::optional<vc::objects::AttachmentIdentity> CState::attachedAt(const std::filesystem::path& path) const
+{
+    for (const auto& attachment : _objectStoreSession->attachments()) {
+        if (_objectStoreSession->hosted(attachment)) continue;
+        std::error_code error;
+        if (std::filesystem::equivalent(_objectStoreSession->path(attachment), path, error)) return attachment;
+    }
+    return std::nullopt;
+}
+vc::objects::AttachmentIdentity CState::prepareStore(const std::filesystem::path& path, const QString& author, bool readOnly)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->prepareStore(path, author, readOnly);
+    if (const auto existing = attachedAt(path)) return *existing;
+    return _objectStoreSession->attach(path, storeOpenOptions(author, readOnly));
+}
+void CState::releasePreparedStore(const vc::objects::AttachmentIdentity& attachment)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->releasePreparedStore(attachment); return; }
+    if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) == _attachedStores.end())
+        _objectStoreSession->detach(attachment);
+}
+void CState::closeProject() { setVpkg(nullptr); }
+std::vector<vc::objects::AttachmentIdentity> CState::attachedStores() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->attachedStores() : _attachedStores;
+}
+vc::objects::AttachmentIdentity CState::attachStore(const std::filesystem::path& path, const QString& author, bool readOnly)
+{
+    if (_objectStoreOwner) return _objectStoreOwner->attachStore(path, author, readOnly);
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    if (const auto existing = attachedAt(path)) {
+        if (std::find(_attachedStores.begin(), _attachedStores.end(), *existing) != _attachedStores.end()) return *existing;
+    }
+    const auto attachment = prepareStore(path, author, readOnly);
+    const auto id = vc::objects::util::newUuid();
+    auto data = _vpkg->document().data();
+    data["stores"].push_back({{"id", id}, {"location", _vpkg->document().location(path)}, {"read_only", readOnly}});
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { releasePreparedStore(attachment); throw; }
+    _attachedStores.push_back(attachment);
+    _storeReferences.emplace(id, attachment);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    return attachment;
+}
+void CState::detachStore(const vc::objects::AttachmentIdentity& attachment)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->detachStore(attachment); return; }
+    if (const auto id = storeReferenceId(attachment)) detachStoreReference(*id);
+}
+void CState::detachStoreReference(const std::string& id)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->detachStoreReference(id); return; }
+    if (!_vpkg) return;
+    auto data = _vpkg->document().data();
+    auto& stores = data["stores"];
+    if (stores.size() <= 1) throw std::runtime_error("A project must reference at least one store");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
+    stores.erase(std::remove_if(stores.begin(), stores.end(), [&](const auto& entry) { return entry.at("id") == id; }), stores.end());
+    for (auto& selection : data["selections"]) if (selection == id) selection = nullptr;
+    if (data.contains("open_data") && data["open_data"]["store"] == id) data.erase("open_data");
+    _vpkg->document().replace(std::move(data));
+    if (const auto attachment = storeReference(id)) {
+        _objectStoreSession->detach(*attachment);
+        std::erase(_attachedStores, *attachment);
+    }
+    _storeReferences.erase(id);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+void CState::replaceStoreReference(const std::string& id, const std::filesystem::path& path)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->replaceStoreReference(id, path); return; }
+    if (!_vpkg) return;
+    auto data = _vpkg->document().data();
+    auto entry = std::find_if(data["stores"].begin(), data["stores"].end(), [&](const auto& e) { return e.at("id") == id; });
+    if (entry == data["stores"].end()) throw std::invalid_argument("Unknown store reference");
+    if (vc::project::ProjectDocument::hostedStore(*entry))
+        throw std::invalid_argument("A hosted store has no file to locate; detach it and attach its endpoint again");
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
+    const auto existing = attachedAt(path);
+    if (existing && existing != storeReference(id)) throw std::invalid_argument("Store is already attached");
+    const auto replacement = prepareStore(path, storeAuthor(), entry->value("read_only", false));
+    (*entry)["location"] = _vpkg->document().location(path);
+    try { _vpkg->document().replace(std::move(data)); }
+    catch (...) { releasePreparedStore(replacement); throw; }
+    if (const auto old = storeReference(id); old && old != replacement) {
+        _objectStoreSession->detach(*old);
+        std::erase(_attachedStores, *old);
+    }
+    if (std::find(_attachedStores.begin(), _attachedStores.end(), replacement) == _attachedStores.end()) _attachedStores.push_back(replacement);
+    _storeReferences.insert_or_assign(id, replacement);
+    pollObjectStoreChanges();
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+const std::vector<std::string>& CState::routableKinds() { return vc::project::ProjectDocument::kinds(); }
+std::optional<vc::objects::AttachmentIdentity> CState::storeFor(std::string_view kind) const
+{
+    if (_objectStoreOwner) return _objectStoreOwner->storeFor(kind);
+    if (!_vpkg) return std::nullopt;
+    const auto& selections = _vpkg->document().data().at("selections");
+    const auto found = selections.find(std::string(kind));
+    return found == selections.end() || found->is_null() ? std::nullopt : storeReference(found->get<std::string>());
+}
+std::vector<vc::objects::AttachmentIdentity> CState::surfaceSources() const
+{
+    if (const auto store = storeFor("surface"); store && _currentVolume) return {*store};
+    return {};
+}
+void CState::setStoreFor(const std::string& kind, const std::optional<vc::objects::AttachmentIdentity>& store)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->setStoreFor(kind, store); return; }
+    if (!store) { setStoreSelection(kind, {}); return; }
+    if (const auto id = storeReferenceId(*store)) { setStoreSelection(kind, *id); return; }
+    throw std::invalid_argument("Store is not attached to this project");
+}
+void CState::setStoreSelection(const std::string& kind, const std::string& id)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->setStoreSelection(kind, id); return; }
+    if (!_vpkg) throw std::runtime_error("Open a project first");
+    auto data = _vpkg->document().data();
+    if (!data["selections"].contains(kind)) throw std::invalid_argument("Unknown object kind");
+    const nlohmann::json selected = id.empty() ? nlohmann::json(nullptr) : nlohmann::json(id);
+    if (data["selections"][kind] == selected) return;
+    if (prepareStoreSwitch && !prepareStoreSwitch()) throw StoreSwitchRefused("Store switch cancelled: pending edits could not be saved");
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw StoreSwitchRefused("Pending point-collection edits could not be saved");
+    data["selections"][kind] = selected;
+    _vpkg->document().replace(std::move(data));
+    emit storeRoutesChanged();
+    emit umbilicusChanged();
+}
+void CState::restoreStoreRoutes()
+{
+    if (!_vpkg) return;
+    QStringList failures;
+    const auto stores = _vpkg->document().data().at("stores");
+    for (size_t index = 0; index < stores.size(); ++index) {
+        const auto& entry = stores[index];
+        try {
+            vc::objects::AttachmentIdentity attachment;
+            try {
+                attachment = vc::project::ProjectDocument::hostedStore(entry)
+                    ? connectHostedStore(_objectStoreSession, entry.at("location").get<std::string>(), hostedOptions(storeAuthor()))
+                    : prepareStore(_vpkg->document().resolve(entry.at("location")), storeAuthor(), entry.value("read_only", false));
+            } catch (const std::exception& error) {
+                if (vc::project::ProjectDocument::hostedStore(entry) || entry.value("read_only", false) ||
+                    !_vpkg->writable() || !QString::fromUtf8(error.what()).contains(": convert it with vc_object_convert)")) throw;
+                // Reuse the offline converter; retain the original and its relative references.
+                const auto source = _vpkg->document().resolve(entry.at("location"));
+                const auto destination = source.parent_path() / (source.stem().string() + "-upgraded-" + vc::objects::util::newUuid() + ".vcobj");
+                QProcess converter;
+                converter.start(QStandardPaths::findExecutable("vc_object_convert", {QCoreApplication::applicationDirPath()}),
+                                {QString::fromStdString(source.string()), QString::fromStdString(destination.string())});
+                if (!converter.waitForFinished(-1) || converter.exitStatus() != QProcess::NormalExit || converter.exitCode() != 0)
+                    throw std::runtime_error("Store upgrade failed: " + converter.errorString().toStdString() + "\n" + converter.readAllStandardError().toStdString());
+                attachment = prepareStore(destination, storeAuthor());
+                auto data = _vpkg->document().data();
+                data["stores"][index]["location"] = _vpkg->document().location(destination);
+                try { _vpkg->document().replace(std::move(data)); }
+                catch (...) { releasePreparedStore(attachment); throw; }
+            }
+            if (std::find(_attachedStores.begin(), _attachedStores.end(), attachment) != _attachedStores.end())
+                throw std::runtime_error("Store is referenced more than once");
+            _attachedStores.push_back(attachment);
+            _storeReferences.emplace(entry.at("id").get<std::string>(), attachment);
+        } catch (const std::exception& error) {
+            failures << QString::fromStdString(entry.at("location").get<std::string>()) + ": " + QString::fromUtf8(error.what());
+        }
+    }
+    if (!failures.empty()) emit objectStoreObservationFailed(tr("Unavailable project stores:\n%1").arg(failures.join('\n')));
+}
+
+std::shared_ptr<vc::objects::SurfaceTileCache> CState::surfaceGeometryCache()
+{
+    static const auto cache = std::make_shared<vc::objects::SurfaceTileCache>(surfaceGeometryCacheBytes());
+    return cache;
+}
+
+void CState::applySurfaceGeometryCacheSettings()
+{
+    surfaceGeometryCache()->setCapacity(surfaceGeometryCacheBytes());
+}
+
+void CState::pollObjectStoreChanges()
+{
+    if(_objectStoreOwner) { _objectStoreOwner->pollObjectStoreChanges(); return; }
+    try {
+        const auto events = _objectStoreSession->takeEvents();
+        _objectStoreObservationError.clear();
+        for (const auto& event : events) emit objectStoreChanged(event);
+    } catch (const std::exception& error) {
+        const auto message = QString::fromUtf8(error.what());
+        if (_objectStoreObservationError != message) {
+            _objectStoreObservationError = message;
+            emit objectStoreObservationFailed(message);
+        }
+    }
+}
 
 std::shared_ptr<VolumePkg> CState::vpkg() const { return _vpkg; }
 
 void CState::setVpkg(std::shared_ptr<VolumePkg> pkg)
 {
+    const bool changed = _vpkg != pkg;
+    if (changed && !_objectStoreOwner) {
+        if (_pointCollectionSync && !_pointCollectionSync->flush())
+            throw std::runtime_error("Pending point-collection edits could not be saved");
+        for (const auto& store : _attachedStores) _objectStoreSession->detach(store);
+        _attachedStores.clear();
+        _storeReferences.clear();
+    }
     _vpkg = std::move(pkg);
+    if (changed && !_objectStoreOwner) {
+        restoreStoreRoutes();
+        pollObjectStoreChanges();
+        emit storeRoutesChanged();
+    }
+    updateAnnotationVolume();
+    if (changed) {
+        // Restore without invoking setters: switching projects must not persist
+        // the previous project's bounds into either project.
+        _focusBounds = _vpkg ? _vpkg->focusBounds() : std::nullopt;
+        _focusBoundsEnabled = _vpkg && _vpkg->focusBoundsEnabled();
+        ++_focusBoundsRevision;
+        emit focusBoundsChanged();
+    }
     emit vpkgChanged(_vpkg);
 }
 
-QString CState::vpkgPath() const
+QString CState::projectDirectory() const
 {
-    if (_vpkg) {
-        return QString::fromStdString(_vpkg->getVolpkgDirectory());
-    }
-    return {};
+    return _vpkg ? QString::fromStdString(_vpkg->directory().string()) : QString();
 }
 
 bool CState::hasVpkg() const { return _vpkg != nullptr; }
 
 std::shared_ptr<Volume> CState::currentVolume() const { return _currentVolume; }
 
-std::string CState::currentVolumeId() const { return _currentVolumeId; }
+std::string CState::currentVolumeId() const { return _currentVolume ? _currentVolume->id() : std::string{}; }
 
 void CState::setCurrentVolume(std::shared_ptr<Volume> vol)
 {
+    if (_currentVolume == vol) {
+        ++_focusBoundsRevision;
+        emit volumeChanged(_currentVolume, currentVolumeId());
+        emit focusBoundsChanged();
+        return;
+    }
     _currentVolume = std::move(vol);
-    applyCacheBudget(_currentVolume);
-    resolveCurrentVolumeId();
-    emit volumeChanged(_currentVolume, _currentVolumeId);
+    updateAnnotationVolume();
+    // Reopening the project returns to it.
+    if (_vpkg && _currentVolume && !_objectStoreOwner) {
+        try { _vpkg->setCurrentVolumeId(_currentVolume->id()); } catch (const std::exception&) {}
+    }
+    // The open surface's draft is declared in the volume's voxels.
+    draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surface("segmentation")));
+    const auto volumeId = currentVolumeId();
+    ++_focusBoundsRevision;
+    emit volumeChanged(_currentVolume, volumeId);
+    emit focusBoundsChanged();
+}
+
+void CState::updateAnnotationVolume()
+{
+    _annotationVolume.reset();
+    if (_currentVolume) _annotationVolume = vc::project::annotationVolume(_vpkg.get(), *_currentVolume);
+}
+
+std::optional<Rect3D> CState::focusBounds() const
+{
+    if (!_focusBounds || !_annotationVolume) return std::nullopt;
+    return scaledBox(*_focusBounds, _annotationVolume->scale);
+}
+
+std::optional<Rect3D> CState::activeFocusBounds() const
+{
+    return _focusBoundsEnabled ? focusBounds() : std::nullopt;
+}
+
+std::optional<Rect3D> CState::activeAnnotationFocusBounds() const
+{
+    return _focusBoundsEnabled && _annotationVolume ? _focusBounds : std::nullopt;
+}
+
+bool CState::focusBoundsEnabled() const { return _focusBoundsEnabled; }
+
+uint64_t CState::focusBoundsRevision() const { return _focusBoundsRevision; }
+
+void CState::setFocusBounds(const Rect3D& bounds)
+{
+    if (!_annotationVolume)
+        return;
+    const auto normalized = scaledBox(bounds, 1.0 / _annotationVolume->scale);
+    for (int axis = 0; axis < 3; ++axis)
+        if (!std::isfinite(normalized.low[axis]) || !std::isfinite(normalized.high[axis]))
+            return;
+    if (_focusBounds && _focusBounds->low == normalized.low &&
+        _focusBounds->high == normalized.high) {
+        return;
+    }
+    if (_vpkg) _vpkg->setFocusBounds(normalized, _focusBoundsEnabled);
+    _focusBounds = normalized;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::setFocusBoundsEnabled(bool enabled)
+{
+    if (_focusBoundsEnabled == enabled) {
+        return;
+    }
+    if (_vpkg) _vpkg->setFocusBounds(_focusBounds, enabled);
+    _focusBoundsEnabled = enabled;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
+}
+
+void CState::clearFocusBounds()
+{
+    if (!_focusBounds && !_focusBoundsEnabled) {
+        return;
+    }
+    if (_vpkg) _vpkg->setFocusBounds(std::nullopt, false);
+    _focusBounds.reset();
+    _focusBoundsEnabled = false;
+    ++_focusBoundsRevision;
+    emit focusBoundsChanged();
 }
 
 std::string CState::segmentationGrowthVolumeId() const { return _segmentationGrowthVolumeId; }
@@ -259,57 +764,33 @@ void CState::clearActiveSurface()
 
 VCCollection* CState::pointCollection() const { return _pointCollection; }
 
-size_t CState::cacheSizeBytes() const { return _cacheSizeBytes; }
-
-void CState::applyCacheBudget(const std::shared_ptr<Volume>& vol) const
+void CState::savePointCollections()
 {
-    if (vol && _cacheSizeBytes > 0) {
-        vol->setCacheBudget(_cacheSizeBytes);
-    }
-}
-
-void CState::resolveCurrentVolumeId()
-{
-    _currentVolumeId.clear();
-    if (_vpkg && _currentVolume) {
-        for (const auto& id : _vpkg->volumeIDs()) {
-            if (_vpkg->volume(id) == _currentVolume) {
-                _currentVolumeId = id;
-                return;
-            }
-        }
-    }
-    if (_currentVolume) {
-        _currentVolumeId = _currentVolume->id();
-    }
+    if (_pointCollectionSync && !_pointCollectionSync->flush())
+        throw std::runtime_error("Pending point-collection edits could not be saved");
+    emit pointCollectionsSaveRequested();
 }
 
 void CState::closeAll()
 {
+    savePointCollections();
     emit volumeClosing();
 
     clearActiveSurface();
 
-    setSurface("segmentation", nullptr, true);
-    if (_vpkg) {
-        for (const auto& id : _vpkg->getLoadedSurfaceIDs()) {
-            setSurface(id, nullptr, true);
-        }
-        _vpkg->unloadAllSurfaces();
-    } else {
-        auto names = surfaceNames();
-        for (const auto& name : names) {
-            if (name != "segmentation") {
-                setSurface(name, nullptr, true);
-            }
-        }
-    }
+    // Every surface except the view planes belongs to the closed project.
+    std::vector<std::string> closed;
+    for (const auto& [name, surf] : _surfs)
+        if (!std::dynamic_pointer_cast<PlaneSurface>(surf)) closed.push_back(name);
+    std::sort(closed.begin(), closed.end());
+    for (const auto& name : closed)
+        setSurface(name, nullptr, true);
 
     _currentVolume = nullptr;
-    _currentVolumeId.clear();
     _segmentationGrowthVolumeId.clear();
 
     _pois.clear();
+    if (_pointCollectionSync) _pointCollectionSync->unload();
     _pointCollection->clearAll();
 
     setVpkg(nullptr);
@@ -324,7 +805,8 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     if (sameSurface && !isEditUpdate && surf != nullptr) {
         return;
     }
-    if (it != _surfs.end() && it->second && it->second != surf) {
+    if (_surfaceBatchDepth == 0 && it != _surfs.end() && it->second &&
+        it->second != surf) {
         emit surfaceWillBeDeleted(name, it->second);
     }
 
@@ -333,7 +815,7 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         resetViewOnSurfaceChangeEnabled()) {
         if (auto quad = std::dynamic_pointer_cast<QuadSurface>(surf)) {
             try {
-                auto focusPoi = createSegmentationFocusPoi(this, *quad);
+                auto focusPoi = createSurfaceFocusPoi(*quad);
                 if (focusPoi) {
                     delayedFocusPoi = focusPoi.get();
                     _pois["focus"] = std::move(focusPoi);
@@ -348,8 +830,20 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
     }
 
     _surfs[name] = surf;
+    if (name == "segmentation" && (!sameSurface || (isEditUpdate && !_activeSurfaceEditing))) {
+        // A surface newly set without an edit is the one opened from its store.
+        draftActiveSurface(std::dynamic_pointer_cast<QuadSurface>(surf), !sameSurface && !isEditUpdate);
+    }
+    if (!sameSurface) {
+        // Edit updates re-set the same pointer every frame; only a mapping
+        // change should invalidate cached views of the surface map.
+        ++_surfacesVersion;
+        if (_surfaceBatchDepth > 0) {
+            _surfaceBatchChanged = true;
+        }
+    }
 
-    if (!noSignalSend || surf == nullptr) {
+    if (_surfaceBatchDepth == 0 && (!noSignalSend || surf == nullptr)) {
         emit surfaceChanged(name, surf, isEditUpdate);
     }
 
@@ -358,14 +852,80 @@ void CState::setSurface(const std::string& name, std::shared_ptr<Surface> surf, 
         if (poiIt != _pois.end() && poiIt->second.get() == delayedFocusPoi) {
             emit poiChanged("focus", delayedFocusPoi);
             delayedFocusPoi->suppressViewerRecenter = false;
-            delayedFocusPoi->suppressTransientPlaneIntersections = false;
         }
     }
 }
 
-void CState::emitSurfacesChanged()
+void CState::draftActiveSurface(const std::shared_ptr<QuadSurface>& surface, bool saved)
 {
-    emit surfaceChanged("", nullptr, false);
+    // Workspaces sharing the main session draft their own surfaces.
+    if (_objectStoreOwner || !_objectStoreSession) {
+        return;
+    }
+    if (!_activeSurfaceDraft.empty() && (!surface || surface->id != _activeSurfaceDraft)) {
+        _objectStoreSession->clearDraft(_activeSurfaceDraft);
+        _activeSurfaceDraft.clear();
+    }
+    if (!surface || !_annotationVolume || !vc::objects::util::isUuid(surface->id)) {
+        return;
+    }
+    // Never replace unsaved edits recovered from an earlier session: the user decides.
+    if (_sessionDrafts && _sessionDrafts->recovered(surface->id)) {
+        _activeSurfaceDraft.clear();
+        const auto uuid = QString::fromStdString(surface->id);
+        QMetaObject::invokeMethod(this, [this, uuid] { emit recoveredDraftFound(uuid); }, Qt::QueuedConnection);
+        return;
+    }
+    _objectStoreSession->setDraft(surface->id, quad_surface_grid(*surface),
+                                  vc::objects::volumeCoordinates(*_annotationVolume));
+    if (saved) _objectStoreSession->markDraftSaved(surface->id, _objectStoreSession->draftRevision(surface->id));
+    _activeSurfaceDraft = surface->id;
+}
+
+void CState::recoveredDraftResolved(const std::string& objectUuid, bool restored)
+{
+    if (_objectStoreOwner) { _objectStoreOwner->recoveredDraftResolved(objectUuid, restored); return; }
+    if (_sessionDrafts) _sessionDrafts->forgetRecovered(objectUuid);
+    const auto open = std::dynamic_pointer_cast<QuadSurface>(surface("segmentation"));
+    if (!open || open->id != objectUuid) return;
+    if (restored) _activeSurfaceDraft = objectUuid;
+    else draftActiveSurface(open, true);
+}
+
+SessionDrafts* CState::sessionDrafts() const
+{
+    return _objectStoreOwner ? _objectStoreOwner->sessionDrafts() : _sessionDrafts;
+}
+
+void CState::setSurfacesBatch(
+    const std::vector<std::pair<std::string, std::shared_ptr<Surface>>>& updates)
+{
+    const bool outermost = _surfaceBatchDepth == 0;
+    if (outermost) {
+        _surfaceBatchChanged = false;
+    }
+    ++_surfaceBatchDepth;
+
+    auto finishBatch = [this, outermost]() {
+        --_surfaceBatchDepth;
+        if (outermost) {
+            const bool changed = _surfaceBatchChanged;
+            _surfaceBatchChanged = false;
+            if (changed) {
+                emit surfaceChanged("", nullptr, false);
+            }
+        }
+    };
+
+    try {
+        for (const auto& [name, surface] : updates) {
+            setSurface(name, surface, true, false);
+        }
+    } catch (...) {
+        finishBatch();
+        throw;
+    }
+    finishBatch();
 }
 
 std::shared_ptr<Surface> CState::surface(const std::string& name)
@@ -407,16 +967,12 @@ std::vector<std::shared_ptr<Surface>> CState::surfaces()
     return result;
 }
 
-std::vector<std::string> CState::surfaceNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _surfs)
-        keys.push_back(it.first);
-
-    return keys;
-}
-
 // --- POI methods (from CSurfaceCollection) ---
+
+std::unique_ptr<POI> CState::createSurfaceFocusPoi(QuadSurface& surface)
+{
+    return createSegmentationFocusPoi(this, surface);
+}
 
 void CState::setPOI(const std::string& name, POI* poi)
 {
@@ -425,13 +981,11 @@ void CState::setPOI(const std::string& name, POI* poi)
         // Same pointer re-submitted (caller mutated in place) - just signal
         emit poiChanged(name, poi);
         poi->suppressViewerRecenter = false;
-        poi->suppressTransientPlaneIntersections = false;
         return;
     }
     _pois[name] = std::unique_ptr<POI>(poi);
     emit poiChanged(name, poi);
     poi->suppressViewerRecenter = false;
-    poi->suppressTransientPlaneIntersections = false;
 }
 
 POI* CState::poi(const std::string& name)
@@ -440,25 +994,4 @@ POI* CState::poi(const std::string& name)
     if (it == _pois.end())
         return nullptr;
     return it->second.get();
-}
-
-std::vector<POI*> CState::pois()
-{
-    std::vector<POI*> result;
-    result.reserve(_pois.size());
-
-    for (auto& [key, ptr] : _pois) {
-        result.push_back(ptr.get());
-    }
-
-    return result;
-}
-
-std::vector<std::string> CState::poiNames()
-{
-    std::vector<std::string> keys;
-    for (auto& it : _pois)
-        keys.push_back(it.first);
-
-    return keys;
 }

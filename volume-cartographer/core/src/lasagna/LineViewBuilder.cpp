@@ -1,4 +1,5 @@
 #include "vc/lasagna/LineViewBuilder.hpp"
+#include "vc/fiber_tracer/FiberDisplay.hpp"
 
 #include "vc/core/util/PlaneSurface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
@@ -75,48 +76,19 @@ cv::Vec3f toVec3f(const cv::Vec3d& v)
             static_cast<float>(v[2])};
 }
 
-std::vector<double> crossOffsets(double halfWidth, int samples)
+std::vector<double> crossOffsets()
 {
-    if (samples < 2) {
-        throw std::invalid_argument("LineViewConfig::crossSamples must be at least 2");
-    }
     std::vector<double> offsets;
-    offsets.reserve(static_cast<size_t>(samples));
-    for (int i = 0; i < samples; ++i) {
-        const double t = static_cast<double>(i) / static_cast<double>(samples - 1);
-        offsets.push_back(-halfWidth + 2.0 * halfWidth * t);
+    offsets.reserve(kLineViewCrossSampleCount);
+    const int center = kLineViewCrossSampleCount / 2;
+    for (int i = 0; i < kLineViewCrossSampleCount; ++i) {
+        offsets.push_back(
+            static_cast<double>(i - center) * kLineViewCrossRowSpacingBaseVoxels);
     }
     return offsets;
 }
 
-double typicalStepSize(const std::vector<SegmentNormalSample>& samples)
-{
-    std::vector<double> steps;
-    steps.reserve(samples.size());
-    for (size_t i = 0; i + 1 < samples.size(); ++i) {
-        const double step = norm(samples[i + 1].position - samples[i].position);
-        if (std::isfinite(step) && step > kEpsilon) {
-            steps.push_back(step);
-        }
-    }
-    if (steps.empty()) {
-        return 1.0;
-    }
-    std::sort(steps.begin(), steps.end());
-    return steps[steps.size() / 2];
-}
-
-double resolvedHalfExtent(double configuredHalfExtent,
-                          const std::vector<SegmentNormalSample>& samples,
-                          int crossSamples)
-{
-    if (configuredHalfExtent > 0.0) {
-        return configuredHalfExtent;
-    }
-    return typicalStepSize(samples) * static_cast<double>(crossSamples - 1) * 0.5;
-}
-
-std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
+std::vector<SegmentNormalSample> lineSamples(const LineModel& line)
 {
     std::vector<SegmentNormalSample> samples;
     samples.reserve(line.points.size());
@@ -126,18 +98,160 @@ std::vector<SegmentNormalSample> controlPointSamples(const LineModel& line)
     return samples;
 }
 
-std::vector<SegmentNormalSample> denseSamples(const LineModel& line)
+double arclengthAtLinePosition(const std::vector<double>& arclengths,
+                               double linePosition)
 {
-    std::vector<SegmentNormalSample> samples;
-    for (const auto& segment : line.segmentSamples) {
-        for (const auto& sample : segment.samples) {
-            if (!samples.empty() && norm(sample.position - samples.back().position) <= kEpsilon) {
-                continue;
-            }
-            samples.push_back(sample);
+    linePosition = std::clamp(
+        linePosition, 0.0, static_cast<double>(arclengths.size() - 1));
+    const size_t first = static_cast<size_t>(std::floor(linePosition));
+    const size_t second = std::min(first + 1, arclengths.size() - 1);
+    const double t = linePosition - static_cast<double>(first);
+    return arclengths[first] * (1.0 - t) + arclengths[second] * t;
+}
+
+std::vector<double> resamplingSupportPositions(
+    size_t linePointCount,
+    const std::vector<double>& controlPointLinePositions)
+{
+    const double lastPosition = static_cast<double>(linePointCount - 1);
+    if (controlPointLinePositions.empty()) {
+        std::vector<double> positions;
+        positions.reserve(linePointCount);
+        for (size_t index = 0; index < linePointCount; ++index) {
+            positions.push_back(static_cast<double>(index));
+        }
+        return positions;
+    }
+    std::vector<double> positions{0.0, lastPosition};
+    positions.reserve(controlPointLinePositions.size() + 2);
+    for (const double position : controlPointLinePositions) {
+        if (std::isfinite(position)) {
+            positions.push_back(std::clamp(position, 0.0, lastPosition));
         }
     }
-    return samples;
+    std::sort(positions.begin(), positions.end());
+    positions.erase(
+        std::unique(positions.begin(), positions.end(), [](double lhs, double rhs) {
+            return std::abs(lhs - rhs) <= kEpsilon;
+        }),
+        positions.end());
+    return positions;
+}
+
+LineStripPositionMap buildPositionMap(const std::vector<SegmentNormalSample>& samples,
+                                      double targetSpacingBaseVoxels,
+                                      const std::vector<double>& controlPointLinePositions)
+{
+    LineStripPositionMap map;
+    map.originalArclengths.resize(samples.size(), 0.0);
+    for (size_t i = 1; i < samples.size(); ++i) {
+        const double segmentLength = norm(samples[i].position - samples[i - 1].position);
+        if (!std::isfinite(segmentLength)) {
+            throw std::invalid_argument("LineModel contains a non-finite segment");
+        }
+        map.originalArclengths[i] = map.originalArclengths[i - 1] + segmentLength;
+    }
+    map.totalArclength = map.originalArclengths.empty() ? 0.0 : map.originalArclengths.back();
+    if (!(map.totalArclength > kEpsilon)) {
+        throw std::invalid_argument("Cannot build line annotation views for a zero-length LineModel");
+    }
+
+    const std::vector<double> supportPositions = resamplingSupportPositions(
+        samples.size(), controlPointLinePositions);
+    std::vector<double> supportArclengths;
+    supportArclengths.reserve(supportPositions.size());
+    for (const double position : supportPositions) {
+        supportArclengths.push_back(
+            arclengthAtLinePosition(map.originalArclengths, position));
+    }
+
+    map.stripGridArclengths.push_back(0.0);
+    for (size_t i = 1; i < supportArclengths.size(); ++i) {
+        const double spanStart = supportArclengths[i - 1];
+        const double spanEnd = supportArclengths[i];
+        const double spanLength = spanEnd - spanStart;
+        if (spanLength <= kEpsilon) {
+            continue;
+        }
+
+        const double idealIntervals = spanLength / targetSpacingBaseVoxels;
+        const size_t lowerIntervals = std::max<size_t>(
+            1, static_cast<size_t>(std::floor(idealIntervals)));
+        const size_t upperIntervals = lowerIntervals + 1;
+        const double lowerError = std::abs(
+            spanLength / static_cast<double>(lowerIntervals) - targetSpacingBaseVoxels);
+        const double upperError = std::abs(
+            spanLength / static_cast<double>(upperIntervals) - targetSpacingBaseVoxels);
+        const size_t intervalCount = upperError < lowerError
+            ? upperIntervals
+            : lowerIntervals;
+
+        for (size_t interval = 1; interval <= intervalCount; ++interval) {
+            const double arclength = interval == intervalCount
+                ? spanEnd
+                : spanStart + spanLength *
+                    static_cast<double>(interval) / static_cast<double>(intervalCount);
+            map.stripGridArclengths.push_back(arclength);
+        }
+    }
+
+    map.stripGridColumnCount = map.stripGridArclengths.size();
+    map.stripGridSpacingBaseVoxels = targetSpacingBaseVoxels;
+    return map;
+}
+
+NormalSample interpolatedNormal(const NormalSample& a, const NormalSample& b, double t)
+{
+    if (a.valid && b.valid) {
+        cv::Vec3d bNormal = b.normal;
+        if (a.normal.dot(bNormal) < 0.0) {
+            bNormal *= -1.0;
+        }
+        const cv::Vec3d normal = normalizedOrZero(a.normal * (1.0 - t) + bNormal * t);
+        return {normal, validDirection(normal)};
+    }
+    if (a.valid) {
+        return a;
+    }
+    return b;
+}
+
+std::vector<SegmentNormalSample> resampleLine(
+    const std::vector<SegmentNormalSample>& samples,
+    const LineStripPositionMap& map)
+{
+    std::vector<SegmentNormalSample> result;
+    result.reserve(map.stripGridColumnCount);
+    for (const double arclength : map.stripGridArclengths) {
+        auto upper = std::upper_bound(map.originalArclengths.begin(),
+                                      map.originalArclengths.end(), arclength);
+        size_t second = upper == map.originalArclengths.end()
+            ? samples.size() - 1
+            : static_cast<size_t>(upper - map.originalArclengths.begin());
+        size_t first = second == 0 ? 0 : second - 1;
+        while (second < samples.size() &&
+               map.originalArclengths[second] - map.originalArclengths[first] <= kEpsilon) {
+            ++second;
+        }
+        if (second >= samples.size()) {
+            second = samples.size() - 1;
+            first = second == 0 ? 0 : second - 1;
+            while (first > 0 &&
+                   map.originalArclengths[second] - map.originalArclengths[first] <= kEpsilon) {
+                --first;
+            }
+        }
+        const double span = map.originalArclengths[second] - map.originalArclengths[first];
+        const double t = span > kEpsilon
+            ? std::clamp((arclength - map.originalArclengths[first]) / span, 0.0, 1.0)
+            : 0.0;
+        SegmentNormalSample sample;
+        sample.position = samples[first].position * (1.0 - t) + samples[second].position * t;
+        sample.sampledNormal = interpolatedNormal(samples[first].sampledNormal,
+                                                  samples[second].sampledNormal, t);
+        result.push_back(sample);
+    }
+    return result;
 }
 
 std::vector<cv::Vec3d> resolvedNormals(const std::vector<SegmentNormalSample>& samples)
@@ -178,22 +292,8 @@ std::vector<cv::Vec3d> resolvedNormals(const std::vector<SegmentNormalSample>& s
 
 cv::Vec3d tangentAt(const std::vector<SegmentNormalSample>& samples, size_t row)
 {
-    if (samples.size() < 2) {
-        return {1.0, 0.0, 0.0};
-    }
-    cv::Vec3d tangent{0.0, 0.0, 0.0};
-    if (row == 0) {
-        tangent = samples[1].position - samples[0].position;
-    } else if (row + 1 == samples.size()) {
-        tangent = samples[row].position - samples[row - 1].position;
-    } else {
-        tangent = samples[row + 1].position - samples[row - 1].position;
-    }
-    tangent = normalizedOrZero(tangent);
-    if (!validDirection(tangent)) {
-        return {1.0, 0.0, 0.0};
-    }
-    return tangent;
+    return vc::geometry::lineTangent(samples.size(), row,
+        [&](size_t i) { return samples[i].position; });
 }
 
 cv::Vec3d sideDirection(const cv::Vec3d& normal, const cv::Vec3d& tangent)
@@ -236,14 +336,8 @@ cv::Vec3d transportNormal(const cv::Vec3d& previousNormal,
                           const cv::Vec3d& previousTangent,
                           const cv::Vec3d& tangent)
 {
-    const cv::Vec3d axis = previousTangent.cross(tangent);
-    const double sinAngle = norm(axis);
-    const double cosAngle = clamped(previousTangent.dot(tangent), -1.0, 1.0);
-    cv::Vec3d transported = previousNormal;
-    if (sinAngle > kEpsilon) {
-        transported = rotateAroundAxis(previousNormal, axis, std::atan2(sinAngle, cosAngle));
-    }
-    transported = projectToTangentPlane(transported, tangent);
+    cv::Vec3d transported = vc::geometry::transportFrameNormal(
+        previousNormal, previousTangent, tangent);
     if (validDirection(transported)) {
         return transported;
     }
@@ -285,18 +379,6 @@ cv::Vec3d requiredDisplayAnchorUp(const std::vector<SegmentNormalSample>& sample
     return up;
 }
 
-double unwrapNear(double angle, double reference)
-{
-    constexpr double twoPi = 2.0 * 3.14159265358979323846;
-    while (angle - reference > 3.14159265358979323846) {
-        angle -= twoPi;
-    }
-    while (angle - reference < -3.14159265358979323846) {
-        angle += twoPi;
-    }
-    return angle;
-}
-
 double unwrapAxisNear(double angle, double reference)
 {
     constexpr double pi = 3.14159265358979323846;
@@ -335,31 +417,6 @@ std::vector<double> smoothRollAngles(const std::vector<double>& targets)
     return angles;
 }
 
-std::vector<cv::Vec3d> alignedTargetNormals(const std::vector<cv::Vec3d>& normals,
-                                            const std::vector<cv::Vec3d>& tangents,
-                                            const std::vector<cv::Vec3d>& baseNormals)
-{
-    std::vector<cv::Vec3d> targets(normals.size(), {0.0, 0.0, 0.0});
-    cv::Vec3d previous{0.0, 0.0, 0.0};
-    for (size_t row = 0; row < normals.size(); ++row) {
-        cv::Vec3d target = projectToTangentPlane(normalizedOrZero(normals[row]), tangents[row]);
-        if (!validDirection(target)) {
-            targets[row] = previous;
-            continue;
-        }
-
-        const cv::Vec3d reference = validDirection(previous) && row > 0
-            ? transportNormal(previous, tangents[row - 1], tangents[row])
-            : baseNormals[row];
-        if (validDirection(reference) && target.dot(reference) < 0.0) {
-            target *= -1.0;
-        }
-        targets[row] = target;
-        previous = target;
-    }
-    return targets;
-}
-
 struct LineFrame {
     cv::Vec3d side;
     cv::Vec3d meshNormal;
@@ -377,29 +434,6 @@ cv::Vec3d fallbackMeshNormalForTangent(const cv::Vec3d& tangent)
         return normal;
     }
     return {0.0, 1.0, 0.0};
-}
-
-cv::Vec3d clampedFrameNormal(const cv::Vec3d& reference,
-                             const cv::Vec3d& target,
-                             const cv::Vec3d& tangent)
-{
-    if (!validDirection(reference)) {
-        return target;
-    }
-    if (!validDirection(target)) {
-        return reference;
-    }
-
-    const cv::Vec3d binormal = normalizedOrZero(tangent.cross(reference));
-    if (!validDirection(binormal)) {
-        return target;
-    }
-
-    const double angle = std::atan2(target.dot(binormal), target.dot(reference));
-    const double clampedAngle = clamped(angle, -kMaxFrameRollDelta, kMaxFrameRollDelta);
-    cv::Vec3d normal = rotateAroundAxis(reference, tangent, clampedAngle);
-    normal = projectToTangentPlane(normal, tangent);
-    return validDirection(normal) ? normal : target;
 }
 
 LineFrame frameFromMeshNormal(cv::Vec3d meshNormal, const cv::Vec3d& tangent)
@@ -532,6 +566,8 @@ std::vector<cv::Vec3d> buildTransportedUpVectors(const std::vector<SegmentNormal
 std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>& samples,
                                          const std::vector<double>& offsets,
                                          const std::vector<LineFrame>& frames,
+                                         double alongSpacing,
+                                         double crossSpacing,
                                          bool useSide)
 {
     cv::Mat_<cv::Vec3f> points(static_cast<int>(offsets.size()),
@@ -544,28 +580,50 @@ std::shared_ptr<QuadSurface> buildRibbon(const std::vector<SegmentNormalSample>&
                                      + direction * offsets[static_cast<size_t>(row)]);
         }
     }
-    return std::make_shared<QuadSurface>(points, cv::Vec2f{1.0f, 1.0f});
+    auto surface = std::make_shared<QuadSurface>(
+        points,
+        cv::Vec2f{static_cast<float>(1.0 / alongSpacing),
+                  static_cast<float>(1.0 / crossSpacing)});
+    // The strips are built along the line's polyline: linear patches keep the line on
+    // them between support columns (bicubic would bow it off the line).
+    surface->setInterpolation(vcr::grid::Interpolation::Linear);
+    return surface;
 }
 
-std::vector<LineFrame> framesAtControlPoints(const std::vector<SegmentNormalSample>& controlSamples,
-                                             const std::vector<SegmentNormalSample>& frameSamples,
-                                             const std::vector<LineFrame>& frameSamplesFrames)
+// Only entries where both the hint and the direction are usable contribute, so
+// sparse invalid hints dilute the vote instead of deciding it, and hints
+// orthogonal to the direction contribute ~nothing.
+double orientationAgreementScore(const std::vector<cv::Vec3f>& hints,
+                                 const std::vector<cv::Vec3d>& directions)
 {
-    std::vector<LineFrame> frames;
-    frames.reserve(controlSamples.size());
-    for (const auto& controlSample : controlSamples) {
-        size_t bestIndex = 0;
-        double bestDistance = std::numeric_limits<double>::max();
-        for (size_t i = 0; i < frameSamples.size(); ++i) {
-            const double distance = norm(frameSamples[i].position - controlSample.position);
-            if (distance < bestDistance) {
-                bestIndex = i;
-                bestDistance = distance;
-            }
+    double score = 0.0;
+    const size_t count = std::min(hints.size(), directions.size());
+    for (size_t i = 0; i < count; ++i) {
+        const cv::Vec3d hint = normalizedOrZero({static_cast<double>(hints[i][0]),
+                                                 static_cast<double>(hints[i][1]),
+                                                 static_cast<double>(hints[i][2])});
+        const cv::Vec3d direction = normalizedOrZero(directions[i]);
+        if (!validDirection(hint) || !validDirection(direction)) {
+            continue;
         }
-        frames.push_back(frameSamplesFrames[bestIndex]);
+        score += hint.dot(direction);
     }
-    return frames;
+    return score;
+}
+
+bool usableOrientationHints(const std::vector<cv::Vec3f>& hints, size_t sampleCount)
+{
+    if (hints.size() != sampleCount) {
+        return false;
+    }
+    for (const auto& hint : hints) {
+        if (validDirection({static_cast<double>(hint[0]),
+                            static_cast<double>(hint[1]),
+                            static_cast<double>(hint[2])})) {
+            return true;
+        }
+    }
+    return false;
 }
 
 struct LineViewFrameData {
@@ -576,10 +634,11 @@ struct LineViewFrameData {
     std::vector<cv::Vec3d> transportedUpVectors;
 };
 
-LineViewFrameData buildControlFrameData(const LineModel& line)
+LineViewFrameData buildLineFrameData(const LineModel& line,
+                                     const std::vector<cv::Vec3f>& orientedPointNormals)
 {
     LineViewFrameData data;
-    data.samples = controlPointSamples(line);
+    data.samples = lineSamples(line);
     if (data.samples.empty()) {
         return data;
     }
@@ -589,6 +648,32 @@ LineViewFrameData buildControlFrameData(const LineModel& line)
     data.transportedUpVectors = buildTransportedUpVectors(
         data.samples,
         displayFrameAnchorIndex(line, data.samples.size()));
+
+    // Frames and display ups are each already sign-chained along the line, so
+    // the only remaining freedom is one global sign per set -- inherited from an
+    // unoriented manifest normal at an anchor that moves as the line grows.
+    // A whole-line vote against the caller's oriented normals pins both signs;
+    // flipping per frame instead would mirror the strips mid-line.
+    if (usableOrientationHints(orientedPointNormals, data.samples.size())) {
+        std::vector<cv::Vec3d> meshNormals;
+        meshNormals.reserve(data.frames.size());
+        for (const auto& frame : data.frames) {
+            meshNormals.push_back(frame.meshNormal);
+        }
+        if (orientationAgreementScore(orientedPointNormals, meshNormals) < 0.0) {
+            for (auto& frame : data.frames) {
+                // Negating both keeps side == meshNormal x tangent.
+                frame.meshNormal *= -1.0;
+                frame.side *= -1.0;
+            }
+        }
+        if (orientationAgreementScore(orientedPointNormals, data.transportedUpVectors) < 0.0) {
+            for (auto& up : data.transportedUpVectors) {
+                up *= -1.0;
+            }
+        }
+    }
+
     data.tangents.reserve(data.samples.size());
     for (size_t row = 0; row < data.samples.size(); ++row) {
         data.tangents.push_back(tangentAt(data.samples, row));
@@ -598,69 +683,317 @@ LineViewFrameData buildControlFrameData(const LineModel& line)
 
 cv::Vec3d pointTangent(const LineModel& line, size_t index)
 {
-    if (line.points.size() < 2) {
-        return {1.0, 0.0, 0.0};
-    }
-    cv::Vec3d tangent{0.0, 0.0, 0.0};
-    if (index == 0) {
-        tangent = line.points[1].position - line.points[0].position;
-    } else if (index + 1 == line.points.size()) {
-        tangent = line.points[index].position - line.points[index - 1].position;
-    } else {
-        tangent = line.points[index + 1].position - line.points[index - 1].position;
-    }
-    tangent = normalizedOrZero(tangent);
-    if (validDirection(tangent)) {
-        return tangent;
-    }
-    return {1.0, 0.0, 0.0};
+    return vc::geometry::lineTangent(line.points.size(), index,
+        [&](size_t i) { return line.points[i].position; });
 }
 
 } // namespace
 
+LineModel lineModelForInspection(const std::vector<cv::Vec3d>& points)
+{
+    if (points.empty())
+        throw std::invalid_argument("Cannot inspect an empty line");
+    LineModel line;
+    line.points.reserve(points.size());
+    for (const auto& point : points) {
+        if (!finite(point))
+            throw std::invalid_argument("Cannot inspect a non-finite line");
+        line.points.push_back({point, {}, true});
+    }
+    const size_t anchor = points.size() / 2;
+    line.displayFrameAnchorIndex = static_cast<int>(anchor);
+    const auto tangent = pointTangent(line, anchor);
+    line.points[anchor].sampledNormal = {
+        projectToTangentPlane(axisFallbackLeastAlignedWith(tangent), tangent),
+        true, "display frame only"};
+    auto transport = [&](size_t from, size_t to) {
+        line.points[to].sampledNormal = {
+            transportNormal(line.points[from].sampledNormal.normal,
+                            pointTangent(line, from), pointTangent(line, to)),
+            true, "display frame only"};
+    };
+    for (size_t i = anchor + 1; i < points.size(); ++i)
+        transport(i - 1, i);
+    for (size_t i = anchor; i > 0; --i)
+        transport(i, i - 1);
+    return line;
+}
+
+bool LineStripPositionMap::valid() const
+{
+    return originalArclengths.size() >= 2 && totalArclength > kEpsilon &&
+           stripGridSpacingBaseVoxels > kEpsilon && stripGridColumnCount >= 2 &&
+           stripGridArclengths.size() == stripGridColumnCount;
+}
+
+double LineStripPositionMap::originalPositionToStripGridColumn(double originalPosition) const
+{
+    if (!valid() || !std::isfinite(originalPosition)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    originalPosition = std::clamp(originalPosition, 0.0,
+                                  static_cast<double>(originalArclengths.size() - 1));
+    const size_t first = static_cast<size_t>(std::floor(originalPosition));
+    const size_t second = std::min(first + 1, originalArclengths.size() - 1);
+    const double t = originalPosition - static_cast<double>(first);
+    const double arclength = originalArclengths[first] * (1.0 - t) +
+                             originalArclengths[second] * t;
+    const auto exact = std::lower_bound(stripGridArclengths.begin(),
+                                        stripGridArclengths.end(), arclength);
+    if (exact == stripGridArclengths.end()) {
+        return static_cast<double>(stripGridColumnCount - 1);
+    }
+    const size_t upperColumn = static_cast<size_t>(exact - stripGridArclengths.begin());
+    if (std::abs(*exact - arclength) <= kEpsilon || upperColumn == 0) {
+        return static_cast<double>(upperColumn);
+    }
+    const size_t lowerColumn = upperColumn - 1;
+    const double span = stripGridArclengths[upperColumn] -
+                        stripGridArclengths[lowerColumn];
+    return static_cast<double>(lowerColumn) +
+           (arclength - stripGridArclengths[lowerColumn]) / span;
+}
+
+double LineStripPositionMap::stripGridColumnToOriginalPosition(double stripGridColumn) const
+{
+    if (!valid() || !std::isfinite(stripGridColumn)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    stripGridColumn = std::clamp(stripGridColumn, 0.0,
+                                 static_cast<double>(stripGridColumnCount - 1));
+    const size_t lowerColumn = static_cast<size_t>(std::floor(stripGridColumn));
+    const size_t upperColumn = std::min(lowerColumn + 1, stripGridColumnCount - 1);
+    const double gridT = stripGridColumn - static_cast<double>(lowerColumn);
+    const double arclength = stripGridArclengths[lowerColumn] * (1.0 - gridT) +
+                             stripGridArclengths[upperColumn] * gridT;
+    const auto exact = std::lower_bound(originalArclengths.begin(),
+                                        originalArclengths.end(), arclength);
+    if (exact == originalArclengths.end()) {
+        return static_cast<double>(originalArclengths.size() - 1);
+    }
+    const size_t second = static_cast<size_t>(exact - originalArclengths.begin());
+    if (std::abs(*exact - arclength) <= kEpsilon || second == 0) {
+        return static_cast<double>(second);
+    }
+    size_t first = second - 1;
+    while (first > 0 && originalArclengths[second] - originalArclengths[first] <= kEpsilon) {
+        --first;
+    }
+    const double span = originalArclengths[second] - originalArclengths[first];
+    if (span <= kEpsilon) {
+        return static_cast<double>(first);
+    }
+    return static_cast<double>(first) +
+           (arclength - originalArclengths[first]) / span *
+               static_cast<double>(second - first);
+}
+
+LineModel lineModelFromSampledPoints(
+    const std::vector<cv::Vec3d>& points,
+    const vc::lasagna::NormalSampler* normalSampler)
+{
+    if (points.empty()) {
+        throw std::runtime_error("Fiber has no line points");
+    }
+    if (!normalSampler) {
+        throw std::runtime_error("No Lasagna normal sampler is available for this fiber");
+    }
+
+    std::vector<vc::lasagna::NormalSampleWithDerivative> samples;
+    const vc::lasagna::NormalBatchReport batchReport =
+        normalSampler->sampleNormalBatch(points, false, samples);
+    (void)batchReport;
+    if (samples.size() != points.size()) {
+        throw std::runtime_error("Normal sampler returned the wrong number of samples");
+    }
+
+    vc::lasagna::LineModel model;
+    model.points.reserve(points.size());
+    int bestAnchor = -1;
+    double bestAnchorDistance = std::numeric_limits<double>::infinity();
+    const double center = static_cast<double>(points.size() - 1) * 0.5;
+    for (size_t i = 0; i < points.size(); ++i) {
+        vc::lasagna::LinePoint linePoint;
+        linePoint.position = points[i];
+        linePoint.sampledNormal = samples[i].sample;
+        linePoint.sampledNormal.normal = normalizedOrZero(linePoint.sampledNormal.normal);
+        linePoint.sampledNormal.valid =
+            linePoint.sampledNormal.valid &&
+            validDirection(linePoint.sampledNormal.normal);
+        linePoint.valid = linePoint.sampledNormal.valid;
+        if (linePoint.valid) {
+            const double distance = std::abs(static_cast<double>(i) - center);
+            if (distance < bestAnchorDistance) {
+                bestAnchorDistance = distance;
+                bestAnchor = static_cast<int>(i);
+            }
+        }
+        model.points.push_back(std::move(linePoint));
+    }
+    if (bestAnchor < 0) {
+        throw std::runtime_error("Fiber line points have no valid sampled normals");
+    }
+    model.displayFrameAnchorIndex = bestAnchor;
+    return model;
+}
+
+
+std::vector<cv::Vec3f> orientedLineNormals(
+    const LineModel& line, const std::function<cv::Vec3f(const cv::Vec3f&)>& centerReference)
+{
+    constexpr float kNan = std::numeric_limits<float>::quiet_NaN();
+    std::vector<cv::Vec3f> normals;
+    normals.reserve(line.points.size());
+    // Pass 1: chain signs along the line. Each valid normal is aligned to
+    // the previous valid one, so a local sign flip -- whether from the field
+    // itself or from any per-point orientation test -- is structurally
+    // impossible, and the displayed frame cannot mirror mid-line.
+    cv::Vec3f previousNormal{kNan, kNan, kNan};
+    for (const auto& point : line.points) {
+        const cv::Vec3d sampled = normalizedOrZero(point.sampledNormal.normal);
+        if (!point.sampledNormal.valid || !validDirection(sampled)) {
+            normals.push_back({kNan, kNan, kNan});
+            continue;
+        }
+        cv::Vec3f normal = toVec3f(sampled);
+        if (std::isfinite(previousNormal[0]) &&
+            normal.dot(previousNormal) < 0.0f) {
+            normal = -normal;
+        }
+        previousNormal = normal;
+        normals.push_back(normal);
+    }
+
+    // Pass 2: one global majority vote decides the whole line's sign, so a
+    // noisy or imperfect center reference cannot flip individual stretches.
+    // The reference only needs to get the hemisphere right on balance; its z
+    // component is zeroed because orientation is radial-only (z is the
+    // scroll axis).
+    // Sign convention: normals point away from the scroll center. The dialog
+    // uses them directly as the cut view's up hint, and the viewer's scene y
+    // renders downward, so this puts the fiber's center-facing surface at
+    // the top of the view.
+    double awayScore = 0.0;
+    for (size_t index = 0; index < normals.size(); ++index) {
+        if (!std::isfinite(normals[index][0])) {
+            continue;
+        }
+        const cv::Vec3f position =
+            toVec3f(line.points[index].position);
+        cv::Vec3f towardCenter = centerReference ? centerReference(position)
+            : cv::Vec3f{kNan, kNan, kNan};
+        if (!std::isfinite(towardCenter[0])) {
+            continue;
+        }
+        // Cosine-weighted vote: normalize the reference so each point's
+        // influence reflects only how well its normal aligns with the radial
+        // direction, not its distance from the center -- a few large-radius
+        // points must not outvote the rest of the line.
+        towardCenter[2] = 0.0f;
+        const float towardNorm = cv::norm(towardCenter);
+        if (!(towardNorm > 1.0e-3f)) {
+            continue;
+        }
+        awayScore -= static_cast<double>(
+            normals[index].dot(towardCenter) / towardNorm);
+    }
+    if (awayScore < 0.0) {
+        for (cv::Vec3f& normal : normals) {
+            if (std::isfinite(normal[0])) {
+                normal = -normal;
+            }
+        }
+    }
+    return normals;
+}
+
 LineViewSurfaces buildLineViewSurfaces(const LineModel& line, const LineViewConfig& config)
 {
-    const auto frameData = buildControlFrameData(line);
-    const auto& samples = frameData.samples;
-    const auto& frames = frameData.frames;
-    if (samples.empty()) {
+    if (!std::isfinite(config.targetSpacingBaseVoxels) ||
+        config.targetSpacingBaseVoxels <= 0.0) {
+        throw std::invalid_argument(
+            "LineViewConfig::targetSpacingBaseVoxels must be finite and positive");
+    }
+    // Corrections are input normals, not a second rotation of finished frames.
+    auto displayLine = line;
+    if (config.displayPointNormals.size() == line.points.size()) {
+        for (size_t i=0; i<line.points.size(); ++i) {
+            displayLine.points[i].sampledNormal.normal = cv::Vec3d(config.displayPointNormals[i]);
+            displayLine.points[i].sampledNormal.valid = validDirection(
+                displayLine.points[i].sampledNormal.normal);
+        }
+    }
+    const auto& orientation = config.displayPointNormals.size() == line.points.size()
+        ? config.displayPointNormals : config.orientedPointNormals;
+    const auto frameData = buildLineFrameData(displayLine, orientation);
+    if (frameData.samples.empty()) {
         throw std::invalid_argument("Cannot build line annotation views for an empty LineModel");
     }
 
-    const double surfaceHalfWidth = resolvedHalfExtent(config.surfaceHalfWidth,
-                                                       samples,
-                                                       config.crossSamples);
-    const double sideSliceHalfDepth = resolvedHalfExtent(config.sideSliceHalfDepth,
-                                                        samples,
-                                                        config.crossSamples);
+    const LineStripPositionMap positionMap =
+        buildPositionMap(frameData.samples,
+                         config.targetSpacingBaseVoxels,
+                         config.controlPointLinePositions);
+    const auto ribbonSamples = resampleLine(frameData.samples, positionMap);
+    const auto ribbonNormals = resolvedNormals(ribbonSamples);
+    auto ribbonFrames = buildFrames(ribbonSamples, ribbonNormals);
+    // Original line-point frames own the persistent orientation decision (including
+    // the caller's whole-line hint vote). Pin the derived ribbon to that same
+    // global sign without changing the original cut-plane frames.
+    double frameAgreement = 0.0;
+    for (size_t i = 0; i < frameData.frames.size(); ++i) {
+        const double column = positionMap.originalPositionToStripGridColumn(
+            static_cast<double>(i));
+        const size_t ribbonIndex = std::min(
+            static_cast<size_t>(std::llround(column)), ribbonFrames.size() - 1);
+        frameAgreement += frameData.frames[i].meshNormal.dot(
+            ribbonFrames[ribbonIndex].meshNormal);
+    }
+    if (frameAgreement < 0.0) {
+        for (auto& frame : ribbonFrames) {
+            frame.meshNormal *= -1.0;
+            frame.side *= -1.0;
+        }
+    }
+
+    const auto fixedCrossOffsets = crossOffsets();
 
     LineViewSurfaces surfaces;
-    surfaces.lineSurface = buildRibbon(samples,
-                                       crossOffsets(surfaceHalfWidth, config.crossSamples),
-                                       frames,
+    surfaces.lineSurface = buildRibbon(ribbonSamples,
+                                       fixedCrossOffsets,
+                                       ribbonFrames,
+                                       positionMap.stripGridSpacingBaseVoxels,
+                                       kLineViewCrossRowSpacingBaseVoxels,
                                        true);
-    surfaces.lineSideSlice = buildRibbon(samples,
-                                         crossOffsets(sideSliceHalfDepth, config.crossSamples),
-                                         frames,
+    surfaces.lineSideSlice = buildRibbon(ribbonSamples,
+                                         fixedCrossOffsets,
+                                         ribbonFrames,
+                                         positionMap.stripGridSpacingBaseVoxels,
+                                         kLineViewCrossRowSpacingBaseVoxels,
                                          false);
+    surfaces.stripPositionMap = positionMap;
 
-    surfaces.lineZSlices.reserve(line.points.size());
+    if (config.buildLineZSlices) {
+        surfaces.lineZSlices.reserve(line.points.size());
+    }
     surfaces.lineUpVectors.reserve(line.points.size());
     for (size_t i = 0; i < line.points.size(); ++i) {
-        const cv::Vec3f origin = toVec3f(line.points[i].position);
-        const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
         const cv::Vec3f up = toVec3f(frameData.transportedUpVectors[i]);
-        auto plane = std::make_shared<PlaneSurface>();
-        plane->setFromNormalAndUp(origin, tangent, up);
-        surfaces.lineZSlices.push_back(std::move(plane));
+        if (config.buildLineZSlices) {
+            const cv::Vec3f origin = toVec3f(line.points[i].position);
+            const cv::Vec3f tangent = toVec3f(pointTangent(line, i));
+            auto plane = std::make_shared<PlaneSurface>();
+            plane->setFromNormalAndUp(origin, tangent, up);
+            surfaces.lineZSlices.push_back(std::move(plane));
+        }
         surfaces.lineUpVectors.push_back(up);
     }
     return surfaces;
 }
 
-LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const LineViewConfig& /*config*/)
+LineViewFrameDiagnostics diagnoseLineViewFrames(const LineModel& line, const LineViewConfig& config)
 {
-    const auto frameData = buildControlFrameData(line);
+    const auto frameData = buildLineFrameData(line, config.orientedPointNormals);
     LineViewFrameDiagnostics diagnostics;
     diagnostics.frameCount = frameData.frames.size();
     if (frameData.frames.size() < 2) {

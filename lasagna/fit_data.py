@@ -4,18 +4,124 @@ import math
 import json
 import os
 from dataclasses import dataclass
-from pathlib import Path
+from pathlib import Path, PurePosixPath, PureWindowsPath
+from urllib.parse import quote, urlsplit, urlunsplit
 
 import numpy as np
+from dtypes import numpy_float_hi
 import torch
 import torch.nn.functional as F
-import zarr
+from vc_reader.reader import open_zarr
 
-from lasagna_volume import LasagnaVolume
+from lasagna_volume import ChannelGroup, LasagnaVolume
 
 # --- Chunk sampling statistics ---
 CHUNK_STATS_ENABLED = False
 _CHUNK_SIZE = 32
+
+
+@dataclass(frozen=True)
+class StreamingZarrSource:
+	"""A complete local Zarr array or the authoritative remote catalog array."""
+
+	zarr_path: str
+	remote: bool = False
+
+
+def _safe_relative_zarr_key(raw_path: str) -> tuple[str, ...]:
+	"""Return a catalog-safe relative Zarr key without normalizing traversal."""
+
+	value = str(raw_path).strip()
+	posix = PurePosixPath(value.replace("\\", "/"))
+	windows = PureWindowsPath(value)
+	parts = posix.parts
+	if (not value or posix.is_absolute() or windows.is_absolute() or windows.drive
+			or not parts or any(part in ("", ".", "..") for part in parts)):
+		raise ValueError(f"catalog remote Zarr path must be a safe relative path: {raw_path!r}")
+	return tuple(parts)
+
+
+def _read_validated_lasagna_remote_marker(vol: LasagnaVolume) -> str:
+	"""Return the authoritative artifact URL from VC3D's adjacent marker."""
+
+	marker_path = vol.path.parent / "lasagna-remote.json"
+	try:
+		marker = json.loads(marker_path.read_text(encoding="utf-8"))
+	except FileNotFoundError as exc:
+		raise ValueError(
+			"VC3D split Lasagna cache has metadata outside the chunk tree but "
+			"no adjacent lasagna-remote.json marker; refusing to treat partial "
+			"local chunks as a complete Zarr store"
+		) from exc
+	except json.JSONDecodeError as exc:
+		raise ValueError(f"invalid VC3D lasagna-remote.json: {marker_path}") from exc
+	if not isinstance(marker, dict):
+		raise ValueError(f"VC3D lasagna-remote.json must be an object: {marker_path}")
+	manifest_file = marker.get("manifest_file")
+	if not isinstance(manifest_file, str) or not manifest_file.strip():
+		raise ValueError("VC3D lasagna-remote.json has no manifest_file")
+	if (vol.path.parent / manifest_file).resolve() != vol.path.resolve():
+		raise ValueError("VC3D lasagna-remote.json does not identify the opened manifest")
+	artifact_url = marker.get("artifact_url")
+	if not isinstance(artifact_url, str) or not artifact_url.strip():
+		raise ValueError("VC3D lasagna-remote.json has no artifact_url")
+	url = artifact_url.strip().rstrip("/")
+	parsed_url = urlsplit(url)
+	if parsed_url.scheme not in {"http", "https", "s3"} or not parsed_url.netloc:
+		raise ValueError("VC3D lasagna-remote.json artifact_url must use http, https, or s3")
+	return url
+
+
+def _join_remote_artifact_url(artifact_url: str, key_parts: tuple[str, ...]) -> str:
+	"""Append a relative Zarr key before any query or fragment component."""
+
+	parsed = urlsplit(artifact_url)
+	encoded_key = "/".join(quote(part, safe="-._~") for part in key_parts)
+	path = parsed.path.rstrip("/") + "/" + encoded_key
+	return urlunsplit((parsed.scheme, parsed.netloc, path, parsed.query, parsed.fragment))
+
+
+def resolve_streaming_zarr_source(
+	vol: LasagnaVolume, group: ChannelGroup
+) -> StreamingZarrSource:
+	"""Resolve a group without ever accepting VC3D's incomplete sparse cache.
+
+	VC3D deliberately keeps Zarr metadata under ``.lasagna-zarr-metadata`` while
+	chunk objects live in the visible sibling tree.  Opening that visible tree
+	locally would turn every not-yet-cached chunk into Zarr's fill value.  For a
+	split cache, use the marker's authoritative remote artifact instead.
+	"""
+
+	group_path = str(group.zarr_path)
+	marker_path = vol.path.parent / "lasagna-remote.json"
+	if marker_path.is_file():
+		# A VC3D marker means the artifact is authoritative.  A copied .zarray
+		# beside incomplete cached chunks would otherwise make Zarr return fills.
+		key_parts = _safe_relative_zarr_key(group_path)
+		artifact_url = _read_validated_lasagna_remote_marker(vol)
+		return StreamingZarrSource(
+			_join_remote_artifact_url(artifact_url, key_parts),
+			remote=True,
+		)
+
+	local_path = vol.path.parent / group_path
+	if any((local_path / name).is_file() for name in (".zarray", "zarr.json")):
+		return StreamingZarrSource(str(local_path), remote=False)
+
+	key_parts = _safe_relative_zarr_key(group_path)
+	metadata_root = vol.path.parent / ".lasagna-zarr-metadata" / Path(*key_parts)
+	has_split_metadata = any(
+		(metadata_root / name).is_file() for name in (".zarray", "zarr.json")
+	)
+	if not has_split_metadata:
+		# Preserve the normal local-Zarr failure when this is not a VC3D catalog cache.
+		return StreamingZarrSource(str(local_path), remote=False)
+
+	artifact_url = _read_validated_lasagna_remote_marker(vol)
+	return StreamingZarrSource(
+		_join_remote_artifact_url(artifact_url, key_parts),
+		remote=True,
+	)
 
 
 def _dilate26(t: torch.Tensor) -> torch.Tensor:
@@ -664,7 +770,7 @@ def load_winding_volume(
 ) -> tuple[torch.Tensor, float, float]:
 	"""Load winding volume zarr, apply crop, return ((1,1,Z,Y,X) tensor, min_winding, max_winding)."""
 	p = Path(path)
-	zsrc = zarr.open(str(p), mode="r")
+	zsrc = open_zarr(p)
 	wv_scaledown = int(zsrc.attrs.get("scaledown", 1))
 	wv_min = float(zsrc.attrs.get("min_winding", 1.0))
 	wv_max = float(zsrc.attrs.get("max_winding", 1.0))
@@ -764,9 +870,7 @@ def load_single_channel(
 		raise ValueError(f"channel '{channel}' not in volume (available: {vol.all_channels()})")
 	group, ch_idx = vol.channel_group(channel)
 	zarr_path = str(vol.path.parent / group.zarr_path)
-	zsrc = zarr.open(zarr_path, mode="r")
-	if not isinstance(zsrc, zarr.Array):
-		raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+	zsrc = open_zarr(zarr_path)
 	shape = tuple(int(v) for v in zsrc.shape)
 	Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
 		vol=vol,
@@ -828,15 +932,15 @@ def _load_umbilicus_lookup(
 			raise ValueError(f"umbilicus control point {i} has non-finite coordinates")
 		rows.append((x, y, z))
 
-	pts_np = np.asarray(rows, dtype=np.float64)
+	pts_np = np.asarray(rows, dtype=numpy_float_hi)
 	order = np.argsort(pts_np[:, 2], kind="mergesort")
 	pts_np = pts_np[order]
 
 	z_vals = pts_np[:, 2]
 	uniq_z, inv = np.unique(z_vals, return_inverse=True)
 	if uniq_z.shape[0] != z_vals.shape[0]:
-		xy_sum = np.zeros((uniq_z.shape[0], 2), dtype=np.float64)
-		count = np.zeros((uniq_z.shape[0], 1), dtype=np.float64)
+		xy_sum = np.zeros((uniq_z.shape[0], 2), dtype=numpy_float_hi)
+		count = np.zeros((uniq_z.shape[0], 1), dtype=numpy_float_hi)
 		np.add.at(xy_sum, inv, pts_np[:, :2])
 		np.add.at(count, inv, 1.0)
 		xy_vals = xy_sum / np.maximum(count, 1.0)
@@ -848,7 +952,7 @@ def _load_umbilicus_lookup(
 	z0 = math.floor(float(z_vals[0]) / z_step) * z_step
 	z1 = math.ceil(float(z_vals[-1]) / z_step) * z_step
 	count = max(1, int(round((z1 - z0) / z_step)) + 1)
-	z_lookup = z0 + np.arange(count, dtype=np.float64) * z_step
+	z_lookup = z0 + np.arange(count, dtype=numpy_float_hi) * z_step
 	x_lookup = np.interp(z_lookup, z_vals, pts_np[:, 0])
 	y_lookup = np.interp(z_lookup, z_vals, pts_np[:, 1])
 	lookup_np = np.stack([x_lookup, y_lookup], axis=1).astype(np.float32)
@@ -860,12 +964,25 @@ def _load_umbilicus_lookup(
 	return points, lookup, float(z0), float(z_step)
 
 
+def _maybe_load_umbilicus_lookup(
+	vol: LasagnaVolume,
+	*,
+	device: torch.device,
+	require_umbilicus: bool,
+) -> tuple[torch.Tensor | None, torch.Tensor | None, float, float]:
+	"""Load umbilicus metadata when present, or when explicitly required."""
+	if vol.umbilicus_json or require_umbilicus:
+		return _load_umbilicus_lookup(vol, device=device)
+	return None, None, 0.0, 1000.0
+
+
 def load_3d_for_model(
 	*, path: str, device: torch.device, model: object,
 	blur_sigma: float = 0.0,
 	erode_valid_mask: int = 0,
 	cuda_gridsample: bool = True,
 	skip_channels: set[str] | None = None,
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load 3D data auto-cropped around model mesh bbox. Optionally blurs."""
 	with torch.no_grad():
@@ -880,7 +997,7 @@ def load_3d_for_model(
 	print(f"[fit_data] auto-crop: x={crop[0]} y={crop[1]} z={crop[2]} "
 		  f"w={crop[3]} h={crop[4]} d={crop[5]}", flush=True)
 	data = load_3d(path=path, device=device, crop=crop, cuda_gridsample=cuda_gridsample,
-				  skip_channels=skip_channels)
+				  skip_channels=skip_channels, require_umbilicus=require_umbilicus)
 	if blur_sigma > 0:
 		blur_3d(data, sigma=blur_sigma)
 		print(f"[fit_data] blurred data sigma={blur_sigma}", flush=True)
@@ -1057,9 +1174,7 @@ def get_preprocessed_params(path: str) -> dict:
 	for group_name, g in sorted(vol.groups.items(), key=lambda item: item[1].sd_fac):
 		zarr_path = str(vol.path.parent / g.zarr_path)
 		try:
-			zsrc = zarr.open(zarr_path, mode="r")
-			if not isinstance(zsrc, zarr.Array):
-				raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+			zsrc = open_zarr(zarr_path)
 			shape = tuple(int(v) for v in zsrc.shape)
 			Z, Y, X, _is_3d = _validate_group_zarr_shape(
 				vol=vol,
@@ -1085,18 +1200,23 @@ def load_3d(
 	crop: tuple[int, int, int, int, int, int] | None = None,
 	cuda_gridsample: bool = True,
 	skip_channels: set[str] | None = None,
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load 3D sub-volume from .lasagna.json manifest.
 
 	crop: (x0, y0, z0, w, h, d) in base-coord voxels, or None for full volume.
 	skip_channels: channel names to skip (set to None instead of loading).
 	"""
-	vol = LasagnaVolume.load(path)
+	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	# Effective decode scale: encode_scale / factor
 	# Higher factor → larger decoded grad_mag values
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
-	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _maybe_load_umbilicus_lookup(
+		vol,
+		device=device,
+		require_umbilicus=require_umbilicus,
+	)
 	_skip = skip_channels or set()
 
 	# Resolve which channels are available
@@ -1114,9 +1234,7 @@ def load_3d(
 		"""
 		group, ch_idx = vol.channel_group(name)
 		zarr_path = str(vol.path.parent / group.zarr_path)
-		zsrc = zarr.open(zarr_path, mode="r")
-		if not isinstance(zsrc, zarr.Array):
-			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
+		zsrc = open_zarr(zarr_path)
 		shape = tuple(int(v) for v in zsrc.shape)
 		Z_all, Y_all, X_all, is_3d = _validate_group_zarr_shape(
 			vol=vol,
@@ -1224,25 +1342,24 @@ def load_3d_streaming(
 	path: str,
 	device: torch.device,
 	skip_channels: set[str] | None = None,
-	sparse_prefetch_backend: str = "tensorstore",
+	require_umbilicus: bool = False,
 ) -> FitData3D:
 	"""Load .lasagna.json as sparse streaming cache — no upfront data load.
 
 	Chunks are loaded on demand via prefetch/sync. The returned FitData3D has
 	dense channel tensors set to None and sparse_caches populated instead.
 	"""
-	from sparse_cache import SparseChunkGroupCache
+	from sparse_cache import READER_MEMORY_CACHE_BYTES, SparseChunkGroupCache
 
-	vol = LasagnaVolume.load(path)
+	vol = LasagnaVolume.load(path, require_umbilicus=require_umbilicus)
 	gmag_enc = vol.grad_mag_encode_scale / vol.grad_mag_factor
 	s2b = vol.source_to_base
-	umb_pts, umb_lookup, umb_z0, umb_z_step = _load_umbilicus_lookup(vol, device=device)
+	umb_pts, umb_lookup, umb_z0, umb_z_step = _maybe_load_umbilicus_lookup(
+		vol,
+		device=device,
+		require_umbilicus=require_umbilicus,
+	)
 	_skip = skip_channels or set()
-	_backend = str(sparse_prefetch_backend)
-	if _backend not in {"tensorstore", "python-zarr"}:
-		raise ValueError(
-			f"unknown sparse_prefetch_backend={_backend!r}; "
-			"expected 'tensorstore' or 'python-zarr'")
 
 	# Build sparse caches per group
 	sparse_caches: dict[str, SparseChunkGroupCache] = {}
@@ -1261,11 +1378,10 @@ def load_3d_streaming(
 		if not channels:
 			continue
 
-		zarr_path = str(vol.path.parent / group.zarr_path)
-		zsrc = zarr.open(zarr_path, mode="r")
-		if not isinstance(zsrc, zarr.Array):
-			raise ValueError(f"expected zarr.Array at {zarr_path}, got {type(zsrc)}")
-		shape = tuple(int(v) for v in zsrc.shape)
+		source = resolve_streaming_zarr_source(vol, group)
+		zarr_path = source.zarr_path
+		reader = open_zarr(zarr_path, memory_cache=READER_MEMORY_CACHE_BYTES)
+		shape = tuple(int(v) for v in reader.shape)
 		Z, Y, X, is_3d = _validate_group_zarr_shape(
 			vol=vol,
 			group_name=group_name,
@@ -1280,25 +1396,14 @@ def load_3d_streaming(
 			ch_idx = group.channels.index(ch)
 			channel_indices[ch] = ch_idx
 
-		if _backend == "tensorstore":
-			from sparse_tensorstore_cache import TensorStoreSparseChunkGroupCache
-			cache = TensorStoreSparseChunkGroupCache(
-				channels=channels,
-				zarr_path=zarr_path,
-				vol_shape_zyx=(Z, Y, X),
-				channel_indices=channel_indices,
-				is_3d_zarr=is_3d,
-				device=device,
-			)
-		else:
-			cache = SparseChunkGroupCache(
-				channels=channels,
-				zarr_path=zarr_path,
-				vol_shape_zyx=(Z, Y, X),
-				channel_indices=channel_indices,
-				is_3d_zarr=is_3d,
-				device=device,
-			)
+		cache = SparseChunkGroupCache(
+			channels=channels,
+			reader=reader,
+			vol_shape_zyx=(Z, Y, X),
+			channel_indices=channel_indices,
+			is_3d_zarr=is_3d,
+			device=device,
+		)
 		sparse_caches[group_name] = cache
 
 		# Per-channel spacing
@@ -1319,8 +1424,7 @@ def load_3d_streaming(
 
 	print(f"[fit_data] load_3d_streaming: origin={origin_fullres} "
 		  f"primary_spacing={primary_spacing} source_to_base={s2b} "
-		  f"groups={list(sparse_caches.keys())} "
-		  f"sparse_prefetch={sparse_prefetch_backend}", flush=True)
+		  f"groups={list(sparse_caches.keys())}", flush=True)
 
 	return FitData3D(
 		cos=None,

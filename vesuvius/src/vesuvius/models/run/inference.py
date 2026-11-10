@@ -1,28 +1,34 @@
 import torch
 import numpy as np
-import zarr
 import os
-import fcntl
+import errno
+try:
+    import fcntl  # POSIX-only; used to serialize model-cache downloads
+except ImportError:  # pragma: no cover - Windows has no fcntl
+    fcntl = None
+    import msvcrt
 import hashlib
 import multiprocessing
 import subprocess
 import threading
-import fsspec
-import numcodecs
+import psutil
 from concurrent.futures import ThreadPoolExecutor, ProcessPoolExecutor
 # fork causes issues on windows , force to spawn
 multiprocessing.set_start_method('spawn', force=True)
 from tqdm.auto import tqdm
 from torch.utils.data import DataLoader
 from vesuvius.utils.models.load_nnunet_model import load_model_for_inference
+from vesuvius.models.utilities.get_accelerator import get_accelerator
 from vesuvius.data.vc_dataset import VCDataset
-from vesuvius.data.utils import open_zarr
+from vc_reader.reader import ObjectStore, ZarrWriter, open_zarr
 from pathlib import Path
 from vesuvius.models.build.build_network_from_config import NetworkFromConfig
 from vesuvius.models.run.external_models.load_resnet import try_load_external_resnet34_model
 from vesuvius.models.run.tta import infer_with_tta
 from vesuvius.models.run.patch_writer import BoundedPatchWriter
+from vesuvius.models.run.blending import InMemoryBlender, part_z_range, patches_in_z_range
 from vesuvius.utils.k8s import get_tqdm_kwargs
+from vesuvius.utils.cli import HyphenUnderscoreParser
 
 
 def _tuple_if_sequence(value):
@@ -103,6 +109,87 @@ def _checkpoint_normalization_scheme(checkpoint_data):
     return image_normalization
 
 
+_NNUNET_NORMALIZATION_MAP = {
+    'CTNormalization': 'ct',
+    'ZScoreNormalization': 'instance_zscore',
+    'NoNormalization': 'none',
+    'RescaleTo01Normalization': 'instance_minmax',
+}
+
+
+def _nnunet_normalization_from_model_info(model_info):
+    """Return the normalization declared by an nnU-Net model's plans.
+
+    ``load_model_for_inference`` already returns the nnU-Net configuration and
+    plans managers.  Keep their native metadata authoritative rather than
+    silently falling back to the CLI's per-patch z-score default.
+
+    VCDataset currently accepts one normalization contract for the entire
+    input, so reject multi-channel plans instead of applying one channel's
+    fingerprint to another.
+    """
+    configuration_manager = model_info.get('configuration_manager')
+    plans_manager = model_info.get('plans_manager')
+    if configuration_manager is None or plans_manager is None:
+        return None, None
+
+    schemes = getattr(configuration_manager, 'normalization_schemes', None)
+    if schemes is None:
+        return None, None
+    if isinstance(schemes, str):
+        schemes = [schemes]
+    else:
+        schemes = list(schemes)
+    if len(schemes) != 1:
+        raise ValueError(
+            'vesuvius.predict cannot reproduce nnU-Net normalization for '
+            f'{len(schemes)} input channels; expected exactly one scheme')
+
+    native_scheme = schemes[0]
+    if not isinstance(native_scheme, str):
+        native_scheme = getattr(native_scheme, '__name__', str(native_scheme))
+    native_scheme = native_scheme.rsplit('.', 1)[-1]
+    try:
+        scheme = _NNUNET_NORMALIZATION_MAP[native_scheme]
+    except KeyError as exc:
+        raise ValueError(
+            'Unsupported nnU-Net normalization scheme in plans.json: '
+            f'{native_scheme!r}') from exc
+
+    use_mask = getattr(configuration_manager, 'use_mask_for_norm', None)
+    if isinstance(use_mask, (list, tuple)):
+        use_mask = use_mask[0] if use_mask else None
+    if scheme == 'instance_zscore' and bool(use_mask):
+        raise ValueError(
+            'nnU-Net plans require masked Z-score normalization, which '
+            'vesuvius.predict cannot reproduce without the preprocessing mask')
+
+    intensity_properties = None
+    if scheme == 'ct':
+        per_channel = getattr(
+            plans_manager, 'foreground_intensity_properties_per_channel', None)
+        if not isinstance(per_channel, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires '
+                'foreground_intensity_properties_per_channel in plans.json')
+        intensity_properties = per_channel.get('0', per_channel.get(0))
+        required = {
+            'mean', 'std', 'percentile_00_5', 'percentile_99_5',
+        }
+        if not isinstance(intensity_properties, dict):
+            raise ValueError(
+                'nnU-Net CTNormalization requires intensity properties for '
+                'input channel 0')
+        missing = sorted(required.difference(intensity_properties))
+        if missing:
+            raise ValueError(
+                'nnU-Net CTNormalization channel-0 intensity properties are '
+                f'missing: {", ".join(missing)}')
+        intensity_properties = dict(intensity_properties)
+
+    return scheme, intensity_properties
+
+
 def _select_evenly_spaced_middle_indices(candidate_indices, limit):
     """Select a deterministic, small representative subset of patch indices."""
     candidates = list(candidate_indices)
@@ -156,13 +243,34 @@ class _InferenceDeepSupervisionWrapper(torch.nn.Module):
 DEFAULT_MODEL_CACHE_DIR = os.environ.get('VESUVIUS_MODEL_CACHE_DIR', '/tmp/vesuvius-models')
 
 
+def _lock_file_exclusive(fh):
+    """Take an exclusive advisory lock on an open file, on POSIX or Windows.
+
+    Released when the handle closes, matching the previous fcntl.flock usage.
+    """
+    if fcntl is not None:
+        fcntl.flock(fh, fcntl.LOCK_EX)
+    else:
+        # msvcrt locks a byte range; one byte suffices for a lockfile. LK_LOCK
+        # retries for ~10 s and then raises, so loop to mirror LOCK_EX's
+        # blocking. Only contention is worth retrying: anything else (a bad
+        # descriptor, a full disk) would spin here forever, so re-raise it.
+        while True:
+            try:
+                msvcrt.locking(fh.fileno(), msvcrt.LK_LOCK, 1)
+                return
+            except OSError as exc:
+                if exc.errno not in (errno.EACCES, errno.EDEADLK):
+                    raise
+
+
 def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) -> str:
     """Resolve a model_path, downloading from S3 to a local cache if needed.
 
     For s3:// URLs, runs `aws s3 sync` into `<cache_dir>/<sha256(url)>/` and
     returns the local directory path. A `.done` sentinel marks successful
     completion so re-runs reuse the cache. Concurrent downloads of the same
-    model are serialized with fcntl.flock on a per-model lockfile.
+    model are serialized with an exclusive lock on a per-model lockfile.
 
     For non-S3 paths, returns the input unchanged.
     """
@@ -181,7 +289,7 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
         return target
 
     with open(lock_path, 'w') as lock_fh:
-        fcntl.flock(lock_fh, fcntl.LOCK_EX)
+        _lock_file_exclusive(lock_fh)
         # Re-check after acquiring the lock in case another process completed.
         if os.path.exists(done):
             if verbose:
@@ -207,11 +315,14 @@ def _resolve_model_path(model_path: str, cache_dir: str, verbose: bool = False) 
 
 
 class Inferer():
+    # Off unless __init__ is given in_memory_blend (class-level so partially built instances work too).
+    in_memory_blend = None
+    blender = None
+
     def __init__(self,
                  model_path: str = None,
                  input_dir: str = None,
                  output_dir: str = None,
-                 input_format: str = 'zarr',
                  tta_type: str = 'mirroring', # 'mirroring' or 'rotation'
                  # tta_combinations: int = 3,
                  # tta_rotation_weights: [list, tuple] = (1, 1, 1),
@@ -223,16 +334,11 @@ class Inferer():
                  patch_size: [list, tuple] = None,
                  save_softmax: bool = False,
                  normalization_scheme: str = 'instance_zscore',
-                 device: str = 'cuda' if torch.cuda.is_available() else 'cpu',
+                 device: str = None,
                  num_dataloader_workers: int = 4,
                  writer_workers: int = None,
                  verbose: bool = False,
                  skip_empty_patches: bool = True,  # Skip empty/homogeneous patches
-                 # params to get passed to Volume 
-                 scroll_id: [str, int] = None,
-                 segment_id: [str, int] = None,
-                 energy: int = None,
-                 resolution: float = None,
                  compressor_name: str = 'zstd',
                  compression_level: int = 1,
                  hf_token: str = None,
@@ -240,6 +346,9 @@ class Inferer():
                  input_anon: bool = False,
                  model_cache_dir: str = DEFAULT_MODEL_CACHE_DIR,
                  max_patches: int = None,
+                 bbox: [list, tuple] = None,
+                 chunk_cache_mb: int = 0,
+                 in_memory_blend: dict = None,
                  ):
         print(f"Initializing Inferer with output_dir: '{output_dir}'")
         if output_dir and not output_dir.strip():
@@ -253,21 +362,19 @@ class Inferer():
         # self.tta_rotation_weights = tta_rotation_weights
         self.num_parts = num_parts
         self.part_id = part_id
+        if not 0.0 <= overlap < 1.0:
+            raise ValueError(f"overlap must be in [0, 1), got {overlap}")
         self.overlap = overlap
         self.batch_size = batch_size
         self.patch_size = tuple(patch_size) if patch_size is not None else None  # Can be None, will derive from model
         self.save_softmax = save_softmax
         self.verbose = verbose
         self.normalization_scheme = normalization_scheme
-        self.input_format = input_format
-        self.device = torch.device(device)
+        # cuda, then mps, then cpu unless a device is given.
+        self.device = torch.device(device) if device else get_accelerator()
         self.num_dataloader_workers = num_dataloader_workers
         self.writer_workers = writer_workers
         self.skip_empty_patches = skip_empty_patches
-        self.scroll_id = scroll_id
-        self.segment_id = segment_id
-        self.energy = energy
-        self.resolution = resolution
         self.compressor_name = compressor_name
         self.compression_level = compression_level
         self.hf_token = hf_token
@@ -275,6 +382,12 @@ class Inferer():
         self.input_anon = input_anon
         self.model_cache_dir = model_cache_dir
         self.max_patches = max_patches
+        self.bbox = tuple(bbox) if bbox is not None else None
+        self.chunk_cache_mb = chunk_cache_mb
+        # When set, patches are blended in RAM and written straight to
+        # in_memory_blend['output_path'] instead of to logits_part_*.zarr (see InMemoryBlender).
+        self.in_memory_blend = dict(in_memory_blend) if in_memory_blend else None
+        self.blender = None
         self.model_patch_size = None
         self.num_classes = None
 
@@ -304,6 +417,18 @@ class Inferer():
              raise ValueError(f"Invalid tta_type '{self.tta_type}'. Must be 'mirroring' or 'rotation'.")
         if self.max_patches is not None and self.max_patches < 1:
             raise ValueError(f"max_patches must be >= 1 when provided, got {self.max_patches}.")
+        if self.chunk_cache_mb < 0:
+            raise ValueError(f"chunk_cache_mb must be >= 0, got {self.chunk_cache_mb}.")
+        if self.in_memory_blend is not None:
+            if not self.in_memory_blend.get('output_path'):
+                raise ValueError("in_memory_blend needs an 'output_path'.")
+            run_id = self.in_memory_blend.get('run_id')
+            if self.num_parts > 1 and (not run_id or not run_id.strip()):
+                raise ValueError("Split in-memory blending requires --blend_run_id shared by all parts; "
+                                 "use a fresh ID for each run.")
+            wait_timeout = self.in_memory_blend.get('wait_timeout', 300)
+            if not np.isfinite(wait_timeout) or wait_timeout <= 0:
+                raise ValueError("blend_wait_timeout must be finite and positive.")
         # Defer patch size validation until after model loading if not explicitly provided
 
         # --- Output Setup ---
@@ -311,13 +436,8 @@ class Inferer():
         if output_dir:
             self.output_dir = output_dir
             
-            # For S3 paths, use fsspec.filesystem.makedirs
-            if self.output_dir.startswith('s3://'):
-                fs = fsspec.filesystem('s3', anon=False)
-                fs.makedirs(self.output_dir, exist_ok=True)
-                print(f"Created S3 output directory: {self.output_dir}")
-            else:
-                # For local paths, use os.makedirs
+            # S3 has no directories to make
+            if not self.output_dir.startswith('s3://'):
                 os.makedirs(self.output_dir, exist_ok=True)
         else:
             raise ValueError("Output directory must be provided.")
@@ -404,7 +524,7 @@ class Inferer():
                         raise
                     raise ValueError(
                         f"{e}. If this is an external ResNet checkpoint (ink_model.py + .pth), "
-                        "rerun with --model-type resnet."
+                        "rerun with --model_type resnet."
                     ) from e
             else:
                 # Auto mode: fallback to nnUNet loader
@@ -416,6 +536,26 @@ class Inferer():
                     verbose=self.verbose
                 )
         
+        # Prefer normalization metadata returned directly by train.py/external
+        # loaders. For nnU-Net, derive it from the plans managers that the
+        # loader already returns.
+        model_scheme = model_info.get('normalization_scheme')
+        model_intensity_properties = model_info.get('intensity_properties')
+        if model_scheme is None:
+            model_scheme, nnunet_intensity_properties = \
+                _nnunet_normalization_from_model_info(model_info)
+            if model_intensity_properties is None:
+                model_intensity_properties = nnunet_intensity_properties
+        if model_scheme is not None:
+            self.model_normalization_scheme = model_scheme
+            if model_scheme != self.normalization_scheme:
+                print(
+                    'Using model-declared normalization '
+                    f'{model_scheme!r} instead of CLI/default '
+                    f'{self.normalization_scheme!r}.')
+        if model_intensity_properties is not None:
+            self.model_intensity_properties = model_intensity_properties
+
         # model loader returns a dict, network is the actual model
         model = model_info['network']
         model.eval()
@@ -657,9 +797,36 @@ class Inferer():
                 f"(max_patches={self.max_patches})"
             )
 
+    def _select_blend_part_patches(self):
+        """In a split in-memory blend, keep the patches that overlap this part's output slab.
+
+        A patch that starts in the part below but reaches into this slab still contributes to its
+        chunks, so the selection is by Z overlap rather than by start coordinate (the staged split).
+        """
+        self._blend_z_range = None
+        if self.in_memory_blend is None or self.num_parts <= 1:
+            return
+        positions = getattr(self.dataset, 'all_positions', None) or []
+        volume_shape = self._original_volume_shape()
+        if volume_shape is None:
+            raise RuntimeError("In-memory blending needs the input volume shape, which the dataset does not expose.")
+        chunk_size = self.in_memory_blend.get('chunk_size')
+        z_chunk = int(chunk_size[0]) if chunk_size else int(self.patch_size[0])
+        self._blend_z_range = part_z_range(positions, self.patch_size, volume_shape, z_chunk,
+                                           self.num_parts, self.part_id)
+        keep = patches_in_z_range(positions, self.patch_size[0], self._blend_z_range)
+        self.dataset.all_positions = [positions[i] for i in keep]
+        non_empty_mask = getattr(self.dataset, 'non_empty_mask', None)
+        if non_empty_mask is not None and len(non_empty_mask) == len(positions):
+            self.dataset.non_empty_mask = np.asarray(non_empty_mask)[keep]
+        if self.verbose:
+            print(f"In-memory blend part {self.part_id}/{self.num_parts}: output Z slab "
+                  f"[{self._blend_z_range[0]}, {self._blend_z_range[1]}), {len(keep)} of {len(positions)} "
+                  f"patches overlap it")
+
     def _create_dataset_and_loader(self):
-        # Use step_size instead of overlap (step_size is [0-1] representing stride as fraction of patch size)
-        # step_size of 0.5 means 50% overlap
+        # The dataset takes a stride as a fraction of the patch size, the complement of the
+        # overlap: overlap 0.25 is a stride of 0.75. A subclass may set step_size directly.
         
         # Use normalization from model checkpoint if available, otherwise use command line arg
         normalization_scheme = self.model_normalization_scheme or self.normalization_scheme
@@ -690,21 +857,31 @@ class Inferer():
         self.dataset = VCDataset(
             input_path=self.input,
             patch_size=self.patch_size,
-            step_size=self.overlap,
-            num_parts=self.num_parts,
-            part_id=self.part_id,
+            step_size=(getattr(self, 'step_size', None) or 1.0 - self.overlap),
+            # In-memory blending splits by output slab, not by patch start (see _select_blend_part_patches).
+            num_parts=1 if self.in_memory_blend is not None else self.num_parts,
+            part_id=0 if self.in_memory_blend is not None else self.part_id,
             normalization_scheme=normalization_scheme,
             global_mean=global_mean,
             global_std=global_std,
-            input_format=self.input_format,
+            intensity_props=self.model_intensity_properties,
             verbose=self.verbose,
             mode='infer',
             skip_empty_patches=self.skip_empty_patches,
-            scroll_id=self.scroll_id,
-            segment_id=self.segment_id,
-            energy=self.energy,
-            resolution=self.resolution,
             anon=self.input_anon,
+            bbox=self.bbox,
+            cache=self.chunk_cache_mb > 0,
+            cache_size_mb=self.chunk_cache_mb,
+            io_threads=1 if self.num_dataloader_workers > 0 else None,
+            # The float16 default suits the CUDA autocast path. Autocast only
+            # runs on CUDA here, so on CPU and MPS half patches would meet
+            # float32 weights and raise "Input type (c10::Half) and bias type
+            # (float) should be the same". Ask for the dtype the model can
+            # actually consume.
+            return_as_type=(
+                "np.float16" if self.device.type == "cuda"
+                else "np.float32"
+            ),
         )
 
         expected_attr_name = 'all_positions'
@@ -712,6 +889,7 @@ class Inferer():
             raise AttributeError(f"The VCDataset instance must calculate and provide an "
                                  f"'{expected_attr_name}' attribute (list of coordinate tuples).")
 
+        self._select_blend_part_patches()
         self._limit_dataset_patches()
 
         self.patch_start_coords_list = getattr(self.dataset, expected_attr_name)
@@ -750,7 +928,7 @@ class Inferer():
             batch_size=self.batch_size,
             shuffle=False,
             num_workers=self.num_dataloader_workers,
-            pin_memory=True if self.device != torch.device('cpu') else False,
+            pin_memory=self.device.type == 'cuda',
             collate_fn=VCDataset.collate_fn  # we use custom collate fn here to tag patches that contain only zeros
                                              # so we don't run them through the model
         )
@@ -785,42 +963,69 @@ class Inferer():
         
         return concatenated
         
-    def _get_zarr_compressor(self):
-        if self.compressor_name.lower() == 'zstd':
-            return zarr.Blosc(cname='zstd', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'lz4':
-            return zarr.Blosc(cname='lz4', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'zlib':
-            return zarr.Blosc(cname='zlib', clevel=self.compression_level, shuffle=zarr.Blosc.SHUFFLE)
-        elif self.compressor_name.lower() == 'none':
+    def _zarr_codec(self):
+        name = self.compressor_name.lower()
+        if name == 'none':
+            return {'compressor': None}
+        if name in ('zstd', 'lz4', 'zlib'):
+            return {'cname': name, 'level': self.compression_level, 'shuffle': 1}
+        return {'cname': 'zstd', 'level': 1, 'shuffle': 1}
+
+    def _original_volume_shape(self):
+        """Spatial (Z, Y, X) shape of the input volume, or None if the dataset does not expose it."""
+        if not hasattr(self.dataset, 'input_shape'):
             return None
-        else:
-            return zarr.Blosc(cname='zstd', clevel=1, shuffle=zarr.Blosc.SHUFFLE)
+        if len(self.dataset.input_shape) == 4:  # has channel dimension
+            return list(self.dataset.input_shape[1:])
+        return list(self.dataset.input_shape)  # no channel dimension
+
+    def _create_in_memory_blender(self):
+        volume_shape = self._original_volume_shape()
+        if volume_shape is None:
+            raise RuntimeError("In-memory blending needs the input volume shape, which the dataset does not expose.")
+        coords = np.asarray(self.patch_start_coords_list, dtype=np.int64).reshape(-1, 3)
+        z_range = getattr(self, '_blend_z_range', None)
+        needed = InMemoryBlender.required_bytes(coords, self.patch_size, self.num_classes, volume_shape, z_range)
+        available = psutil.virtual_memory().available
+        print(f"In-memory blending: the blend sums need {needed / 2**30:.1f} GiB "
+              f"({available / 2**30:.1f} GiB available)")
+        if needed > available:
+            raise MemoryError(
+                f"In-memory blending needs {needed / 2**30:.1f} GiB for this region but only "
+                f"{available / 2**30:.1f} GiB is available. Use a smaller --bbox or more --num_parts, "
+                f"or drop --blend_in_memory and blend the written logits with blend_and_finalize.")
+        self.blender = InMemoryBlender(coords, self.patch_size, self.num_classes, volume_shape,
+                                       sigma_scale=self.in_memory_blend.get('sigma_scale', 8.0),
+                                       z_range=z_range)
+        self.coords_store_path = None
+        self._prepare_in_memory_blend()
+        return self.blender
 
     def _create_output_stores(self):
         if self.num_classes is None or self.patch_size is None or self.num_total_patches is None:
             raise RuntimeError("Cannot create output stores: model/patch info missing.")
+        if self.in_memory_blend is not None:
+            return self._create_in_memory_blender()
         # An empty patch list is valid: we still write zarrs with shape[0]=0 so
         # blending can enumerate logits_part_*.zarr files uniformly across parts.
 
-        compressor = self._get_zarr_compressor()
+        codec = self._zarr_codec()
         output_shape = (self.num_total_patches, self.num_classes, *self.patch_size)
         output_chunks = (1, self.num_classes, *self.patch_size)  # we align chunks to patch size for better write performance
         main_store_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
         
         print(f"Creating output store at: {main_store_path}")
         
-        self.output_store = open_zarr(
-            path=main_store_path, 
-            mode='w',  
-            storage_options={'anon': False} if main_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        # We skip empty chunks here so we don't write all zero patches to the array but keep
+        # the proper indices for later re-zarring.
+        self.output_store = ZarrWriter.create(
+            main_store_path,
             shape=output_shape,
             chunks=output_chunks,
-            dtype=np.float16,  
-            compressor=compressor,
-            write_empty_chunks=False  # we skip empty chunks here so we don't write all zero patches to the array but keep
-                                      # the proper indices for later re-zarring 
+            dtype=np.float16,
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created zarr array at {main_store_path} with shape {self.output_store.shape}")
@@ -832,35 +1037,39 @@ class Inferer():
         
         print(f"Creating coordinates store at: {self.coords_store_path}")
         
-        coords_store = open_zarr(
-            path=self.coords_store_path,
-            mode='w',
-            storage_options={'anon': False} if self.coords_store_path.startswith('s3://') else None,
-            verbose=self.verbose,
+        coords_store = ZarrWriter.create(
+            self.coords_store_path,
             shape=coord_shape,
             chunks=coord_chunks,
             dtype=np.int32,
-            compressor=compressor,
-            write_empty_chunks=False  
+            overwrite=True,
+            skip_empty=True,
+            **codec,
         )
         
         print(f"Created coordinates zarr array at {self.coords_store_path} with shape {coords_store.shape}")
         
         try:
-            original_volume_shape = None
-            if hasattr(self.dataset, 'input_shape'):
-                if len(self.dataset.input_shape) == 4:  # has channel dimension
-                    original_volume_shape = list(self.dataset.input_shape[1:])
-                else:  # no channel dimension
-                    original_volume_shape = list(self.dataset.input_shape)
-                if self.verbose:
-                    print(f"Derived original volume shape from dataset.input_shape: {original_volume_shape}")
+            original_volume_shape = self._original_volume_shape()
+            if original_volume_shape is not None and self.verbose:
+                print(f"Derived original volume shape from dataset.input_shape: {original_volume_shape}")
             
             # store some metadata we might later want 
             self.output_store.attrs['patch_size'] = list(self.patch_size)
             self.output_store.attrs['overlap'] = self.overlap
             self.output_store.attrs['part_id'] = self.part_id
             self.output_store.attrs['num_parts'] = self.num_parts
+            # Record whether test-time augmentation was used. Patch size and overlap are
+            # already here, but TTA is the setting that changes the output most and it
+            # leaves no trace otherwise, so a stored prediction cannot be reproduced from
+            # itself without guessing it.
+            self.output_store.attrs['tta'] = bool(self.do_tta)
+            if self.do_tta:
+                self.output_store.attrs['tta_type'] = self.tta_type
+            if self.bbox is not None:
+                # Record the requested ROI (global voxel coords, half-open) so the
+                # output is self-describing about which region was processed.
+                self.output_store.attrs['bbox'] = list(self.bbox)
             
             # Store multi-task metadata if applicable
             if self.is_multi_task and self.target_info:
@@ -905,8 +1114,6 @@ class Inferer():
         return self.output_store
 
     def _process_batches(self):
-        numcodecs.blosc.use_threads = False
-
         self.current_patch_write_index = 0
         max_workers = self.writer_workers if self.writer_workers is not None else min(16, os.cpu_count() or 4)
 
@@ -917,10 +1124,10 @@ class Inferer():
             print(error_msg)
             raise ValueError(error_msg)
 
-        if self.output_store is None:
+        if self.output_store is None and self.blender is None:
             raise RuntimeError(f"Error: output_store is None. Make sure _create_output_stores() was called successfully.")
 
-        if self.verbose:
+        if self.verbose and self.blender is None:
             print(f"Using existing output store: {zarr_path}")
             print(f"Output store shape: {self.output_store.shape}")
 
@@ -935,11 +1142,18 @@ class Inferer():
                     self.current_patch_write_index += 1
                 pbar.update(1)
 
+            if self.blender is not None:
+                # One thread adds patches to the in-memory blend, in the order they are submitted,
+                # so the float32 sums are reproducible; it overlaps with the next batch's inference.
+                store, max_workers, max_inflight = self.blender, 1, max(2, 2 * self.batch_size)
+            else:
+                store, max_inflight = self.output_store, None
             with BoundedPatchWriter(
-                self.output_store,
+                store,
                 max_workers=max_workers,
                 pbar=pbar,
                 on_progress=on_progress,
+                max_inflight=max_inflight,
             ) as writer:
                 if self.verbose:
                     print(f"Writer pool: {writer.max_workers} workers, max in-flight: {writer.max_inflight}")
@@ -971,8 +1185,9 @@ class Inferer():
                     # Only perform inference if there are non-empty patches
                     if non_empty_indices:
                         non_empty_input = input_batch[non_empty_indices]
-                        
-                        with torch.inference_mode(), torch.amp.autocast('cuda'):
+
+                        with torch.inference_mode(), torch.amp.autocast(
+                                self.device.type, enabled=(self.device.type == 'cuda')):
                             if self.do_tta:
                                 non_empty_output = infer_with_tta(
                                     self.model,
@@ -1039,11 +1254,43 @@ class Inferer():
         else:
             print(f"Part {self.part_id} has no patches; wrote empty output stores and skipped inference.")
 
+        if self.blender is not None:
+            self._write_in_memory_blend()
+
         if self.verbose: print("Inference complete.")
+
+    def _prepare_in_memory_blend(self):
+        config = self.in_memory_blend
+        finalize_config = config.get('finalize_config')
+        if finalize_config is not None:
+            finalize_config.is_multi_task = bool(self.is_multi_task and self.target_info)
+            finalize_config.target_info = self.target_info if finalize_config.is_multi_task else None
+        self.blender.prepare_output(
+            config['output_path'],
+            chunk_size=config.get('chunk_size'),
+            compression_level=config.get('compression_level', 1),
+            finalize_config=finalize_config,
+            verbose=self.verbose,
+            create=self.part_id == 0,
+            part_id=self.part_id,
+            run_id=config.get('run_id'),
+            wait_timeout=config.get('wait_timeout', 300),
+        )
+
+    def _write_in_memory_blend(self):
+        config = self.in_memory_blend
+        self.blender.write(
+            config['output_path'],
+            chunk_size=config.get('chunk_size'),
+            finalize_config=config.get('finalize_config'),
+            verbose=self.verbose,
+        )
 
     def infer(self):
         try:
             self._run_inference()
+            if self.blender is not None:
+                return self.in_memory_blend['output_path'], None
             main_output_path = os.path.join(self.output_dir, f"logits_part_{self.part_id}.zarr")
             return main_output_path, self.coords_store_path
         except Exception as e:
@@ -1052,11 +1299,40 @@ class Inferer():
             traceback.print_exc() 
 
 
-def main():
+def _parse_bbox_arg(value):
+    """Parse "z0:z1,y0:y1,x0:x1" (half-open, global voxel coords) into a 6-tuple.
+
+    An omitted bound becomes None and is resolved to the volume edge once the
+    dataset opens the volume, so "1000:1400,:,2000:" is valid.
+    """
+    parts = value.split(',')
+    if len(parts) != 3:
+        raise ValueError(
+            f"--bbox expects three comma-separated ranges 'z0:z1,y0:y1,x0:x1', got '{value}'"
+        )
+    bounds = []
+    for axis_label, part in zip('zyx', parts):
+        piece = part.strip()
+        if ':' not in piece:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' must contain ':' "
+                f"(use ':' alone for the full axis)"
+            )
+        lo_s, hi_s = piece.split(':', 1)
+        try:
+            bounds.append(int(lo_s) if lo_s.strip() else None)
+            bounds.append(int(hi_s) if hi_s.strip() else None)
+        except ValueError:
+            raise ValueError(
+                f"--bbox {axis_label}-range '{piece}' has a non-integer bound"
+            ) from None
+    return tuple(bounds)
+
+
+def build_parser():
+    """Build the predict CLI parser (separate from main so it can be tested)."""
     import argparse
-    import sys
-    
-    parser = argparse.ArgumentParser(description='Run nnUNet inference on Zarr data')
+    parser = HyphenUnderscoreParser(description='Run nnUNet inference on Zarr data')
     parser.add_argument('--model_path', type=str, required=True,
                       help='Path to nnUNet model folder, train.py .pth, or external model path (when enabled)')
     parser.add_argument('--input_dir', type=str, required=True, help='Path to the input Zarr volume')
@@ -1065,7 +1341,6 @@ def main():
                            'Required when reading from a public bucket while AWS credentials '
                            'are configured for writes to a different bucket.')
     parser.add_argument('--output_dir', type=str, required=True, help='Path to store output predictions')
-    parser.add_argument('--input_format', type=str, default='zarr', help='Input format (zarr, volume)')
     parser.add_argument('--tta_type', type=str, default='mirroring', choices=['mirroring', 'rotation'],
                       help='TTA type (mirroring or rotation). Default: rotation')
     parser.add_argument('--disable_tta', action='store_true', help='Disable test time augmentation')
@@ -1077,46 +1352,86 @@ def main():
                       help='Optional: Override patch size, comma-separated (e.g., "192,192,192"). If not provided, uses the model\'s default patch size.')
     parser.add_argument('--save_softmax', action='store_true', help='Save softmax outputs')
     parser.add_argument('--normalization', type=str, default='instance_zscore',
-                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, none)')
-    parser.add_argument('--device', type=str, default='cuda', help='Device to use (cuda, cpu)')
+                      help='Normalization scheme (instance_zscore, global_zscore, instance_minmax, percentile_minmax, ct, none)')
+    parser.add_argument('--device', type=str, default=None,
+                        help='Device to use (cuda, mps, cpu). Default: cuda, then mps, then cpu')
     parser.add_argument('--num_workers', type=int, default=4,
                       help='Number of DataLoader workers. Use 0 in low /dev/shm environments (e.g. Docker).')
     parser.add_argument('--writer_workers', type=int, default=None,
                       help='Number of threads used to write patches to the output zarr. '
                            'Default: min(16, cpu_count). Increase for S3 outputs to push more parallelism.')
     parser.add_argument('--verbose', action='store_true', help='Enable verbose output')
-    parser.add_argument('--skip-empty-patches', dest='skip_empty_patches', action='store_true',
+    parser.add_argument('--skip_empty_patches', action='store_true',
                       help='Skip patches that are empty (all values the same). Default: True')
-    parser.add_argument('--no-skip-empty-patches', dest='skip_empty_patches', action='store_false',
+    parser.add_argument('--no_skip_empty_patches', dest='skip_empty_patches', action='store_false',
                       help='Process all patches, even if they appear empty')
     parser.set_defaults(skip_empty_patches=True)
     
     # Add arguments for Zarr compression
-    parser.add_argument('--zarr-compressor', type=str, default='zstd',
+    parser.add_argument('--zarr_compressor', type=str, default='zstd',
                       choices=['zstd', 'lz4', 'zlib', 'none'],
                       help='Zarr compression algorithm')
-    parser.add_argument('--zarr-compression-level', type=int, default=3,
+    parser.add_argument('--zarr_compression_level', type=int, default=3,
                       help='Compression level (1-9, higher = better compression but slower)')
     
-    # Add arguments for the updated Volume class
-    parser.add_argument('--scroll_id', type=str, default=None, help='Scroll ID to use (if input_format is volume)')
-    parser.add_argument('--segment_id', type=str, default=None, help='Segment ID to use (if input_format is volume)')
-    parser.add_argument('--energy', type=int, default=None, help='Energy level to use (if input_format is volume)')
-    parser.add_argument('--resolution', type=float, default=None, help='Resolution to use (if input_format is volume)')
-
     # Add arguments for Hugging Face model loading
     parser.add_argument('--hf_token', type=str, default=None, help='Hugging Face token for accessing private repositories')
-    parser.add_argument('--model-type', type=str, default='auto',
+    parser.add_argument('--model_type', type=str, default='auto',
                       choices=['auto', 'nnunet', 'train_py', 'resnet'],
                       help='Model loader type. Use "resnet" for external ink_model.py + .pth loading.')
     parser.add_argument('--model_cache_dir', type=str, default=DEFAULT_MODEL_CACHE_DIR,
                       help=f'Local directory used to cache models downloaded from S3. '
                            f'Only applies when --model_path is an s3:// URL. '
                            f'Default: {DEFAULT_MODEL_CACHE_DIR}')
+    parser.add_argument('--chunk_cache_mb', type=int, default=0,
+                      help='Keep up to this many MB of fetched input chunks in an in-memory LRU '
+                           'cache, so overlapping patches reuse chunks instead of downloading '
+                           'them again. Each DataLoader worker keeps its own cache. Requires '
+                           'zarr 3. Default 0 (off).')
     parser.add_argument('--max_patches', type=int, default=None,
                       help='Optional cap on patch positions processed by this part. '
                            'Intended for smoke tests; production inference leaves this unset.')
-    
+    parser.add_argument('--bbox', type=str, default=None,
+                      help='Restrict inference to a region of interest given as '
+                           '"z0:z1,y0:y1,x0:x1" in global voxel coordinates (half-open). '
+                           'Omit a bound to reach the volume edge, e.g. "1000:1400,:,2000:". '
+                           'Patch coordinates stay in the global frame, so blend_logits and '
+                           'finalize_outputs need no extra flags. When streaming a remote '
+                           'volume only the chunks intersecting the ROI are fetched.')
+    # In-memory blending: blend in RAM and write what blend_and_finalize would, with no per-patch logits.
+    parser.add_argument('--blend_in_memory', type=str, default=None, metavar='OUTPUT_PATH',
+                        help='Blend the patches in memory and write the finalized output Zarr here, '
+                             'instead of writing logits_part_*.zarr for blend_and_finalize. Needs '
+                             '(num_classes + 1) * 4 bytes of RAM per voxel of the region the patches cover. '
+                             'With --num_parts N, part --part_id blends and writes one chunk-aligned Z slab '
+                             'of that region (running the patches that reach into it), so the parts are '
+                             'independent jobs writing disjoint chunks of the same output; part 0 creates it.')
+    parser.add_argument('--blend_run_id', type=str, default=None,
+                        help='With split --blend_in_memory: required ID shared by all parts. Use a fresh '
+                             'ID for every run so existing output cannot release waiting parts.')
+    parser.add_argument('--blend_wait_timeout', type=int, default=300, metavar='SECONDS',
+                        help='With --blend_in_memory: seconds to wait for part 0 to initialize this run '
+                             'before inference (positive integer; default: 300). Increase for scheduler delays.')
+    parser.add_argument('--mode', type=str, choices=['binary', 'multiclass'], default='binary',
+                        help='With --blend_in_memory: finalization mode, as in blend_and_finalize. Default: binary')
+    from vesuvius.models.run.finalize_outputs import add_threshold_arguments
+    add_threshold_arguments(parser)
+    parser.add_argument('--blend_sigma_scale', type=float, default=8.0,
+                        help='With --blend_in_memory: Gaussian sigma = patch_size / blend_sigma_scale, '
+                             'as blend_and_finalize --sigma_scale. Default: 8.0')
+    parser.add_argument('--blend_chunk_size', type=str, default=None,
+                        help='With --blend_in_memory: spatial chunk size (Z,Y,X) of the output. '
+                             'Default: the patch size')
+    parser.add_argument('--blend_compression_level', type=int, default=1, choices=range(10),
+                        help='With --blend_in_memory: compression level (0-9, 0=none) of the output, '
+                             'as blend_and_finalize --compression_level. Default: 1')
+    return parser
+
+
+def main():
+    import sys
+
+    parser = build_parser()
     args = parser.parse_args()
     
     # Parse optional patch size if provided
@@ -1130,22 +1445,45 @@ def main():
             print("Expected format: comma-separated integers, e.g. '192,192,192'")
             print("Using model's default patch size instead.")
     
-    # Convert scroll_id and segment_id if needed
-    scroll_id = args.scroll_id
-    segment_id = args.segment_id
-    
-    if scroll_id is not None and scroll_id.isdigit():
-        scroll_id = int(scroll_id)
-    
-    if segment_id is not None and segment_id.isdigit():
-        segment_id = int(segment_id)
-    
+    bbox = None
+    if args.bbox:
+        try:
+            bbox = _parse_bbox_arg(args.bbox)
+        except ValueError as e:
+            parser.error(str(e))
+        print(f"Restricting inference to bbox (z0,z1,y0,y1,x0,x1): {bbox}")
+
+    in_memory_blend = None
+    if args.blend_in_memory:
+        from vesuvius.models.run.finalize_outputs import FinalizeConfig, resolve_threshold
+        if args.num_parts > 1 and (not args.blend_run_id or not args.blend_run_id.strip()):
+            parser.error("--blend_run_id is required with split --blend_in_memory; "
+                         "share one fresh ID across all parts of each run.")
+        if args.blend_wait_timeout <= 0:
+            parser.error("--blend_wait_timeout must be positive.")
+        blend_chunk_size = None
+        if args.blend_chunk_size:
+            try:
+                blend_chunk_size = tuple(map(int, args.blend_chunk_size.split(',')))
+                if len(blend_chunk_size) != 3:
+                    raise ValueError()
+            except ValueError:
+                parser.error("Invalid --blend_chunk_size. Expected 3 comma-separated integers (Z,Y,X).")
+        in_memory_blend = {
+            'output_path': args.blend_in_memory,
+            'run_id': args.blend_run_id,
+            'wait_timeout': args.blend_wait_timeout,
+            'sigma_scale': args.blend_sigma_scale,
+            'chunk_size': blend_chunk_size,
+            'compression_level': args.blend_compression_level,
+            'finalize_config': FinalizeConfig(mode=args.mode, threshold=resolve_threshold(parser, args)),
+        }
+
     print("\n--- Initializing Inferer ---")
     inferer = Inferer(
         model_path=args.model_path,
         input_dir=args.input_dir,
         output_dir=args.output_dir,
-        input_format=args.input_format,
         tta_type=args.tta_type,
         do_tta=not args.disable_tta,
         num_parts=args.num_parts,
@@ -1161,10 +1499,6 @@ def main():
         verbose=args.verbose,
         skip_empty_patches=args.skip_empty_patches,  # Skip empty patches flag
         # Pass Volume-specific parameters to VCDataset
-        scroll_id=scroll_id,
-        segment_id=segment_id,
-        energy=args.energy,
-        resolution=args.resolution,
         # Pass Zarr compression settings
         compressor_name=args.zarr_compressor,
         compression_level=args.zarr_compression_level,
@@ -1174,28 +1508,40 @@ def main():
         input_anon=args.input_anon,
         model_cache_dir=args.model_cache_dir,
         max_patches=args.max_patches,
+        bbox=bbox,
+        chunk_cache_mb=args.chunk_cache_mb,
+        in_memory_blend=in_memory_blend,
     )
 
     try:
         print("\n--- Starting Inference ---")
-        logits_path, coords_path = inferer.infer()
+        result = inferer.infer()
+        if result is None:
+            # infer() already printed the exception and its traceback; do not
+            # bury it under "cannot unpack non-iterable NoneType object".
+            print("\n--- Inference Failed ---")
+            print("Inference raised the error shown above and wrote no output.")
+            return 1
+        logits_path, coords_path = result
+
+        if in_memory_blend is not None:
+            print(f"\n--- Inference Finished ---")
+            print(f"Blended output written to: {logits_path}")
+            return 0
 
         if logits_path and coords_path:
-            # Check if paths exist, using fsspec for S3 paths
+            # Check if paths exist
             logits_exists = False
             coords_exists = False
             
             try:
                 if logits_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    # Check if .zarray file exists within the zarr directory
-                    logits_exists = fs.exists(os.path.join(logits_path, '.zarray'))
+                    logits_exists = ObjectStore(logits_path).exists('.zarray')
                 else:
                     logits_exists = os.path.exists(logits_path)
                     
                 if coords_path.startswith('s3://'):
-                    fs = fsspec.filesystem('s3', anon=False)
-                    coords_exists = fs.exists(os.path.join(coords_path, '.zarray'))
+                    coords_exists = ObjectStore(coords_path).exists('.zarray')
                 else:
                     coords_exists = os.path.exists(coords_path)
             except Exception as e:
@@ -1210,11 +1556,7 @@ def main():
 
                 print("\n--- Inspecting Output Store ---")
                 try:
-                    output_store = open_zarr(
-                        path=logits_path,
-                        mode='r',
-                        storage_options={'anon': False} if logits_path.startswith('s3://') else None
-                    )
+                    output_store = open_zarr(logits_path)
                     print(f"Output shape: {output_store.shape}")
                     print(f"Output dtype: {output_store.dtype}")
                     print(f"Output chunks: {output_store.chunks}")
@@ -1233,11 +1575,7 @@ def main():
 
                 print("\n--- Inspecting Coordinate Store ---")
                 try:
-                    coords_store = open_zarr(
-                        path=coords_path,
-                        mode='r',
-                        storage_options={'anon': False} if coords_path.startswith('s3://') else None
-                    )
+                    coords_store = open_zarr(coords_path)
                     print(f"Coords shape: {coords_store.shape}")
                     print(f"Coords dtype: {coords_store.dtype}")
                     first_few_coords = coords_store[0:5]

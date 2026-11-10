@@ -4,12 +4,8 @@
 #include "ViewerManager.hpp"
 #include "WindowRangeWidget.hpp"
 #include "elements/CollapsibleSettingsGroup.hpp"
-#include "viewer_controls/panels/ViewerCompositePanel.hpp"
 #include "viewer_controls/panels/ViewerNavigationPanel.hpp"
 #include "viewer_controls/panels/ViewerNormalVisualizationPanel.hpp"
-#include "viewer_controls/panels/ViewerPostprocessingPanel.hpp"
-#include "viewer_controls/panels/ViewerPreprocessingPanel.hpp"
-#include "viewer_controls/panels/ViewerTransformsPanel.hpp"
 #include "viewer_controls/panels/ViewerViewExtrasPanel.hpp"
 
 #include <QDoubleSpinBox>
@@ -65,102 +61,15 @@ void ViewerControlsPanel::addViewerGroups()
                                      viewer::GROUP_VIEW_EXPANDED,
                                      viewer::GROUP_VIEW_EXPANDED_DEFAULT);
     if (viewGroup) {
-        viewGroup->contentLayout()->addWidget(new ViewerViewExtrasPanel(_viewerManager, viewGroup));
+        _viewExtrasPanel = new ViewerViewExtrasPanel(_viewerManager, viewGroup);
+        viewGroup->contentLayout()->addWidget(_viewExtrasPanel);
     }
 
+    _navigationPanel = new ViewerNavigationPanel(_viewerManager, _uiRefs.contents);
     addViewerGroup(tr("Navigation"),
-                   new ViewerNavigationPanel(_viewerManager, _uiRefs.contents),
+                   _navigationPanel,
                    "viewer_controls/group_navigation_expanded",
                    true);
-
-    addViewerGroup(tr("Overlay"),
-                   detachScrollContents(_uiRefs.overlayScrollArea, _uiRefs.overlayContents),
-                   viewer::GROUP_OVERLAY_EXPANDED,
-                   viewer::GROUP_OVERLAY_EXPANDED_DEFAULT);
-    ViewerCompositePanel::UiRefs compositeUi{
-        .scrollArea = _uiRefs.compositeScrollArea,
-        .contents = _uiRefs.compositeContents,
-        .compositeEnabled = _uiRefs.compositeEnabled,
-        .compositeMode = _uiRefs.compositeMode,
-        .layersInFront = _uiRefs.layersInFront,
-        .layersBehind = _uiRefs.layersBehind,
-        .alphaMinLabel = _uiRefs.alphaMinLabel,
-        .alphaMin = _uiRefs.alphaMin,
-        .alphaMaxLabel = _uiRefs.alphaMaxLabel,
-        .alphaMax = _uiRefs.alphaMax,
-        .alphaThresholdLabel = _uiRefs.alphaThresholdLabel,
-        .alphaThreshold = _uiRefs.alphaThreshold,
-        .materialLabel = _uiRefs.materialLabel,
-        .material = _uiRefs.material,
-        .reverseDirection = _uiRefs.reverseDirection,
-        .methodScaleLabel = _uiRefs.methodScaleLabel,
-        .methodScale = _uiRefs.methodScale,
-        .methodScaleValue = _uiRefs.methodScaleValue,
-        .methodParamLabel = _uiRefs.methodParamLabel,
-        .methodParam = _uiRefs.methodParam,
-        .methodParamValue = _uiRefs.methodParamValue,
-        .blExtinctionLabel = _uiRefs.blExtinctionLabel,
-        .blExtinction = _uiRefs.blExtinction,
-        .blEmissionLabel = _uiRefs.blEmissionLabel,
-        .blEmission = _uiRefs.blEmission,
-        .blAmbientLabel = _uiRefs.blAmbientLabel,
-        .blAmbient = _uiRefs.blAmbient,
-        .lightingEnabled = _uiRefs.lightingEnabled,
-        .lightAzimuthLabel = _uiRefs.lightAzimuthLabel,
-        .lightAzimuth = _uiRefs.lightAzimuth,
-        .lightElevationLabel = _uiRefs.lightElevationLabel,
-        .lightElevation = _uiRefs.lightElevation,
-        .lightDiffuseLabel = _uiRefs.lightDiffuseLabel,
-        .lightDiffuse = _uiRefs.lightDiffuse,
-        .lightAmbientLabel = _uiRefs.lightAmbientLabel,
-        .lightAmbient = _uiRefs.lightAmbient,
-        .useVolumeGradients = _uiRefs.useVolumeGradients,
-        .shadowStepsLabel = _uiRefs.shadowStepsLabel,
-        .shadowSteps = _uiRefs.shadowSteps,
-        .rakingEnabled = _uiRefs.rakingEnabled,
-        .rakingAzimuthLabel = _uiRefs.rakingAzimuthLabel,
-        .rakingAzimuth = _uiRefs.rakingAzimuth,
-        .rakingElevationLabel = _uiRefs.rakingElevationLabel,
-        .rakingElevation = _uiRefs.rakingElevation,
-        .rakingStrengthLabel = _uiRefs.rakingStrengthLabel,
-        .rakingStrength = _uiRefs.rakingStrength,
-        .rakingDepthLabel = _uiRefs.rakingDepthLabel,
-        .rakingDepthScale = _uiRefs.rakingDepthScale,
-        .preNormalizeLayers = _uiRefs.preNormalizeLayers,
-        .preHistEqLayers = _uiRefs.preHistEqLayers,
-        .preTfEnabled = _uiRefs.preTfEnabled,
-        .preTfX1 = _uiRefs.preTfX1,
-        .preTfY1 = _uiRefs.preTfY1,
-        .preTfKnot2Label = _uiRefs.preTfKnot2Label,
-        .preTfX2 = _uiRefs.preTfX2,
-        .preTfY2 = _uiRefs.preTfY2,
-        .postTfEnabled = _uiRefs.postTfEnabled,
-        .postTfX1 = _uiRefs.postTfX1,
-        .postTfY1 = _uiRefs.postTfY1,
-        .postTfKnot2Label = _uiRefs.postTfKnot2Label,
-        .postTfX2 = _uiRefs.postTfX2,
-        .postTfY2 = _uiRefs.postTfY2,
-        .dvrAmbientLabel = _uiRefs.dvrAmbientLabel,
-        .dvrAmbient = _uiRefs.dvrAmbient,
-        .pbrRoughnessLabel = _uiRefs.pbrRoughnessLabel,
-        .pbrRoughness = _uiRefs.pbrRoughness,
-        .pbrMetallicLabel = _uiRefs.pbrMetallicLabel,
-        .pbrMetallic = _uiRefs.pbrMetallic,
-        .planeCompositeXY = _uiRefs.planeCompositeXY,
-        .planeCompositeXZ = _uiRefs.planeCompositeXZ,
-        .planeCompositeYZ = _uiRefs.planeCompositeYZ,
-        .planeLayersFront = _uiRefs.planeLayersFront,
-        .planeLayersBehind = _uiRefs.planeLayersBehind,
-    };
-    _compositePanel = new ViewerCompositePanel(compositeUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Composite View"),
-                   _compositePanel,
-                   viewer::GROUP_COMPOSITE_EXPANDED,
-                   viewer::GROUP_COMPOSITE_EXPANDED_DEFAULT);
-    addViewerGroup(tr("Render Settings"),
-                   detachScrollContents(_uiRefs.renderSettingsScrollArea, _uiRefs.renderSettingsContents),
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED,
-                   viewer::GROUP_RENDER_SETTINGS_EXPANDED_DEFAULT);
 
     ViewerNormalVisualizationPanel::UiRefs normalUi{
         .contents = _uiRefs.normalVisualizationContents,
@@ -172,55 +81,54 @@ void ViewerControlsPanel::addViewerGroups()
         .normalMaxArrowsSlider = _uiRefs.normalMaxArrowsSlider,
         .normalMaxArrowsValueLabel = _uiRefs.normalMaxArrowsValueLabel,
     };
-    auto* normalPanel = new ViewerNormalVisualizationPanel(normalUi, _viewerManager, _uiRefs.contents);
-    connect(normalPanel, &ViewerNormalVisualizationPanel::statusMessageRequested,
+    _normalPanel = new ViewerNormalVisualizationPanel(normalUi, _viewerManager, _uiRefs.contents);
+    connect(_normalPanel, &ViewerNormalVisualizationPanel::statusMessageRequested,
             this, &ViewerControlsPanel::statusMessageRequested);
     addViewerGroup(tr("Normal Visualization"),
-                   normalPanel,
+                   _normalPanel,
                    viewer::GROUP_NORMAL_VIS_EXPANDED,
                    viewer::GROUP_NORMAL_VIS_EXPANDED_DEFAULT);
-
-    ViewerPreprocessingPanel::UiRefs preprocessingUi{
-        .scrollArea = _uiRefs.preprocessingScrollArea,
-        .contents = _uiRefs.preprocessingContents,
-        .isoCutoff = _uiRefs.isoCutoff,
-        .isoCutoffValue = _uiRefs.isoCutoffValue,
-    };
-    _preprocessingPanel = new ViewerPreprocessingPanel(preprocessingUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Preprocessing"),
-                   _preprocessingPanel,
-                   viewer::GROUP_PREPROCESSING_EXPANDED,
-                   viewer::GROUP_PREPROCESSING_EXPANDED_DEFAULT);
-
-    ViewerPostprocessingPanel::UiRefs postprocessingUi{
-        .scrollArea = _uiRefs.postprocessingScrollArea,
-        .contents = _uiRefs.postprocessingContents,
-        .baseColormap = _uiRefs.baseColormap,
-        .stretchValues = _uiRefs.stretchValuesPost,
-        .removeSmallComponents = _uiRefs.removeSmallComponents,
-        .minComponentSizeLabel = _uiRefs.minComponentSizeLabel,
-        .minComponentSize = _uiRefs.minComponentSize,
-        .claheEnabled = _uiRefs.claheEnabled,
-        .claheClipLimitLabel = _uiRefs.claheClipLimitLabel,
-        .claheClipLimit = _uiRefs.claheClipLimit,
-        .claheTileSizeLabel = _uiRefs.claheTileSizeLabel,
-        .claheTileSize = _uiRefs.claheTileSize,
-    };
-    _postprocessingPanel = new ViewerPostprocessingPanel(postprocessingUi, _viewerManager, _uiRefs.contents);
-    addViewerGroup(tr("Postprocessing"),
-                   _postprocessingPanel,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED,
-                   viewer::GROUP_POSTPROCESSING_EXPANDED_DEFAULT);
-
-    _transformsPanel = new ViewerTransformsPanel(_uiRefs.contents);
-    addViewerGroup(tr("Transforms"),
-                   _transformsPanel,
-                   viewer::GROUP_TRANSFORMS_EXPANDED,
-                   viewer::GROUP_TRANSFORMS_EXPANDED_DEFAULT);
 
     if (auto* layout = qobject_cast<QVBoxLayout*>(_uiRefs.contents->layout())) {
         layout->addStretch(1);
     }
+}
+
+void ViewerControlsPanel::setViewerManager(ViewerManager* viewerManager)
+{
+    if (_viewerManager == viewerManager) {
+        return;
+    }
+    if (_viewerManager) {
+        disconnect(_viewerManager, nullptr, this, nullptr);
+    }
+    _viewerManager = viewerManager;
+    if (_viewExtrasPanel) _viewExtrasPanel->setViewerManager(_viewerManager);
+    if (_navigationPanel) _navigationPanel->setViewerManager(_viewerManager);
+    if (_normalPanel) _normalPanel->setViewerManager(_viewerManager);
+    connectViewerManagerSignals();
+
+    if (!_viewerManager) {
+        setOverlayWindowAvailable(false);
+        return;
+    }
+    if (_volumeWindowWidget) {
+        const QSignalBlocker blocker(_volumeWindowWidget);
+        _volumeWindowWidget->setWindowValues(
+            static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
+            static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
+    }
+    if (_overlayWindowWidget) {
+        const QSignalBlocker blocker(_overlayWindowWidget);
+        _overlayWindowWidget->setWindowValues(
+            static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
+            static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
+    }
+    if (_uiRefs.intersectionThicknessSpin) {
+        const QSignalBlocker blocker(_uiRefs.intersectionThicknessSpin);
+        _uiRefs.intersectionThicknessSpin->setValue(_viewerManager->intersectionThickness());
+    }
+    setOverlayWindowAvailable(static_cast<bool>(_viewerManager->overlayVolume()));
 }
 
 void ViewerControlsPanel::setViewControlsEnabled(bool enabled)
@@ -232,28 +140,10 @@ void ViewerControlsPanel::setViewControlsEnabled(bool enabled)
     updateOverlayWindowControlsEnabled();
 }
 
-void ViewerControlsPanel::toggleSegmentationComposite()
-{
-    if (_compositePanel) {
-        _compositePanel->toggleSegmentationComposite();
-    }
-}
-
 void ViewerControlsPanel::setOverlayWindowAvailable(bool available)
 {
     _overlayWindowAvailable = available;
     updateOverlayWindowControlsEnabled();
-}
-
-void ViewerControlsPanel::setSliceStepSize(int value)
-{
-    if (!_sliceStepSizeSpin) {
-        return;
-    }
-    QSignalBlocker blocker(_sliceStepSizeSpin);
-    _sliceStepSizeSpin->setValue(std::clamp(value,
-                                            _sliceStepSizeSpin->minimum(),
-                                            _sliceStepSizeSpin->maximum()));
 }
 
 void ViewerControlsPanel::setupViewerControlWiring()
@@ -268,28 +158,29 @@ void ViewerControlsPanel::setupViewerControlWiring()
         connect(_uiRefs.zoomOutButton, &QPushButton::clicked, this, &ViewerControlsPanel::zoomOutRequested);
     }
 
-    if (auto* spinSliceStep = _uiRefs.sliceStepSizeSpin) {
-        _sliceStepSizeSpin = spinSliceStep;
-        QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-        int savedStep = settings.value(vc3d::settings::viewer::SLICE_STEP_SIZE,
-                                       vc3d::settings::viewer::SLICE_STEP_SIZE_DEFAULT).toInt();
-        savedStep = std::clamp(savedStep, spinSliceStep->minimum(), spinSliceStep->maximum());
-        {
-            QSignalBlocker blocker(spinSliceStep);
-            spinSliceStep->setValue(savedStep);
-        }
-        if (_viewerManager) {
-            _viewerManager->setSliceStepSize(savedStep);
-        }
-        connect(spinSliceStep, qOverload<int>(&QSpinBox::valueChanged), this, [this](int value) {
-            if (_viewerManager) {
-                _viewerManager->setSliceStepSize(value);
-            }
-            QSettings s(vc3d::settingsFilePath(), QSettings::IniFormat);
-            s.setValue(vc3d::settings::viewer::SLICE_STEP_SIZE, value);
-            emit sliceStepSizeChanged(value);
-        });
+}
+
+void ViewerControlsPanel::connectViewerManagerSignals()
+{
+    if (!_viewerManager) {
+        return;
     }
+    connect(_viewerManager, &ViewerManager::volumeWindowChanged,
+            this, [this](float low, float high) {
+                if (_volumeWindowWidget) {
+                    _volumeWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
+                                                         static_cast<int>(std::lround(high)));
+                }
+            });
+    connect(_viewerManager, &ViewerManager::overlayWindowChanged,
+            this, [this](float low, float high) {
+                if (_overlayWindowWidget) {
+                    _overlayWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
+                                                          static_cast<int>(std::lround(high)));
+                }
+            });
+    connect(_viewerManager, &ViewerManager::overlayVolumeAvailabilityChanged,
+            this, &ViewerControlsPanel::setOverlayWindowAvailable);
 }
 
 void ViewerControlsPanel::setupWindowRangeControls()
@@ -314,15 +205,6 @@ void ViewerControlsPanel::setupWindowRangeControls()
                 });
 
         if (_viewerManager) {
-            connect(_viewerManager, &ViewerManager::volumeWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_volumeWindowWidget) {
-                            return;
-                        }
-                        _volumeWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
-                                                             static_cast<int>(std::lround(high)));
-                    });
-
             _volumeWindowWidget->setWindowValues(
                 static_cast<int>(std::lround(_viewerManager->volumeWindowLow())),
                 static_cast<int>(std::lround(_viewerManager->volumeWindowHigh())));
@@ -349,47 +231,18 @@ void ViewerControlsPanel::setupWindowRangeControls()
                 });
 
         if (_viewerManager) {
-            connect(_viewerManager, &ViewerManager::overlayWindowChanged,
-                    this, [this](float low, float high) {
-                        if (!_overlayWindowWidget) {
-                            return;
-                        }
-                        _overlayWindowWidget->setWindowValues(static_cast<int>(std::lround(low)),
-                                                              static_cast<int>(std::lround(high)));
-                    });
-            connect(_viewerManager, &ViewerManager::overlayVolumeAvailabilityChanged,
-                    this, &ViewerControlsPanel::setOverlayWindowAvailable);
-
             _overlayWindowWidget->setWindowValues(
                 static_cast<int>(std::lround(_viewerManager->overlayWindowLow())),
                 static_cast<int>(std::lround(_viewerManager->overlayWindowHigh())));
         }
     }
+
+    connectViewerManagerSignals();
 }
 
 void ViewerControlsPanel::setupIntersectionControls()
 {
     QSettings settings(vc3d::settingsFilePath(), QSettings::IniFormat);
-
-    if (auto* spinIntersectionOpacity = _uiRefs.intersectionOpacitySpin) {
-        const int savedOpacity = settings.value(vc3d::settings::viewer::INTERSECTION_OPACITY,
-                                                spinIntersectionOpacity->value()).toInt();
-        const int boundedOpacity = std::clamp(savedOpacity,
-                                              spinIntersectionOpacity->minimum(),
-                                              spinIntersectionOpacity->maximum());
-        spinIntersectionOpacity->setValue(boundedOpacity);
-        connect(spinIntersectionOpacity, QOverload<int>::of(&QSpinBox::valueChanged),
-                this, [this](int value) {
-                    if (!_viewerManager) {
-                        return;
-                    }
-                    const float normalized = std::clamp(static_cast<float>(value) / 100.0f, 0.0f, 1.0f);
-                    _viewerManager->setIntersectionOpacity(normalized);
-                });
-        if (_viewerManager) {
-            _viewerManager->setIntersectionOpacity(spinIntersectionOpacity->value() / 100.0f);
-        }
-    }
 
     if (auto* spinIntersectionThickness = _uiRefs.intersectionThicknessSpin) {
         const double savedThickness = settings.value(vc3d::settings::viewer::INTERSECTION_THICKNESS,
@@ -409,10 +262,6 @@ void ViewerControlsPanel::setupIntersectionControls()
         if (_viewerManager) {
             _viewerManager->setIntersectionThickness(static_cast<float>(spinIntersectionThickness->value()));
         }
-    }
-
-    if (_viewerManager) {
-        _viewerManager->setSurfacePatchSamplingStride(1, false);
     }
 }
 

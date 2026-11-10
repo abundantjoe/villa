@@ -1,0 +1,80 @@
+#pragma once
+#include <vc_reader/catalog.hpp>
+#include <vc_reader/cache.hpp>
+
+#include <atomic>
+#include <cstdint>
+#include <filesystem>
+#include <functional>
+#include <optional>
+#include <string>
+#include <string_view>
+#include <vector>
+
+class VolumePkg;
+namespace vc::project { struct Entry; }
+
+namespace vc3d::opendata {
+
+struct OpenDataResourceSelection;
+
+inline constexpr int kNormalGridsDownloadWorkers = 16;
+
+// Pairing of an open-data volume with its normal-grids artifact. `url` is the
+// resolved https prefix of the artifact, or empty when the volume has none.
+struct OpenDataNormalGridsInfo {
+    std::string sampleId;
+    std::string volumeId;
+    std::string url;
+    int sourceCoordinateLevel = 0;
+    std::size_t artifactIndex = 0;  // in the volume's artifacts
+};
+
+[[nodiscard]] std::vector<OpenDataNormalGridsInfo> normalGridsArtifacts(
+    const std::string& sampleId,
+    const vcr::catalog::OpenDataVolume& volume);
+
+// The catalog normal grids a normal-grid entry caches (the URL of its remote
+// marker); nullopt for other entries.
+[[nodiscard]] std::optional<vcr::catalog::OpenDataVolumeView> normalGridsCatalogView(
+    const VolumePkg& pkg, const vc::project::Entry& entry);
+
+// Set up streaming normal grids for every volume of this sample that has a
+// normal-grids artifact. Returns the number of entries attached. selection
+// optionally restricts volumes and representations; nullptr attaches all.
+int attachOpenDataNormalGrids(VolumePkg& pkg,
+                              const vcr::catalog::OpenDataSample& sample,
+                              const std::filesystem::path& remoteCacheRoot,
+                              const OpenDataResourceSelection* selection = nullptr);
+
+// On-disk cache state of one volume's normal grids.
+struct NormalGridsCacheState {
+    bool hasArtifact = false;
+    bool complete = false;        // full download finished (completion marker)
+    std::uint64_t cachedBytes = 0;
+    std::uint64_t totalBytes = 0; // known only after a full download
+    int cachedFiles = 0;
+};
+
+[[nodiscard]] NormalGridsCacheState normalGridsCacheState(
+    const std::filesystem::path& remoteCacheRoot,
+    const std::string& sampleId,
+    const vcr::catalog::OpenDataVolume& volume);
+
+using NormalGridsDownloadProgress = vcr::cache::DownloadProgress;
+using NormalGridsProgressCallback = vcr::cache::DownloadCallback;
+
+// List the artifact's prefix and fetch every object with `workers` threads through
+// vc_reader's file cache into the volume's normal-grid cache directory, under the
+// root's byte limit and free-space floor. Files already there are kept, so a
+// cancelled or failed download resumes. Returns the cache dir, or an empty path on
+// failure/cancellation (errorOut explains why).
+[[nodiscard]] std::filesystem::path downloadOpenDataNormalGrids(
+    const OpenDataNormalGridsInfo& info,
+    const std::filesystem::path& remoteCacheRoot,
+    int workers = kNormalGridsDownloadWorkers,
+    const NormalGridsProgressCallback& progress = {},
+    const std::atomic<bool>* cancelRequested = nullptr,
+    std::string* errorOut = nullptr);
+
+} // namespace vc3d::opendata

@@ -41,6 +41,7 @@ struct MaxflowManifestBuildOptions {
     std::vector<MaxflowDouble3> sinksBase;
     int64_t marginBaseVoxels = 1000;
     uint8_t threshold = 110;
+    double workingToBaseScale = 1.0;
 };
 
 enum class MaxflowNodeKind : uint8_t {
@@ -89,7 +90,6 @@ struct MaxflowTerminal {
 struct MaxflowPredDtVolume {
     std::filesystem::path zarrPath;
     std::array<size_t, 3> shapeZYX{0, 0, 0};
-    std::array<size_t, 3> chunksZYX{0, 0, 0};
     double spacingBase = 1.0;
     MaxflowBox3 cropBaseXYZ;
     MaxflowBox3 cropPredXYZ;

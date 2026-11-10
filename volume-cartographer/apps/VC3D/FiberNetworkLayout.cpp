@@ -1,0 +1,2572 @@
+#include "FiberNetworkLayout.hpp"
+
+#include <QDebug>
+
+#include <chrono>
+#include <deque>
+#include <initializer_list>
+
+#include <algorithm>
+#include <cmath>
+#include <cstddef>
+#include <functional>
+#include <limits>
+#include <map>
+#include <queue>
+#include <set>
+#include <tuple>
+#include <unordered_map>
+#include <utility>
+
+namespace vc3d::fiber_map
+{
+
+namespace
+{
+
+constexpr double kTwoPi = 2.0 * M_PI;
+// Fraction of a network's own extent taken as padding; the LayoutParams pads are
+// the floor under it. Dimensionless, so no unit to get wrong.
+constexpr double kPadFraction = 0.05;
+
+// Whole-turn rounding with the ties-to-even behaviour of Python's round().
+double roundTurns(double turns)
+{
+    return std::nearbyint(turns);
+}
+
+double median(std::vector<double> values)
+{
+    if (values.empty()) {
+        return 0.0;
+    }
+    std::sort(values.begin(), values.end());
+    const std::size_t middle = values.size() / 2;
+    if (values.size() % 2 == 1) {
+        return values[middle];
+    }
+    return 0.5 * (values[middle - 1] + values[middle]);
+}
+
+// np.interp: linear interpolation with clamped ends.
+double interpolate(double query, const std::vector<double>& xs,
+                   const std::vector<double>& ys)
+{
+    if (xs.empty()) {
+        return 0.0;
+    }
+    if (query <= xs.front()) {
+        return ys.front();
+    }
+    if (query >= xs.back()) {
+        return ys.back();
+    }
+    const auto upper = std::upper_bound(xs.begin(), xs.end(), query);
+    const std::size_t hi = static_cast<std::size_t>(upper - xs.begin());
+    const std::size_t lo = hi - 1;
+    const double span = xs[hi] - xs[lo];
+    if (span <= 0.0) {
+        return ys[lo];
+    }
+    return ys[lo] + (query - xs[lo]) / span * (ys[hi] - ys[lo]);
+}
+
+// np.unwrap: shift each successive delta into (-pi, pi].
+std::vector<double> unwrapAngles(const std::vector<double>& raw)
+{
+    std::vector<double> out(raw.size());
+    if (raw.empty()) {
+        return out;
+    }
+    out[0] = raw[0];
+    for (std::size_t i = 1; i < raw.size(); ++i) {
+        const double delta = raw[i] - raw[i - 1];
+        double wrapped = std::fmod(delta + M_PI, kTwoPi);
+        if (wrapped < 0.0) {
+            wrapped += kTwoPi;
+        }
+        wrapped -= M_PI;
+        if (wrapped == -M_PI && delta > 0.0) {
+            wrapped = M_PI;
+        }
+        out[i] = out[i - 1] + wrapped;
+    }
+    return out;
+}
+
+std::vector<double> arclengths(const std::vector<QPointF>& points)
+{
+    std::vector<double> s(points.size(), 0.0);
+    for (std::size_t i = 1; i < points.size(); ++i) {
+        const double dx = points[i].x() - points[i - 1].x();
+        const double dy = points[i].y() - points[i - 1].y();
+        s[i] = s[i - 1] + std::sqrt(dx * dx + dy * dy);
+    }
+    return s;
+}
+
+// Resample a polyline at uniform arclength and Gaussian-smooth it. The line
+// points wander around the fiber's true run (placement noise plus interpolated
+// stretches); smoothing in arclength keeps the low-frequency shape and is
+// independent of the very uneven raw point spacing. Returns the arclength grid
+// alongside the smoothed points so positions at any raw arclength can be read
+// back and land exactly on the drawn curve.
+// sRaw is the caller's arclengths(points): one array parameterises the
+// resampling, the control read-back and the inversion back to line points.
+void smoothPolyline(const std::vector<QPointF>& points, const std::vector<double>& sRaw,
+                    double sigma, double step,
+                    std::vector<double>& sOut, std::vector<QPointF>& qOut)
+{
+    const double total = sRaw.empty() ? 0.0 : sRaw.back();
+    // The unsmoothed fallback also covers parameters that cannot be resampled
+    // sanely: non-finite lengths, and steps so small the sample count would
+    // not fit an int (a public parameter must not be able to reach the
+    // undefined float-to-int conversion or an absurd allocation).
+    constexpr double kMaxSamples = 16.0 * 1024.0 * 1024.0;
+    if (!(total >= 2.0 * step) || points.size() < 3 ||
+        !std::isfinite(total) || !std::isfinite(sigma) ||
+        total / step > kMaxSamples) {
+        sOut = sRaw;
+        qOut = points;
+        return;
+    }
+
+    const int count = static_cast<int>(std::ceil(total / step + 0.5));
+    sOut.resize(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        sOut[static_cast<std::size_t>(i)] = static_cast<double>(i) * step;
+    }
+    sOut.back() = total;
+
+    std::vector<double> xs(points.size());
+    std::vector<double> ys(points.size());
+    for (std::size_t i = 0; i < points.size(); ++i) {
+        xs[i] = points[i].x();
+        ys[i] = points[i].y();
+    }
+    qOut.resize(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        const double s = sOut[static_cast<std::size_t>(i)];
+        qOut[static_cast<std::size_t>(i)] =
+            QPointF(interpolate(s, sRaw, xs), interpolate(s, sRaw, ys));
+    }
+    if (sigma <= 0.0) {
+        return;
+    }
+
+    const int radius = std::clamp(
+        static_cast<int>(std::nearbyint(std::min(3.0 * sigma / step, 4096.0))),
+        1, 4096);
+    std::vector<double> kernel(static_cast<std::size_t>(2 * radius + 1));
+    double kernelSum = 0.0;
+    for (int i = -radius; i <= radius; ++i) {
+        const double t = static_cast<double>(i) * step / sigma;
+        const double weight = std::exp(-0.5 * t * t);
+        kernel[static_cast<std::size_t>(i + radius)] = weight;
+        kernelSum += weight;
+    }
+    for (double& weight : kernel) {
+        weight /= kernelSum;
+    }
+
+    // Reflect-pad so the ends do not shrink toward the interior. The mirror
+    // index is clamped for curves shorter than the kernel radius.
+    const int last = count - 1;
+    const auto padded = [&](int index) {
+        if (index < 0) {
+            const int mirror = std::min(-index, last);
+            return QPointF(2.0 * qOut[0].x() - qOut[static_cast<std::size_t>(mirror)].x(),
+                           2.0 * qOut[0].y() - qOut[static_cast<std::size_t>(mirror)].y());
+        }
+        if (index > last) {
+            const int mirror = std::max(last - (index - last), 0);
+            return QPointF(2.0 * qOut[static_cast<std::size_t>(last)].x() -
+                               qOut[static_cast<std::size_t>(mirror)].x(),
+                           2.0 * qOut[static_cast<std::size_t>(last)].y() -
+                               qOut[static_cast<std::size_t>(mirror)].y());
+        }
+        return qOut[static_cast<std::size_t>(index)];
+    };
+    std::vector<QPointF> smoothed(static_cast<std::size_t>(count));
+    for (int i = 0; i < count; ++i) {
+        double x = 0.0;
+        double y = 0.0;
+        for (int d = -radius; d <= radius; ++d) {
+            const QPointF point = padded(i + d);
+            const double weight = kernel[static_cast<std::size_t>(d + radius)];
+            x += weight * point.x();
+            y += weight * point.y();
+        }
+        smoothed[static_cast<std::size_t>(i)] = QPointF(x, y);
+    }
+    qOut = std::move(smoothed);
+}
+
+std::size_t searchSortedLeft(const std::vector<double>& values, double query)
+{
+    return static_cast<std::size_t>(
+        std::lower_bound(values.begin(), values.end(), query) - values.begin());
+}
+
+std::size_t searchSortedRight(const std::vector<double>& values, double query)
+{
+    return static_cast<std::size_t>(
+        std::upper_bound(values.begin(), values.end(), query) - values.begin());
+}
+
+// The umbilicus as three z-sorted interpolation tables.
+struct UmbilicusInterp {
+    std::vector<double> z;
+    std::vector<double> x;
+    std::vector<double> y;
+};
+
+UmbilicusInterp interpolateUmbilicus(const std::vector<cv::Vec3f>& umbilicusCenters)
+{
+    std::vector<cv::Vec3f> centers = umbilicusCenters;
+    std::stable_sort(centers.begin(), centers.end(),
+                     [](const cv::Vec3f& a, const cv::Vec3f& b) { return a[2] < b[2]; });
+    UmbilicusInterp interp;
+    interp.z.resize(centers.size());
+    interp.x.resize(centers.size());
+    interp.y.resize(centers.size());
+    for (std::size_t i = 0; i < centers.size(); ++i) {
+        interp.z[i] = centers[i][2];
+        interp.x[i] = centers[i][0];
+        interp.y[i] = centers[i][1];
+    }
+    return interp;
+}
+
+// Fiber-local unwrapped theta of every line point about the z-interpolated
+// umbilicus: the one definition prepareFiber and unrolledLineArclengths share.
+std::vector<double> unwrappedThetaLine(const std::vector<cv::Vec3d>& linePoints,
+                                       const UmbilicusInterp& umbilicus,
+                                       std::vector<double>* radiusOut)
+{
+    std::vector<double> raw(linePoints.size());
+    if (radiusOut) {
+        radiusOut->resize(linePoints.size());
+    }
+    for (std::size_t i = 0; i < linePoints.size(); ++i) {
+        const cv::Vec3d& point = linePoints[i];
+        const double dx = point[0] - interpolate(point[2], umbilicus.z, umbilicus.x);
+        const double dy = point[1] - interpolate(point[2], umbilicus.z, umbilicus.y);
+        raw[i] = std::atan2(dy, dx);
+        if (radiusOut) {
+            (*radiusOut)[i] = std::sqrt(dx * dx + dy * dy);
+        }
+    }
+    return unwrapAngles(raw);
+}
+
+// The drawn plane: x = (thetaScale * theta + offsetRad) * rRef, y = z.
+std::vector<QPointF> unrollLinePoints(const std::vector<double>& thetaLine,
+                                      const std::vector<cv::Vec3d>& linePoints,
+                                      double thetaScale, double offsetRad, double rRefVx)
+{
+    std::vector<QPointF> unrolled(linePoints.size());
+    for (std::size_t i = 0; i < linePoints.size(); ++i) {
+        unrolled[i] = QPointF((thetaScale * thetaLine[i] + offsetRad) * rRefVx,
+                              linePoints[i][2]);
+    }
+    return unrolled;
+}
+
+// A fiber unrolled about the umbilicus; angles are fiber-local until the
+// whole-turn offset is applied.
+struct PreparedFiber {
+    const InputFiber* input = nullptr;
+    std::vector<double> thetaLine;
+    std::vector<double> radius;
+    std::vector<std::size_t> controlLineIndex;
+    double offset = 0.0;
+
+    double thetaAt(int controlIndex) const
+    {
+        return thetaLine[controlLineIndex[static_cast<std::size_t>(controlIndex)]];
+    }
+    double placedThetaAt(int controlIndex) const
+    {
+        return thetaAt(controlIndex) + offset;
+    }
+};
+
+PreparedFiber prepareFiber(const InputFiber& fiber, const UmbilicusInterp& umbilicus)
+{
+    PreparedFiber entry;
+    entry.input = &fiber;
+    entry.thetaLine = unwrappedThetaLine(fiber.linePoints, umbilicus, &entry.radius);
+    entry.controlLineIndex.resize(fiber.controlPoints.size());
+    for (std::size_t i = 0; i < fiber.controlPoints.size(); ++i) {
+        double best = std::numeric_limits<double>::infinity();
+        std::size_t bestIndex = 0;
+        for (std::size_t j = 0; j < fiber.linePoints.size(); ++j) {
+            const cv::Vec3d delta = fiber.linePoints[j] - fiber.controlPoints[i];
+            const double distance = delta.dot(delta);
+            if (distance < best) {
+                best = distance;
+                bestIndex = j;
+            }
+        }
+        entry.controlLineIndex[i] = bestIndex;
+    }
+    return entry;
+}
+
+struct LinkRecord {
+    std::size_t a = 0;
+    int ia = -1;
+    std::size_t b = 0;
+    int ib = -1;
+    double turnErr = 0.0;
+    bool pending = false;
+    bool adjacent = false;
+    // Any ref of the deduped pair said adjacent / said explicitly ordinary;
+    // both at once is a disagreement between the two files.
+    bool anyAdjacent = false;
+    bool anyExplicitOrdinary = false;
+    // Any ref said automatic; kept under `pending && !adjacent`.
+    bool autoLink = false;
+    bool disagrees() const { return anyAdjacent && anyExplicitOrdinary; }
+};
+
+// The winding gap an adjacent link asserts between its two fibers, W_b - W_a:
+// the V fiber sits one winding inside the H fiber. Anything but an H-V pair
+// has no defined inside (0; see adjacentUnpaired).
+int adjacentWindingOffset(bool adjacent, char hvTagA, char hvTagB)
+{
+    if (!adjacent) {
+        return 0;
+    }
+    if (hvTagA == 'H' && hvTagB == 'V') {
+        return -1;
+    }
+    if (hvTagA == 'V' && hvTagB == 'H') {
+        return 1;
+    }
+    return 0;
+}
+
+// An adjacent link whose fibers are not one H and one V: an annotation
+// error (a tag changed, or a fiber is not classified yet), flagged on the
+// map and kept out of the solve.
+bool adjacentUnpaired(bool adjacent, char hvTagA, char hvTagB)
+{
+    return adjacent && adjacentWindingOffset(true, hvTagA, hvTagB) == 0;
+}
+
+struct HeapEntry {
+    double frac = 0.0;
+    std::size_t link = 0;
+    std::size_t from = 0;
+    std::size_t to = 0;
+    double offset = 0.0;
+
+    bool operator>(const HeapEntry& other) const
+    {
+        if (frac != other.frac) {
+            return frac > other.frac;
+        }
+        return link > other.link;
+    }
+};
+
+struct FiberGeometry {
+    std::vector<double> sampleArclength;
+    std::vector<QPointF> samples;
+    std::vector<double> controlArclength;
+    std::vector<QPointF> controlPoints;
+    double thetaScale = 1.0;
+    double offsetRad = 0.0;
+    std::vector<cv::Vec3d> worldSamples;
+};
+
+struct NetworkDraft {
+    int networkIndex = 0;
+    double rRefVx = 0.0;
+    std::vector<PlacedFiber> fibers;
+    std::vector<PlacedLink> links;
+    double loXVx = 0.0;
+    double hiXVx = 0.0;
+    double loYVx = 0.0;
+    double hiYVx = 0.0;
+};
+
+// Fibers without geometry cannot be unrolled, so they take no part in the
+// link graph either; both entry points share one notion of "placeable" and
+// one deterministic order.
+std::vector<const InputFiber*> orderPlaceableFibers(const std::vector<InputFiber>& fibers)
+{
+    std::vector<const InputFiber*> ordered;
+    ordered.reserve(fibers.size());
+    for (const InputFiber& fiber : fibers) {
+        if (!fiber.controlPoints.empty() && !fiber.linePoints.empty()) {
+            ordered.push_back(&fiber);
+        }
+    }
+    // fileName before runtime id: ids are reassigned on every package load,
+    // so with equal labels they are not a stable tie-break, and the fiber
+    // order feeds constraint ordering and therefore repair tie-breaking.
+    // fileName makes the order a pure function of the stored content.
+    std::sort(ordered.begin(), ordered.end(),
+              [](const InputFiber* a, const InputFiber* b) {
+                  if (a->label != b->label) {
+                      return a->label < b->label;
+                  }
+                  if (a->fileName != b->fileName) {
+                      return a->fileName < b->fileName;
+                  }
+                  return a->id < b->id;
+              });
+    return ordered;
+}
+
+// Links validated and deduped once, over every placeable fiber. Deduped by
+// their sorted endpoint pair: the reciprocal ref of an already-seen crossing
+// is the same physical link, and a half-updated reciprocal pair still reads
+// as pending. Validation matters beyond placement: a link naming a control
+// point that does not exist cannot position anything, but joining on it
+// anyway pulled an otherwise unconnected fiber into the component - it then
+// counted towards minFibers, skewed the network's median radius, and was
+// drawn at its default zero turn offset as though it were linked to
+// something.
+std::vector<LinkRecord> collectValidLinks(
+    const std::vector<const InputFiber*>& ordered,
+    const std::unordered_map<uint64_t, std::size_t>& indexById)
+{
+    std::vector<LinkRecord> links;
+    std::map<std::pair<std::pair<std::size_t, int>, std::pair<std::size_t, int>>,
+             std::size_t>
+        seen;
+    for (std::size_t member = 0; member < ordered.size(); ++member) {
+        const InputFiber& fiber = *ordered[member];
+        const int controlCount = static_cast<int>(fiber.controlPoints.size());
+        for (const InputLink& link : fiber.links) {
+            const auto target = indexById.find(link.branchFiberId);
+            if (target == indexById.end()) {
+                continue;
+            }
+            const std::size_t other = target->second;
+            const int otherCount =
+                static_cast<int>(ordered[other]->controlPoints.size());
+            const int ia = link.controlPointIndex;
+            const int ib = link.branchControlPointIndex;
+            if (ia < 0 || ia >= controlCount || ib < 0 || ib >= otherCount) {
+                qWarning() << "fiber map: link" << fiber.label << ia << "->"
+                           << ordered[other]->label << ib << "out of range; skipped";
+                continue;
+            }
+            const std::pair<std::size_t, int> here{member, ia};
+            const std::pair<std::size_t, int> there{other, ib};
+            const auto inserted =
+                seen.emplace(here < there ? std::make_pair(here, there)
+                                          : std::make_pair(there, here),
+                             links.size());
+            const bool explicitOrdinary = !link.adjacent;
+            if (!inserted.second) {
+                LinkRecord& seen = links[inserted.first->second];
+                // Automatic only if every pending contributor is automatic:
+                // a human pending ref outranks (the controller's dedup and
+                // the markers decide the same way).
+                const bool thisAuto = link.autoLink && link.pending && !link.adjacent;
+                const bool humanPending = (seen.pending && !seen.autoLink) ||
+                                          (link.pending && !thisAuto);
+                seen.pending |= link.pending;
+                seen.adjacent |= link.adjacent;
+                seen.anyAdjacent |= link.adjacent;
+                seen.anyExplicitOrdinary |= explicitOrdinary;
+                seen.autoLink = seen.pending && !humanPending && (seen.autoLink || thisAuto) &&
+                                !seen.adjacent;
+                continue;
+            }
+            links.push_back(LinkRecord{member, ia, other, ib, 0.0, link.pending, link.adjacent,
+                                       link.adjacent, explicitOrdinary,
+                                       link.autoLink && link.pending && !link.adjacent});
+        }
+    }
+    std::sort(links.begin(), links.end(),
+              [](const LinkRecord& a, const LinkRecord& b) {
+                  return std::tie(a.a, a.ia, a.b, a.ib) <
+                         std::tie(b.a, b.ia, b.b, b.ib);
+              });
+    return links;
+}
+
+// Snap each fiber's whole-turn offset to its neighbours, growing the link
+// tree Prim-style from the best-agreeing link so one wrong-winding link
+// cannot decide a fiber's offset when a clean link to the same fiber exists.
+// Writes the offsets into `prepared` and each link's residual turn error into
+// `links`.
+void snapComponentOffsets(const std::vector<std::size_t>& component,
+                          std::vector<LinkRecord>& links,
+                          std::unordered_map<std::size_t, PreparedFiber>& prepared)
+{
+    std::unordered_map<std::size_t, std::vector<std::pair<std::size_t, std::size_t>>> adjacency;
+    adjacency.reserve(component.size());
+    for (std::size_t li = 0; li < links.size(); ++li) {
+        adjacency[links[li].a].emplace_back(links[li].b, li);
+        adjacency[links[li].b].emplace_back(links[li].a, li);
+    }
+    std::size_t root = component.front();
+    std::size_t rootDegree = 0;
+    for (const std::size_t member : component) {
+        const auto entry = adjacency.find(member);
+        const std::size_t degree = entry == adjacency.end() ? 0 : entry->second.size();
+        if (degree >= rootDegree) {
+            rootDegree = degree;
+            root = member;
+        }
+    }
+    std::set<std::size_t> placed{root};
+    std::priority_queue<HeapEntry, std::vector<HeapEntry>, std::greater<HeapEntry>> heap;
+    const auto pushEdges = [&](std::size_t from) {
+        const auto entry = adjacency.find(from);
+        if (entry == adjacency.end()) {
+            return;
+        }
+        for (const auto& [to, li] : entry->second) {
+            if (placed.count(to) != 0) {
+                continue;
+            }
+            const LinkRecord& link = links[li];
+            const int here = link.a == from ? link.ia : link.ib;
+            const int there = link.a == from ? link.ib : link.ia;
+            const double thetaHere = prepared.at(from).placedThetaAt(here);
+            const double thetaThere = prepared.at(to).thetaAt(there);
+            const double offset =
+                roundTurns((thetaHere - thetaThere) / kTwoPi) * kTwoPi;
+            const double frac =
+                std::fabs(thetaHere - (thetaThere + offset)) / kTwoPi;
+            heap.push(HeapEntry{frac, li, from, to, offset});
+        }
+    };
+    pushEdges(root);
+    while (!heap.empty()) {
+        const HeapEntry entry = heap.top();
+        heap.pop();
+        if (placed.count(entry.to) != 0) {
+            continue;
+        }
+        prepared.at(entry.to).offset = entry.offset;
+        placed.insert(entry.to);
+        pushEdges(entry.to);
+    }
+
+    for (LinkRecord& link : links) {
+        const double thetaA = prepared.at(link.a).placedThetaAt(link.ia);
+        const double thetaB = prepared.at(link.b).placedThetaAt(link.ib);
+        link.turnErr = std::fabs(thetaA - thetaB) / kTwoPi;
+    }
+}
+
+// The point of a polyline nearest to `point`; `point` itself when the
+// polyline is empty, its single vertex when it has one.
+QPointF nearestPointOnPolyline(const std::vector<QPointF>& polyline, const QPointF& point)
+{
+    if (polyline.empty()) {
+        return point;
+    }
+    QPointF best = polyline.front();
+    double bestDistance = std::numeric_limits<double>::infinity();
+    for (std::size_t i = 0; i + 1 < polyline.size(); ++i) {
+        const QPointF a = polyline[i];
+        const QPointF b = polyline[i + 1];
+        const QPointF ab = b - a;
+        const double length2 = QPointF::dotProduct(ab, ab);
+        double t = 0.0;
+        if (length2 > 0.0) {
+            t = std::clamp(QPointF::dotProduct(point - a, ab) / length2, 0.0, 1.0);
+        }
+        const QPointF candidate = a + t * ab;
+        const QPointF delta = point - candidate;
+        const double distance = QPointF::dotProduct(delta, delta);
+        if (distance < bestDistance) {
+            bestDistance = distance;
+            best = candidate;
+        }
+    }
+    if (polyline.size() == 1) {
+        return polyline.front();
+    }
+    return best;
+}
+
+// Unroll one fiber at x = (thetaScale * theta + offsetRad) * rRef, y = z,
+// smooth and resample it, read the control points off the smoothed curve, and
+// clip to the control span. line_points overshoot the outermost control
+// points by over a cm on many fibers; those tails carry no segment metadata
+// and are not drawn, so they are clipped out of the geometry entirely --
+// otherwise label anchors and the extents would be computed from invisible
+// curve.
+FiberGeometry buildFiberGeometry(const PreparedFiber& entry, double thetaScale,
+                                 double offsetRad, double rRefVx, double sigmaVx,
+                                 double resampleStepVx)
+{
+    const InputFiber& fiber = *entry.input;
+    const std::vector<QPointF> unrolled =
+        unrollLinePoints(entry.thetaLine, fiber.linePoints, thetaScale, offsetRad, rRefVx);
+
+    FiberGeometry geo;
+    geo.thetaScale = thetaScale;
+    geo.offsetRad = offsetRad;
+    const std::vector<double> rawArclength = arclengths(unrolled);
+    smoothPolyline(unrolled, rawArclength, sigmaVx, resampleStepVx, geo.sampleArclength,
+                   geo.samples);
+    std::vector<double> sampleX(geo.samples.size());
+    std::vector<double> sampleY(geo.samples.size());
+    for (std::size_t i = 0; i < geo.samples.size(); ++i) {
+        sampleX[i] = geo.samples[i].x();
+        sampleY[i] = geo.samples[i].y();
+    }
+    geo.controlArclength.resize(entry.controlLineIndex.size());
+    geo.controlPoints.resize(entry.controlLineIndex.size());
+    for (std::size_t i = 0; i < entry.controlLineIndex.size(); ++i) {
+        const double s = rawArclength[entry.controlLineIndex[i]];
+        geo.controlArclength[i] = s;
+        geo.controlPoints[i] =
+            QPointF(interpolate(s, geo.sampleArclength, sampleX),
+                    interpolate(s, geo.sampleArclength, sampleY));
+    }
+
+    // Extremes, not front/back: a malformed fiber whose control points map
+    // backwards along the line points must clip to a valid (possibly whole)
+    // range rather than erase past the end of a shortened vector.
+    const auto [minArc, maxArc] = std::minmax_element(
+        geo.controlArclength.begin(), geo.controlArclength.end());
+    const std::size_t begin = searchSortedLeft(geo.sampleArclength, *minArc);
+    const std::size_t end = searchSortedRight(geo.sampleArclength, *maxArc);
+    const std::size_t clipBegin = begin > 0 ? begin - 1 : 0;
+    const std::size_t clipEnd = std::min(geo.samples.size(), end + 1);
+    geo.sampleArclength.erase(geo.sampleArclength.begin() +
+                                  static_cast<std::ptrdiff_t>(clipEnd),
+                              geo.sampleArclength.end());
+    geo.sampleArclength.erase(geo.sampleArclength.begin(),
+                              geo.sampleArclength.begin() +
+                                  static_cast<std::ptrdiff_t>(clipBegin));
+    geo.samples.erase(geo.samples.begin() +
+                          static_cast<std::ptrdiff_t>(clipEnd),
+                      geo.samples.end());
+    geo.samples.erase(geo.samples.begin(),
+                      geo.samples.begin() +
+                          static_cast<std::ptrdiff_t>(clipBegin));
+    geo.worldSamples.resize(geo.samples.size());
+    std::vector<double> component(fiber.linePoints.size());
+    for (int axis = 0; axis < 3; ++axis) {
+        for (std::size_t i = 0; i < component.size(); ++i)
+            component[i] = fiber.linePoints[i][axis];
+        for (std::size_t i = 0; i < geo.worldSamples.size(); ++i)
+            geo.worldSamples[i][axis] = interpolate(geo.sampleArclength[i], rawArclength, component);
+    }
+    return geo;
+}
+
+// Traced runs draw solid, thick and vivid; segments that are only
+// interpolations draw thin, dashed and faded -- "dashed = not real trace
+// data" at a glance.
+PlacedFiber makePlacedFiber(const InputFiber& fiber, const FiberGeometry& geo)
+{
+    PlacedFiber placedFiber;
+    placedFiber.id = fiber.id;
+    placedFiber.fileName = fiber.fileName;
+    placedFiber.label = fiber.label;
+    placedFiber.hvTag = fiber.hvTag;
+    placedFiber.controlPoints = geo.controlPoints;
+    placedFiber.controlArclength = geo.controlArclength;
+    placedFiber.thetaScale = geo.thetaScale;
+    placedFiber.offsetRad = geo.offsetRad;
+    placedFiber.controlWorldPoints = fiber.controlPoints;
+    // Per-point flags are copied only when they line up with the controls; a
+    // mismatched vector is ignored rather than read misaligned.
+    const auto copyPointFlags = [&](const std::vector<bool>& flags, std::vector<bool>& out) {
+        out.assign(placedFiber.controlPoints.size(), false);
+        if (flags.size() == fiber.controlPoints.size()) {
+            for (std::size_t i = 0; i < flags.size() && i < out.size(); ++i) {
+                out[i] = flags[i];
+            }
+        }
+    };
+    copyPointFlags(fiber.kollesisTerminations, placedFiber.kollesisTerminations);
+    copyPointFlags(fiber.breaks, placedFiber.breaks);
+
+    const std::size_t spanCount =
+        fiber.controlPoints.empty() ? 0 : fiber.controlPoints.size() - 1;
+    // The two per-span styles are normalised independently: missing or
+    // mismatched traced flags read as all traced (as before), missing gap
+    // flags as no gaps.
+    const bool haveTraced = spanCount > 0 && fiber.tracedSegments.size() == spanCount;
+    std::vector<bool> traced(spanCount, true);
+    if (haveTraced) {
+        traced = fiber.tracedSegments;
+    }
+    std::vector<bool> gap(spanCount, false);
+    std::vector<bool> damaged(spanCount, false);
+    bool anyGap = false;
+    if (spanCount > 0 && fiber.gapSegments.size() == spanCount) {
+        for (std::size_t i = 0; i < spanCount; ++i) {
+            gap[i] = fiber.gapSegments[i];
+            anyGap = anyGap || gap[i];
+        }
+    }
+    if (spanCount > 0 && fiber.damagedSegments.size() == spanCount) {
+        for (std::size_t i = 0; i < spanCount; ++i) {
+            damaged[i] = fiber.damagedSegments[i] && !gap[i];
+            anyGap = anyGap || damaged[i];
+        }
+    }
+    if (!haveTraced && !anyGap) {
+        if (geo.samples.size() > 1) {
+            Run whole;
+            whole.firstControl = 0;
+            whole.lastControl = static_cast<int>(spanCount);
+            whole.points = geo.samples;
+            whole.arclengths = geo.sampleArclength;
+            whole.worldPoints = geo.worldSamples;
+            placedFiber.runs.push_back(std::move(whole));
+        }
+        return placedFiber;
+    }
+
+    // Maximal stretches of spans with the same (traced, gap) style. Every run
+    // keeps one sample past each bounding control (the same geometry as
+    // before breaks existed, so splitting a run at a gap changes which runs
+    // the samples belong to but not the drawn or seeded segments).
+    std::size_t k = 0;
+    while (k < spanCount) {
+        std::size_t j = k;
+        while (j + 1 < spanCount && traced[j + 1] == traced[k] && gap[j + 1] == gap[k] &&
+               damaged[j + 1] == damaged[k]) {
+            ++j;
+        }
+        const std::size_t begin = searchSortedLeft(
+            geo.sampleArclength, geo.controlArclength[k]);
+        const std::size_t end = searchSortedRight(
+            geo.sampleArclength, geo.controlArclength[j + 1]);
+        const std::size_t from = begin > 0 ? begin - 1 : 0;
+        const std::size_t to = std::min(geo.samples.size(), end + 1);
+        if (to > from + 1) {
+            Run run;
+            run.traced = traced[k];
+            run.gap = gap[k];
+            run.damaged = damaged[k];
+            run.firstControl = static_cast<int>(k);
+            run.lastControl = static_cast<int>(j + 1);
+            run.points.assign(geo.samples.begin() + static_cast<std::ptrdiff_t>(from),
+                              geo.samples.begin() + static_cast<std::ptrdiff_t>(to));
+            run.arclengths.assign(
+                geo.sampleArclength.begin() + static_cast<std::ptrdiff_t>(from),
+                geo.sampleArclength.begin() + static_cast<std::ptrdiff_t>(to));
+            run.worldPoints.assign(geo.worldSamples.begin() + static_cast<std::ptrdiff_t>(from),
+                                   geo.worldSamples.begin() + static_cast<std::ptrdiff_t>(to));
+            placedFiber.runs.push_back(std::move(run));
+        }
+        k = j + 1;
+    }
+    return placedFiber;
+}
+
+
+// --- Content hashing: two independent FNV-1a lanes over raw bytes (IEEE-754
+// doubles hashed by bit pattern, strings length-prefixed, field order fixed).
+void hashBytes(ContentDigest& digest, const void* data, std::size_t size)
+{
+    const auto* bytes = static_cast<const unsigned char*>(data);
+    constexpr uint64_t kPrimeA = 1099511628211ULL;
+    constexpr uint64_t kPrimeB = 0x100000001b3ULL ^ 0x9e3779b97f4a7c15ULL;
+    uint64_t a = digest.a;
+    uint64_t b = digest.b;
+    for (std::size_t i = 0; i < size; ++i) {
+        a = (a ^ bytes[i]) * kPrimeA;
+        b = (b ^ bytes[i]) * (kPrimeB | 1ULL);
+    }
+    digest.a = a;
+    digest.b = b;
+}
+
+void hashU64(ContentDigest& digest, uint64_t value)
+{
+    hashBytes(digest, &value, sizeof(value));
+}
+
+void hashDouble(ContentDigest& digest, double value)
+{
+    hashBytes(digest, &value, sizeof(value));
+}
+
+void hashString(ContentDigest& digest, const std::string& value)
+{
+    hashU64(digest, value.size());
+    hashBytes(digest, value.data(), value.size());
+}
+
+void hashVec3(ContentDigest& digest, const cv::Vec3d& value)
+{
+    hashDouble(digest, value[0]);
+    hashDouble(digest, value[1]);
+    hashDouble(digest, value[2]);
+}
+
+ContentDigest seededDigest(uint64_t seed)
+{
+    ContentDigest digest{14695981039346656037ULL, 0xcbf29ce484222325ULL};
+    hashU64(digest, seed);
+    return digest;
+}
+
+// The geometry-relevant fiber content: what prep and detection consume.
+// Links are deliberately excluded - no cached artifact reads them.
+ContentDigest fiberContentDigest(const InputFiber& fiber)
+{
+    ContentDigest digest = seededDigest(0xF1BE1);
+    hashString(digest, fiber.fileName);
+    hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
+    hashU64(digest, fiber.controlPoints.size());
+    for (const cv::Vec3d& point : fiber.controlPoints) {
+        hashVec3(digest, point);
+    }
+    hashU64(digest, fiber.linePoints.size());
+    for (const cv::Vec3d& point : fiber.linePoints) {
+        hashVec3(digest, point);
+    }
+    hashU64(digest, fiber.tracedSegments.size());
+    for (const bool traced : fiber.tracedSegments) {
+        hashU64(digest, traced ? 1 : 0);
+    }
+    return digest;
+}
+
+ContentDigest umbilicusDigest(const UmbilicusInterp& umbilicus)
+{
+    ContentDigest digest = seededDigest(0x0B111);
+    hashU64(digest, umbilicus.z.size());
+    for (std::size_t i = 0; i < umbilicus.z.size(); ++i) {
+        hashDouble(digest, umbilicus.z[i]);
+        hashDouble(digest, umbilicus.x[i]);
+        hashDouble(digest, umbilicus.y[i]);
+    }
+    return digest;
+}
+
+// Every solver parameter detection consumes, as the effective values.
+ContentDigest detectionParamsDigest(const winding::SolverParams& params)
+{
+    ContentDigest digest = seededDigest(0xDE7EC);
+    hashDouble(digest, params.tieBandVx);
+    hashDouble(digest, params.minUmbilicusRadiusVx);
+    hashDouble(digest, params.maxStepTurns);
+    hashDouble(digest, params.minTransversality);
+    hashDouble(digest, params.zMergeVx);
+    hashDouble(digest, params.untrustedConfidenceFactor);
+    hashDouble(digest, params.endpointClearanceTurns);
+    // Detection format version: events, orientation and traversal groups.
+    hashU64(digest, 2);
+    return digest;
+}
+
+ContentDigest combineDigests(uint64_t seed,
+                             std::initializer_list<ContentDigest> parts)
+{
+    ContentDigest digest = seededDigest(seed);
+    for (const ContentDigest& part : parts) {
+        hashU64(digest, part.a);
+        hashU64(digest, part.b);
+    }
+    return digest;
+}
+
+} // namespace
+
+template<typename Point>
+static std::vector<Point> trimDisplayRun(const PlacedFiber& fiber, std::size_t runIndex,
+                                         std::vector<Point> points,
+                                         const std::vector<Point>& controls)
+{
+    if (runIndex >= fiber.runs.size()) {
+        return {};
+    }
+    const Run& run = fiber.runs[runIndex];
+    if (points.size() < 2) {
+        return points;
+    }
+    const auto control = [&controls](int index) -> const Point* {
+        return index >= 0 && static_cast<std::size_t>(index) < controls.size()
+            ? &controls[static_cast<std::size_t>(index)]
+            : nullptr;
+    };
+    // The overlap is exactly one sample at each end: the sample before the
+    // first control's arclength and the one after the last control's. A run
+    // starting at the fiber's first sample (or ending at its last) has no
+    // overlap there, and the control sits on that sample, so the replacement
+    // is a no-op.
+    // Gap and damaged runs are "styled" runs: they and their neighbours meet
+    // exactly at the shared control so no ordinary stroke shows under the
+    // first dashes and no dashes run past the span.
+    const auto styled = [](const Run& other) { return other.gap || other.damaged; };
+    const bool previousStyled = runIndex > 0 && styled(fiber.runs[runIndex - 1]);
+    const bool nextStyled = runIndex + 1 < fiber.runs.size() && styled(fiber.runs[runIndex + 1]);
+    if (styled(run) || previousStyled) {
+        if (const Point* first = control(run.firstControl)) {
+            points.front() = *first;
+        }
+    }
+    if (styled(run) || nextStyled) {
+        if (const Point* last = control(run.lastControl)) {
+            points.back() = *last;
+        }
+    }
+    return points;
+}
+
+std::vector<QPointF> displayRunPoints(const PlacedFiber& fiber, std::size_t runIndex)
+{
+    if (runIndex >= fiber.runs.size()) return {};
+    return trimDisplayRun(fiber, runIndex, fiber.runs[runIndex].points, fiber.controlPoints);
+}
+
+std::vector<cv::Vec3d> displayRunWorldPoints(const PlacedFiber& fiber, std::size_t runIndex)
+{
+    if (runIndex >= fiber.runs.size()) return {};
+    return trimDisplayRun(fiber, runIndex, fiber.runs[runIndex].worldPoints, fiber.controlWorldPoints);
+}
+
+std::vector<const winding::PairDetections*> GlobalLayoutCache::cachedDetections() const
+{
+    std::vector<const winding::PairDetections*> shards;
+    shards.reserve(_pairs.size());
+    for (const auto& entry : _pairs) {
+        shards.push_back(&entry.second.detection);
+    }
+    return shards;
+}
+
+void GlobalLayoutCache::clear()
+{
+    _prep.clear();
+    _pairs.clear();
+    _stats = Stats{};
+}
+
+Result buildLayout(const std::vector<InputFiber>& fibers,
+                   const std::vector<cv::Vec3f>& umbilicusCenters,
+                   const LayoutParams& params)
+{
+    Result result;
+    if (umbilicusCenters.empty()) {
+        return result;
+    }
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+
+    const std::vector<const InputFiber*> ordered = orderPlaceableFibers(fibers);
+    const std::size_t fiberCount = ordered.size();
+    if (fiberCount == 0) {
+        return result;
+    }
+
+    std::unordered_map<uint64_t, std::size_t> indexById;
+    indexById.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        indexById.emplace(ordered[i]->id, i);
+    }
+
+    const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
+
+    std::vector<std::size_t> parent(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        parent[i] = i;
+    }
+    const auto findRoot = [&parent](std::size_t index) {
+        while (parent[index] != index) {
+            parent[index] = parent[parent[index]];
+            index = parent[index];
+        }
+        return index;
+    };
+    for (const LinkRecord& link : allLinks) {
+        const std::size_t a = findRoot(link.a);
+        const std::size_t b = findRoot(link.b);
+        if (a != b) {
+            parent[a] = b;
+        }
+    }
+    std::unordered_map<std::size_t, std::vector<std::size_t>> componentsByRoot;
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        componentsByRoot[findRoot(i)].push_back(i);
+    }
+    std::vector<std::vector<std::size_t>> components;
+    components.reserve(componentsByRoot.size());
+    for (auto& entry : componentsByRoot) {
+        components.push_back(std::move(entry.second));
+    }
+    for (auto& component : components) {
+        std::sort(component.begin(), component.end());
+    }
+    std::sort(components.begin(), components.end(),
+              [](const std::vector<std::size_t>& a, const std::vector<std::size_t>& b) {
+                  if (a.size() != b.size()) {
+                      return a.size() > b.size();
+                  }
+                  return a.front() < b.front();
+              });
+
+    // Voxels throughout: line points, radii and every tuning length arrive in
+    // the same unit, so there is nothing to convert.
+    const double sigmaVx = std::max(0.0, params.smoothVx);
+    // A step of zero would resample forever, so it falls back to the documented
+    // default rather than to a literal repeated from the header.
+    const double resampleStepVx = params.resampleStepVx > 0.0
+        ? params.resampleStepVx
+        : LayoutParams{}.resampleStepVx;
+    const int minFibers = std::max(1, params.minFibers);
+
+    std::vector<NetworkDraft> drafts;
+    int networkIndex = -1;
+    for (const std::vector<std::size_t>& component : components) {
+        if (component.size() < static_cast<std::size_t>(minFibers)) {
+            continue;
+        }
+        ++networkIndex;
+        ++result.qualifyingNetworkCount;
+        if (static_cast<int>(drafts.size()) >= std::max(0, params.maxNetworks)) {
+            continue;
+        }
+
+        std::unordered_map<std::size_t, PreparedFiber> prepared;
+        prepared.reserve(component.size());
+        for (const std::size_t member : component) {
+            prepared.emplace(member, prepareFiber(*ordered[member], umbilicus));
+        }
+
+        // This component's slice of the validated links; both endpoints are
+        // members by construction (links are what defined the components).
+        const std::size_t componentRoot = findRoot(component.front());
+        std::vector<LinkRecord> links;
+        for (const LinkRecord& link : allLinks) {
+            if (findRoot(link.a) == componentRoot) {
+                links.push_back(link);
+            }
+        }
+        if (links.empty()) {
+            continue;
+        }
+
+        snapComponentOffsets(component, links, prepared);
+
+        // Centre the component on a whole turn so the winding numbers stay
+        // small, and take the reference radius from the crossings.
+        std::vector<double> controlThetas;
+        std::vector<double> controlRadii;
+        for (const std::size_t member : component) {
+            const PreparedFiber& entry = prepared.at(member);
+            for (std::size_t i = 0; i < entry.controlLineIndex.size(); ++i) {
+                controlThetas.push_back(entry.thetaLine[entry.controlLineIndex[i]] +
+                                        entry.offset);
+                controlRadii.push_back(entry.radius[entry.controlLineIndex[i]]);
+            }
+        }
+        const double shiftTurns = roundTurns(median(controlThetas) / kTwoPi) * kTwoPi;
+        for (const std::size_t member : component) {
+            prepared.at(member).offset -= shiftTurns;
+        }
+        const double rRefVx = median(controlRadii);
+
+        NetworkDraft draft;
+        draft.networkIndex = networkIndex;
+        draft.rRefVx = rRefVx;
+        draft.loXVx = std::numeric_limits<double>::infinity();
+        draft.hiXVx = -std::numeric_limits<double>::infinity();
+        draft.loYVx = std::numeric_limits<double>::infinity();
+        draft.hiYVx = -std::numeric_limits<double>::infinity();
+
+        std::unordered_map<std::size_t, FiberGeometry> geometry;
+        geometry.reserve(component.size());
+        for (const std::size_t member : component) {
+            const PreparedFiber& entry = prepared.at(member);
+            FiberGeometry geo = buildFiberGeometry(entry, 1.0, entry.offset,
+                                                   rRefVx, sigmaVx, resampleStepVx);
+            for (const QPointF& point : geo.samples) {
+                draft.loXVx = std::min(draft.loXVx, point.x());
+                draft.hiXVx = std::max(draft.hiXVx, point.x());
+                draft.loYVx = std::min(draft.loYVx, point.y());
+                draft.hiYVx = std::max(draft.hiYVx, point.y());
+            }
+            geometry.emplace(member, std::move(geo));
+        }
+        if (!(draft.loXVx <= draft.hiXVx) || !(draft.loYVx <= draft.hiYVx)) {
+            continue;
+        }
+
+        for (const std::size_t member : component) {
+            draft.fibers.push_back(makePlacedFiber(*prepared.at(member).input,
+                                                   geometry.at(member)));
+        }
+
+        for (const LinkRecord& link : links) {
+            PlacedLink placedLink;
+            placedLink.fiberA = ordered[link.a]->id;
+            placedLink.cpA = link.ia;
+            placedLink.fiberB = ordered[link.b]->id;
+            placedLink.cpB = link.ib;
+            placedLink.a = geometry.at(link.a)
+                               .controlPoints[static_cast<std::size_t>(link.ia)];
+            placedLink.b = geometry.at(link.b)
+                               .controlPoints[static_cast<std::size_t>(link.ib)];
+            placedLink.turnErr = link.turnErr;
+            placedLink.pending = link.pending;
+            placedLink.adjacent = link.adjacent;
+            placedLink.autoLink = link.autoLink;
+            placedLink.adjacentUnpaired = adjacentUnpaired(
+                link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
+            placedLink.adjacentDisagrees = link.disagrees();
+            placedLink.suspect = link.turnErr > params.suspectTurns ||
+                                 placedLink.adjacentUnpaired || placedLink.adjacentDisagrees;
+            if (placedLink.suspect) {
+                ++result.suspectLinkCount;
+            }
+            draft.links.push_back(std::move(placedLink));
+        }
+
+        const double padX =
+            std::max(kPadFraction * (draft.hiXVx - draft.loXVx), params.minPadXVx);
+        const double padY =
+            std::max(kPadFraction * (draft.hiYVx - draft.loYVx), params.minPadYVx);
+        draft.loXVx -= padX;
+        draft.hiXVx += padX;
+        draft.loYVx -= padY;
+        draft.hiYVx += padY;
+        drafts.push_back(std::move(draft));
+    }
+    if (drafts.empty()) {
+        return result;
+    }
+
+    // Panels ordered inner -> outer by median distance from the umbilicus.
+    // Unrolled length starts at 0 on the left and runs continuously through
+    // every panel: each next panel starts on the global tick grid, so every
+    // panel shows the same labeling interval, and the gap between networks is
+    // whatever that snap requires (at least minGapVx).
+    std::stable_sort(drafts.begin(), drafts.end(),
+                     [](const NetworkDraft& a, const NetworkDraft& b) {
+                         return a.rRefVx < b.rRefVx;
+                     });
+
+    const double tickVx = params.panelTickVx > 0.0 ? params.panelTickVx
+                                                  : LayoutParams{}.panelTickVx;
+    double panelStart = 0.0;
+    int windingNumber = 0;
+    result.yMinVx = std::numeric_limits<double>::infinity();
+    result.yMaxVx = -std::numeric_limits<double>::infinity();
+    result.networks.reserve(drafts.size());
+    for (NetworkDraft& draft : drafts) {
+        const double width = draft.hiXVx - draft.loXVx;
+        const double shift = panelStart - draft.loXVx;
+
+        PlacedNetwork network;
+        network.networkIndex = draft.networkIndex;
+        network.rRefVx = draft.rRefVx;
+        network.x0Vx = panelStart;
+        network.x1Vx = panelStart + width;
+        network.fibers = std::move(draft.fibers);
+        network.links = std::move(draft.links);
+        for (PlacedFiber& fiber : network.fibers) {
+            for (Run& run : fiber.runs) {
+                for (QPointF& point : run.points) {
+                    point.setX(point.x() + shift);
+                }
+            }
+            for (QPointF& point : fiber.controlPoints) {
+                point.setX(point.x() + shift);
+            }
+        }
+        for (PlacedLink& link : network.links) {
+            link.a.setX(link.a.x() + shift);
+            link.b.setX(link.b.x() + shift);
+        }
+
+        const double circumference = kTwoPi * draft.rRefVx;
+        if (circumference > 0.0) {
+            const long long first =
+                static_cast<long long>(std::ceil(draft.loXVx / circumference));
+            const long long lastMark =
+                static_cast<long long>(std::floor(draft.hiXVx / circumference));
+            for (long long mark = first; mark <= lastMark; ++mark) {
+                network.windings.push_back(WindingMark{
+                    static_cast<double>(mark) * circumference + shift, windingNumber});
+                ++windingNumber;
+            }
+        }
+
+        result.yMinVx = std::min(result.yMinVx, draft.loYVx);
+        result.yMaxVx = std::max(result.yMaxVx, draft.hiYVx);
+        result.widthVx = panelStart + width;
+        result.networks.push_back(std::move(network));
+        panelStart = tickVx * std::ceil((panelStart + width + params.minGapVx) / tickVx);
+    }
+    return result;
+}
+
+GlobalResult buildGlobalLayout(const std::vector<InputFiber>& fibers,
+                               const std::vector<cv::Vec3f>& umbilicusCenters,
+                               const GlobalLayoutParams& params,
+                               GlobalLayoutCache* cache)
+{
+    if (params.solver.chiralityOverride == 0) {
+        // No stated sense: decide it on the geometry alone, then build. Both
+        // senses are solved with the links left out and compared on their
+        // crossing contradictions (chiralityComparisonDecisive says why the
+        // links stay out and what the margin is), the data's vote deciding
+        // otherwise; the map is then built in the chosen sense with the
+        // links. Every run is a complete build of its own: the pair shards
+        // are keyed by sense and never read the links, so the deciding runs
+        // leave both senses' shards in the cache and the final run finds its
+        // sense's all there. The products are combined only in the
+        // bookkeeping - the timings sum to the work done, the cache stats
+        // follow the rule on GlobalLayoutCache::Stats.
+        std::vector<InputFiber> unlinked = fibers;
+        for (InputFiber& fiber : unlinked) {
+            fiber.links.clear();
+        }
+        GlobalLayoutParams stated = params;
+        stated.solver.chiralityOverride = 1;
+        const GlobalResult forward =
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+        const GlobalLayoutCache::Stats forwardStats =
+            cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
+        stated.solver.chiralityOverride = -1;
+        const GlobalResult backward =
+            buildGlobalLayout(unlinked, umbilicusCenters, stated, cache);
+        const GlobalLayoutCache::Stats backwardStats =
+            cache != nullptr ? cache->_stats : GlobalLayoutCache::Stats{};
+        // Independent contradictions, not rings: a group conflict rings at
+        // every member. No links were solved, so none can be suspect.
+        const auto contradictionsOf = [](const GlobalResult& result) {
+            return result.droppedCrossingCount + result.declaredGroupCount;
+        };
+        const int forwardErrors = contradictionsOf(forward);
+        const int backwardErrors = contradictionsOf(backward);
+        const bool decisive = chiralityComparisonDecisive(
+            std::min(forwardErrors, backwardErrors), std::max(forwardErrors, backwardErrors));
+        const bool keepForward = decisive ? forwardErrors < backwardErrors
+                                          : forward.chiralityVote > 0;
+        stated.solver.chiralityOverride = keepForward ? 1 : -1;
+        GlobalResult kept = buildGlobalLayout(fibers, umbilicusCenters, stated, cache);
+        kept.chiralityBasis = decisive ? ChiralityBasis::Comparison : ChiralityBasis::Vote;
+        kept.comparedChiralityErrors = keepForward ? forwardErrors : backwardErrors;
+        kept.rejectedChiralityErrors = keepForward ? backwardErrors : forwardErrors;
+        for (const GlobalResult* deciding : {&forward, &backward}) {
+            kept.prepMs += deciding->prepMs;
+            kept.detectMs += deciding->detectMs;
+            kept.solveMs += deciding->solveMs;
+            kept.geometryMs += deciding->geometryMs;
+        }
+        if (cache != nullptr) {
+            GlobalLayoutCache::Stats stats = cache->_stats;
+            const GlobalLayoutCache::Stats& deciding =
+                keepForward ? forwardStats : backwardStats;
+            stats.fibersReused = forwardStats.fibersReused;
+            stats.fibersRecomputed = forwardStats.fibersRecomputed;
+            stats.pairsReused = deciding.pairsReused;
+            stats.pairsRecomputed = deciding.pairsRecomputed;
+            cache->_stats = stats;
+        }
+        return kept;
+    }
+
+    GlobalResult result;
+    result.chirality = params.solver.chiralityOverride;
+    result.chiralityBasis = ChiralityBasis::Override;
+    // Cache bookkeeping runs for every exit path: stats reset up front (so a
+    // duplicate-disabled or early-return build never shows the previous
+    // build's counts), the duplicate check over the whole input (fileName is
+    // the slot identity), and a scope guard that sweeps slots for fileNames
+    // absent from the current snapshot on every return.
+    if (cache != nullptr) {
+        cache->_stats = GlobalLayoutCache::Stats{};
+        std::set<std::string> names;
+        for (const InputFiber& fiber : fibers) {
+            if (!names.insert(fiber.fileName).second) {
+                qWarning() << "fiber map: duplicate fiber fileName"
+                           << QString::fromStdString(fiber.fileName)
+                           << "- layout cache disabled for this build";
+                cache = nullptr;
+                break;
+            }
+        }
+    }
+    struct CacheSweepGuard {
+        GlobalLayoutCache* cache;
+        const std::vector<InputFiber>& fibers;
+        ~CacheSweepGuard()
+        {
+            if (cache == nullptr) {
+                return;
+            }
+            std::set<std::string> names;
+            for (const InputFiber& fiber : fibers) {
+                names.insert(fiber.fileName);
+            }
+            for (auto it = cache->_prep.begin(); it != cache->_prep.end();) {
+                it = names.count(it->first) != 0 ? std::next(it)
+                                                 : cache->_prep.erase(it);
+            }
+            for (auto it = cache->_pairs.begin(); it != cache->_pairs.end();) {
+                it = names.count(std::get<0>(it->first)) != 0 &&
+                             names.count(std::get<1>(it->first)) != 0
+                         ? std::next(it)
+                         : cache->_pairs.erase(it);
+            }
+        }
+    } sweepGuard{cache, fibers};
+    if (cache != nullptr) {
+        cache->_stats.used = true;
+    }
+    const auto sortUnplaced = [&result]() {
+        std::sort(result.unplaced.begin(), result.unplaced.end(),
+                  [](const UnplacedFiber& a, const UnplacedFiber& b) {
+                      if (a.label != b.label) {
+                          return a.label < b.label;
+                      }
+                      return a.id < b.id;
+                  });
+    };
+    if (umbilicusCenters.empty()) {
+        // Nothing can be unrolled, and "every fiber" still has to hold: the
+        // whole input is unplaceable, not silently absent.
+        for (const InputFiber& fiber : fibers) {
+            result.unplaced.push_back(
+                UnplacedFiber{fiber.id, fiber.fileName, fiber.label, fiber.hvTag});
+        }
+        sortUnplaced();
+        return result;
+    }
+    for (const InputFiber& fiber : fibers) {
+        if (fiber.controlPoints.empty() || fiber.linePoints.empty()) {
+            result.unplaced.push_back(
+                UnplacedFiber{fiber.id, fiber.fileName, fiber.label, fiber.hvTag});
+        }
+    }
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+
+    const std::vector<const InputFiber*> ordered = orderPlaceableFibers(fibers);
+    const std::size_t fiberCount = ordered.size();
+    if (fiberCount == 0) {
+        sortUnplaced();
+        return result;
+    }
+    std::unordered_map<uint64_t, std::size_t> indexById;
+    indexById.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        indexById.emplace(ordered[i]->id, i);
+    }
+
+    const ContentDigest umbDigest = umbilicusDigest(umbilicus);
+    std::vector<ContentDigest> prepKeys(fiberCount);
+
+    const auto prepBegin = std::chrono::steady_clock::now();
+    std::vector<PreparedFiber> prepared;
+    prepared.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        if (cache == nullptr) {
+            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+            continue;
+        }
+        prepKeys[i] = combineDigests(
+            0x50E5, {fiberContentDigest(*ordered[i]), umbDigest});
+        GlobalLayoutCache::PrepSlot& slot = cache->_prep[ordered[i]->fileName];
+        if (slot.key == prepKeys[i]) {
+            PreparedFiber entry;
+            entry.input = ordered[i];
+            entry.thetaLine = slot.thetaLine;
+            entry.radius = slot.radius;
+            entry.controlLineIndex = slot.controlLineIndex;
+            prepared.push_back(std::move(entry));
+            ++cache->_stats.fibersReused;
+        } else {
+            prepared.push_back(prepareFiber(*ordered[i], umbilicus));
+            // Value complete before the key is published: a throw during the
+            // copies must never leave a matching key over stale data.
+            GlobalLayoutCache::PrepSlot fresh;
+            fresh.thetaLine = prepared.back().thetaLine;
+            fresh.radius = prepared.back().radius;
+            fresh.controlLineIndex = prepared.back().controlLineIndex;
+            fresh.key = prepKeys[i];
+            slot = std::move(fresh);
+            ++cache->_stats.fibersRecomputed;
+        }
+    }
+    result.prepMs = std::chrono::duration<double, std::milli>(
+                        std::chrono::steady_clock::now() - prepBegin)
+                        .count();
+
+    // The solver sees only the control-point-bounded domain of every fiber:
+    // the undrawn line-point tails must not constrain the solve any more than
+    // they may set the drawn extents.
+    std::vector<std::size_t> domainBegin(fiberCount, 0);
+    std::vector<winding::FiberTrace> traces(fiberCount);
+    std::vector<double> allRadii;
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        const PreparedFiber& entry = prepared[i];
+        const auto [minIt, maxIt] = std::minmax_element(
+            entry.controlLineIndex.begin(), entry.controlLineIndex.end());
+        // One sample beyond each outer control, matching the drawn clip -
+        // and keeping linked crossings, which sit exactly on the outermost
+        // controls, interior to the trace instead of on an fp-fragile edge.
+        const std::size_t begin = *minIt > 0 ? *minIt - 1 : 0;
+        const std::size_t end =
+            std::min(*maxIt + 1, entry.thetaLine.size() - 1);
+        domainBegin[i] = begin;
+        winding::FiberTrace& trace = traces[i];
+        trace.hvTag = ordered[i]->hvTag;
+        // One model-traced span trusts the whole fiber; a fiber with none is
+        // control-point interpolation, whose evidence is attenuated in repair
+        // conflicts (declarations are not gated on it). Empty flags get the
+        // benefit of the doubt, exactly as the drawing renders them (a single
+        // traced run).
+        const std::vector<bool>& tracedFlags = ordered[i]->tracedSegments;
+        trace.trusted = tracedFlags.empty() ||
+                        std::any_of(tracedFlags.begin(), tracedFlags.end(),
+                                    [](bool traced) { return traced; });
+        trace.theta.assign(entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(begin),
+                           entry.thetaLine.begin() + static_cast<std::ptrdiff_t>(end) + 1);
+        trace.radius.assign(entry.radius.begin() + static_cast<std::ptrdiff_t>(begin),
+                            entry.radius.begin() + static_cast<std::ptrdiff_t>(end) + 1);
+        trace.z.reserve(end - begin + 1);
+        for (std::size_t j = begin; j <= end; ++j) {
+            trace.z.push_back(ordered[i]->linePoints[j][2]);
+        }
+        allRadii.insert(allRadii.end(), trace.radius.begin(), trace.radius.end());
+    }
+
+    const std::vector<LinkRecord> allLinks = collectValidLinks(ordered, indexById);
+
+    // Linked-network membership, for the dock's grouping and the map's
+    // network co-highlight: components of the manual link graph, numbered by
+    // size descending. Singletons keep -1.
+    std::vector<int> networkIdOf(fiberCount, -1);
+    std::vector<int> networkSizeOf(fiberCount, 1);
+    {
+        std::vector<std::size_t> parent(fiberCount);
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            parent[i] = i;
+        }
+        const auto findRoot = [&parent](std::size_t index) {
+            while (parent[index] != index) {
+                parent[index] = parent[parent[index]];
+                index = parent[index];
+            }
+            return index;
+        };
+        for (const LinkRecord& link : allLinks) {
+            const std::size_t a = findRoot(link.a);
+            const std::size_t b = findRoot(link.b);
+            if (a != b) {
+                parent[a] = b;
+            }
+        }
+        std::map<std::size_t, std::vector<std::size_t>> byRoot;
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            byRoot[findRoot(i)].push_back(i);
+        }
+        std::vector<std::vector<std::size_t>> networks;
+        for (auto& entry : byRoot) {
+            if (entry.second.size() > 1) {
+                networks.push_back(std::move(entry.second));
+            }
+        }
+        // ordered[] is already (label, id)-sorted, so front() is each
+        // network's first fiber by label.
+        std::sort(networks.begin(), networks.end(),
+                  [](const std::vector<std::size_t>& a,
+                     const std::vector<std::size_t>& b) {
+                      if (a.size() != b.size()) {
+                          return a.size() > b.size();
+                      }
+                      return a.front() < b.front();
+                  });
+        for (std::size_t n = 0; n < networks.size(); ++n) {
+            for (const std::size_t member : networks[n]) {
+                networkIdOf[member] = static_cast<int>(n);
+                networkSizeOf[member] = static_cast<int>(networks[n].size());
+            }
+        }
+    }
+
+    std::vector<winding::LinkInput> linkInputs;
+    linkInputs.reserve(allLinks.size());
+    for (const LinkRecord& link : allLinks) {
+        const char tagA = ordered[link.a]->hvTag;
+        const char tagB = ordered[link.b]->hvTag;
+        linkInputs.push_back(winding::LinkInput{
+            link.a,
+            prepared[link.a].controlLineIndex[static_cast<std::size_t>(link.ia)] -
+                domainBegin[link.a],
+            link.b,
+            prepared[link.b].controlLineIndex[static_cast<std::size_t>(link.ib)] -
+                domainBegin[link.b],
+            adjacentWindingOffset(link.adjacent, tagA, tagB),
+            // An unpaired or self-contradicting adjacent link is an error,
+            // not evidence.
+            adjacentUnpaired(link.adjacent, tagA, tagB) || link.disagrees()});
+    }
+
+    winding::SolverParams solverParams = params.solver;
+    // One suspicion threshold: the confidence a link solves with and the
+    // suspicion it is reported with must never disagree.
+    solverParams.linkSuspectTurns = params.suspectTurns;
+
+    // Detection, per (H, V) pair, memoized when a cache is supplied. The
+    // fresh path runs the identical per-pair function in the identical pair
+    // order, so a hit substitutes an equal value into an identical
+    // computation.
+    const auto detectBegin = std::chrono::steady_clock::now();
+    const int chirality =
+        winding::inferChirality(traces, solverParams.chiralityOverride);
+    // What the data alone would have said, reported whichever way the map
+    // goes (the prior when both senses are solved, a diagnostic when the
+    // sense is stated).
+    {
+        const winding::ChiralityVote tally = winding::tallyChirality(traces);
+        result.chiralityVote = tally.sense;
+        result.chiralityNetVotes = tally.netTurnVotes;
+    }
+
+    // Kollesis fields (see winding::FiberTrace). An H fiber's tagged first or
+    // last control point marks a seam end, named by that control's sample on
+    // the trace (which runs a sample beyond it). A V fiber is on a kollesis when
+    // the annotator has linked it - at the crossings, wherever along the H
+    // fibers those are - to two DISTINCT tagged H fibers whose tagged ends
+    // lie to opposite sides of it: the side being which way the tagged end
+    // lies from the linked control along the H fiber's own line, in the
+    // winding sense (chirality). Nothing is inferred from crossings.
+    // Per V fiber: the (side, H fiber) evidence its links supply; kept for
+    // the solve's own seam readings below, which need the side the inner
+    // sheet's ends lie on.
+    std::map<std::size_t, std::set<std::pair<int, std::size_t>>> seamEvidence;
+    {
+        const auto tagsUsable = [](const InputFiber& fiber) {
+            return fiber.controlPoints.size() >= 2 &&
+                   fiber.kollesisTerminations.size() == fiber.controlPoints.size();
+        };
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            const InputFiber& fiber = *ordered[i];
+            if (traces[i].hvTag != 'H' || !tagsUsable(fiber)) {
+                continue;
+            }
+            const auto sampleOf = [&](std::size_t control) {
+                const std::size_t lineIndex = prepared[i].controlLineIndex[control];
+                return lineIndex >= domainBegin[i] &&
+                               lineIndex - domainBegin[i] < traces[i].theta.size()
+                           ? lineIndex - domainBegin[i]
+                           : winding::kNoSample;
+            };
+            if (fiber.kollesisTerminations.front()) {
+                traces[i].kollesisStartSample = sampleOf(0);
+            }
+            if (fiber.kollesisTerminations.back()) {
+                traces[i].kollesisEndSample = sampleOf(fiber.controlPoints.size() - 1);
+            }
+        }
+        for (const LinkRecord& link : allLinks) {
+            if (link.adjacent) {
+                // An adjacent link puts the V fiber a winding INSIDE the H
+                // fiber; a kollesis seam is a same-winding contact at a
+                // tagged end. It is not the evidence this reads.
+                continue;
+            }
+            std::size_t h = link.a;
+            int ih = link.ia;
+            std::size_t v = link.b;
+            if (traces[link.a].hvTag == 'V' && traces[link.b].hvTag == 'H') {
+                h = link.b;
+                ih = link.ib;
+                v = link.a;
+            } else if (traces[link.a].hvTag != 'H' || traces[link.b].hvTag != 'V') {
+                continue;
+            }
+            const InputFiber& hFiber = *ordered[h];
+            if (!tagsUsable(hFiber) || ih < 0 ||
+                static_cast<std::size_t>(ih) >= hFiber.controlPoints.size()) {
+                continue;
+            }
+            const std::vector<double>& thetaLine = prepared[h].thetaLine;
+            const std::vector<std::size_t>& lineOf = prepared[h].controlLineIndex;
+            const std::size_t linkLine = lineOf[static_cast<std::size_t>(ih)];
+            if (linkLine >= thetaLine.size()) {
+                continue;
+            }
+            const std::size_t last = hFiber.controlPoints.size() - 1;
+            for (const std::size_t tagged : {std::size_t{0}, last}) {
+                if (!hFiber.kollesisTerminations[tagged]) {
+                    continue;
+                }
+                const std::size_t tagLine = lineOf[tagged];
+                if (tagLine >= thetaLine.size()) {
+                    continue;
+                }
+                // Which way the tagged end lies from the link along the line.
+                double toward = thetaLine[tagLine] - thetaLine[linkLine];
+                if (tagLine == linkLine) {
+                    // Linked at the tagged control itself: the end lies away
+                    // from the fiber's body, one line step toward the
+                    // neighbouring control's sample. (Controls follow the
+                    // line, but a control snapped to a nearest line point
+                    // out of order must not flip the side.)
+                    const std::size_t neighbour = lineOf[tagged == 0 ? 1 : tagged - 1];
+                    if (neighbour == tagLine || neighbour >= thetaLine.size()) {
+                        continue;
+                    }
+                    const std::size_t inward = neighbour > tagLine ? tagLine + 1 : tagLine - 1;
+                    toward = -(thetaLine[inward] - thetaLine[tagLine]);
+                }
+                const double side = static_cast<double>(chirality) * toward;
+                if (!(side > 0.0) && !(side < 0.0)) {
+                    continue;
+                }
+                seamEvidence[v].emplace(side > 0.0 ? 1 : -1, h);
+            }
+        }
+        for (const auto& [v, evidence] : seamEvidence) {
+            // Two distinct H fibers on opposite sides; a doubly tagged single
+            // H fiber does not qualify a V on its own.
+            bool distinct = false;
+            for (const auto& [sideA, hA] : evidence) {
+                for (const auto& [sideB, hB] : evidence) {
+                    if (sideA > 0 && sideB < 0 && hA != hB) {
+                        distinct = true;
+                    }
+                }
+            }
+            traces[v].onKollesis = distinct;
+        }
+    }
+
+    std::vector<winding::CanonicalTrace> canonical(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        canonical[i] = winding::canonicalizeTrace(traces[i], chirality);
+    }
+    const ContentDigest detectParams = detectionParamsDigest(solverParams);
+    const ContentDigest chiralityDigest = [&]() {
+        ContentDigest digest = seededDigest(0xC819);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(chirality)));
+        return digest;
+    }();
+    // Geometry per pair (cached or fresh), then its classification: the
+    // merge, the events, the groups and every reading that depends on
+    // annotation, computed for every build from the canonical traces' flags,
+    // so a link or tag edit never invalidates a shard.
+    std::deque<winding::PairDetections> freshShards;
+    std::deque<winding::PairCrossings> classified;
+    std::vector<winding::PairDetection> detections;
+    // Per classified pair: its geometry and fibers, for the second pass.
+    std::vector<const winding::PairDetections*> geometryOf;
+    std::map<std::pair<std::size_t, std::size_t>, std::size_t> pairIndexOf;
+    for (std::size_t h = 0; h < fiberCount; ++h) {
+        if (canonical[h].hvTag != 'H' || canonical[h].psi.empty()) {
+            continue;
+        }
+        for (std::size_t v = 0; v < fiberCount; ++v) {
+            if (canonical[v].hvTag != 'V' || canonical[v].psi.empty()) {
+                continue;
+            }
+            const winding::PairDetections* geometry = nullptr;
+            if (cache == nullptr) {
+                freshShards.push_back(winding::detectPairCrossings(
+                    canonical[h], canonical[v], solverParams));
+                geometry = &freshShards.back();
+            } else {
+                const ContentDigest pairKey = combineDigests(
+                    0x9A18, {prepKeys[h], prepKeys[v], chiralityDigest, detectParams});
+                GlobalLayoutCache::PairSlot& slot = cache->_pairs[std::make_tuple(
+                    ordered[h]->fileName, ordered[v]->fileName, chirality)];
+                if (slot.key == pairKey) {
+                    ++cache->_stats.pairsReused;
+                } else {
+                    slot.detection = winding::detectPairCrossings(
+                        canonical[h], canonical[v], solverParams);
+                    slot.key = pairKey;
+                    ++cache->_stats.pairsRecomputed;
+                }
+                geometry = &slot.detection;
+            }
+            classified.push_back(winding::classifyPairCrossings(
+                *geometry, canonical[h], canonical[v],
+                winding::seamAnchors(canonical, h, v, linkInputs), {},
+                solverParams));
+            detections.push_back(winding::PairDetection{h, v, &classified.back()});
+            geometryOf.push_back(geometry);
+            pairIndexOf[{h, v}] = classified.size() - 1;
+        }
+    }
+    const double detectLoopMs = std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - detectBegin)
+                                    .count();
+    winding::SolveResult solve =
+        winding::solveWindings(traces, linkInputs, solverParams, chirality,
+                               detections);
+    // Seam encounters the solve finds (see winding::Crossing::kollesisInferred):
+    // on a V the annotator certified as on a kollesis, an Outside crossing
+    // that lost to the rest of its H fiber's evidence by exactly one turn,
+    // where that H fiber ends within a turn past the V. The glued inner sheet
+    // sits one thickness behind the outer sheet's V and reads exactly so.
+    // The H fiber must end on the side of the V where the inner sheet's
+    // tagged ends lie - the side of the tagged encounters that read Outside
+    // (behind the V), known from the identification itself; a V whose tagged
+    // encounters do not settle that side gets no inferred readings. Those
+    // pairs are classified again with the encounter read Inside, and the
+    // solve repeated, until a pass finds nothing new (each pass adds at
+    // least one of finitely many events, so it ends). Detection shards are
+    // untouched: this is classification.
+    double reclassifyMs = 0.0;
+    double assemblyMs = solve.detectMs;
+    double solveMs = solve.solveMs;
+    {
+        // Per kollesis V: the side (+1 / -1 in canonical angle) its inner
+        // sheet's ends lie on, or 0 when unsettled.
+        std::map<std::size_t, int> innerEndSide;
+        {
+            std::map<std::size_t, std::set<int>> behind;
+            std::map<std::size_t, std::set<int>> inFront;
+            for (const winding::Crossing& event : solve.events) {
+                if (!event.kollesis || event.kollesisInferred) {
+                    continue;
+                }
+                const auto evidence = seamEvidence.find(event.vFiber);
+                if (evidence == seamEvidence.end()) {
+                    continue;
+                }
+                for (const auto& [side, h] : evidence->second) {
+                    if (h == event.hFiber) {
+                        (event.deltaR > 0.0 ? behind : inFront)[event.vFiber].insert(side);
+                    }
+                }
+            }
+            for (const auto& [v, sides] : behind) {
+                if (sides.size() == 1) {
+                    const int side = *sides.begin();
+                    const auto front = inFront.find(v);
+                    if (front == inFront.end() || front->second.count(side) == 0) {
+                        innerEndSide[v] = side;
+                    }
+                }
+            }
+        }
+        std::map<std::size_t, std::set<std::size_t>> inferred;
+        for (;;) {
+            bool added = false;
+            for (const winding::Crossing& event : solve.events) {
+                if (event.status != winding::CrossingStatus::Dropped ||
+                    event.kind != winding::CrossingKind::Outside || event.kollesis ||
+                    event.touch || event.tangential || !event.terminal ||
+                    std::abs(event.violationTurns - 1.0) > 0.5 ||
+                    !traces[event.vFiber].onKollesis) {
+                    continue;
+                }
+                const auto side = innerEndSide.find(event.vFiber);
+                if (side == innerEndSide.end() ||
+                    (event.terminalSides & (side->second > 0 ? 1 : 2)) == 0) {
+                    continue;
+                }
+                const auto pair = pairIndexOf.find({event.hFiber, event.vFiber});
+                if (pair == pairIndexOf.end()) {
+                    continue;
+                }
+                added = inferred[pair->second].insert(event.detection).second || added;
+            }
+            if (!added) {
+                break;
+            }
+            const auto reclassifyBegin = std::chrono::steady_clock::now();
+            for (const auto& [index, ids] : inferred) {
+                const std::size_t h = detections[index].hFiber;
+                const std::size_t v = detections[index].vFiber;
+                classified[index] = winding::classifyPairCrossings(
+                    *geometryOf[index], canonical[h], canonical[v],
+                    winding::seamAnchors(canonical, h, v, linkInputs),
+                    std::vector<std::size_t>(ids.begin(), ids.end()), solverParams);
+            }
+            reclassifyMs += std::chrono::duration<double, std::milli>(
+                                std::chrono::steady_clock::now() - reclassifyBegin)
+                                .count();
+            solve = winding::solveWindings(traces, linkInputs, solverParams, chirality,
+                                           detections);
+            assemblyMs += solve.detectMs;
+            solveMs += solve.solveMs;
+        }
+    }
+    // Every pass's shard assembly, detection loop and reclassification is
+    // detection time; every pass's solve is solve time.
+    solve.detectMs = assemblyMs + detectLoopMs + reclassifyMs;
+    solve.solveMs = solveMs;
+
+    result.chirality = solve.chirality;
+    result.islandCount = solve.islandCount;
+    result.unresolvedCount = solve.unresolvedCount;
+    result.tieCount = solve.tieCount;
+    result.gatedSegmentCount = solve.gatedSegmentCount;
+    result.tangentialCount = solve.tangentialCount;
+    result.unresolvedIntersectionCount = solve.unresolvedIntersectionCount;
+    result.kollesisCrossingCount = solve.kollesisCrossingCount;
+    result.kollesisInferredCount = solve.kollesisInferredCount;
+    result.detectMs = solve.detectMs;
+    result.solveMs = solve.solveMs;
+
+    // One reference radius for the whole map. It is a display scale, never
+    // evidence, so the median over everything is enough.
+    double rRefVx = median(std::move(allRadii));
+    if (!(rRefVx > 0.0)) {
+        rRefVx = 1.0;
+    }
+    result.rRefVx = rRefVx;
+
+    const double sigmaVx = std::max(0.0, params.smoothVx);
+    const double resampleStepVx = params.resampleStepVx > 0.0
+        ? params.resampleStepVx
+        : GlobalLayoutParams{}.resampleStepVx;
+    const double thetaScale = static_cast<double>(solve.chirality);
+
+    const auto geometryBegin = std::chrono::steady_clock::now();
+    double loX = std::numeric_limits<double>::infinity();
+    double hiX = -std::numeric_limits<double>::infinity();
+    double loY = std::numeric_limits<double>::infinity();
+    double hiY = -std::numeric_limits<double>::infinity();
+    std::vector<FiberGeometry> geometry;
+    std::vector<char> drawable(fiberCount, 0);
+    geometry.reserve(fiberCount);
+    result.fibers.reserve(fiberCount);
+    for (std::size_t i = 0; i < fiberCount; ++i) {
+        const winding::Placement& placement = solve.placements[i];
+        const double offsetRad = kTwoPi * placement.turns;
+        FiberGeometry geo = buildFiberGeometry(prepared[i], thetaScale, offsetRad,
+                                               rRefVx, sigmaVx, resampleStepVx);
+        GlobalPlacedFiber placed;
+        placed.fiber = makePlacedFiber(*ordered[i], geo);
+        // Geometry too degenerate to draw a single run (a one-point trace,
+        // say) or containing non-finite coordinates is unplaceable, honestly,
+        // rather than a placed fiber the map never shows. Note the fiber's
+        // trace has already informed the winding solve by this point; that is
+        // deliberate - the annotation geometry is real even when it cannot be
+        // drawn.
+        double fiberLoX = std::numeric_limits<double>::infinity();
+        double fiberHiX = -std::numeric_limits<double>::infinity();
+        double fiberLoY = std::numeric_limits<double>::infinity();
+        double fiberHiY = -std::numeric_limits<double>::infinity();
+        for (const QPointF& point : geo.samples) {
+            fiberLoX = std::min(fiberLoX, point.x());
+            fiberHiX = std::max(fiberHiX, point.x());
+            fiberLoY = std::min(fiberLoY, point.y());
+            fiberHiY = std::max(fiberHiY, point.y());
+        }
+        if (placed.fiber.runs.empty() || !std::isfinite(fiberLoX) ||
+            !std::isfinite(fiberHiX) || !std::isfinite(fiberLoY) ||
+            !std::isfinite(fiberHiY)) {
+            result.unplaced.push_back(UnplacedFiber{ordered[i]->id,
+                                                    ordered[i]->fileName,
+                                                    ordered[i]->label,
+                                                    ordered[i]->hvTag});
+            geometry.push_back(std::move(geo));
+            continue;
+        }
+        drawable[i] = 1;
+        loX = std::min(loX, fiberLoX);
+        hiX = std::max(hiX, fiberHiX);
+        loY = std::min(loY, fiberLoY);
+        hiY = std::max(hiY, fiberHiY);
+        placed.meta.linked = placement.linked;
+        placed.meta.networkId = networkIdOf[i];
+        placed.meta.networkSize = networkSizeOf[i];
+        placed.meta.sheetDriftSuspect = placement.sheetDriftSuspect;
+        placed.meta.onKollesis = traces[i].onKollesis;
+        placed.meta.windingLo = placement.windingLo;
+        placed.meta.windingHi = placement.windingHi;
+        switch (placement.anchor) {
+        case winding::ComponentAnchor::Primary:
+            placed.meta.anchor = GlobalAnchor::Primary;
+            break;
+        case winding::ComponentAnchor::Radius:
+            placed.meta.anchor = GlobalAnchor::Radius;
+            break;
+        case winding::ComponentAnchor::AmbiguousRadius:
+            placed.meta.anchor = GlobalAnchor::AmbiguousRadius;
+            break;
+        case winding::ComponentAnchor::Unresolved:
+            placed.meta.anchor = GlobalAnchor::Unresolved;
+            break;
+        }
+        result.fibers.push_back(std::move(placed));
+        geometry.push_back(std::move(geo));
+    }
+    if (!(loX <= hiX) || !(loY <= hiY)) {
+        // Nothing drew at all; the accounting still owes the caller every
+        // fiber it was about to place.
+        for (const GlobalPlacedFiber& placed : result.fibers) {
+            result.unplaced.push_back(UnplacedFiber{placed.fiber.id,
+                                                    placed.fiber.fileName,
+                                                    placed.fiber.label,
+                                                    placed.fiber.hvTag});
+        }
+        result.fibers.clear();
+        sortUnplaced();
+        return result;
+    }
+
+    result.geometryMs = std::chrono::duration<double, std::milli>(
+                            std::chrono::steady_clock::now() - geometryBegin)
+                            .count();
+    std::set<std::size_t> droppedLinks(solve.droppedLinks.begin(),
+                                       solve.droppedLinks.end());
+    result.links.reserve(allLinks.size());
+    for (std::size_t l = 0; l < allLinks.size(); ++l) {
+        const LinkRecord& link = allLinks[l];
+        if (!drawable[link.a] || !drawable[link.b]) {
+            continue;
+        }
+        PlacedLink placedLink;
+        placedLink.fiberA = ordered[link.a]->id;
+        placedLink.cpA = link.ia;
+        placedLink.fiberB = ordered[link.b]->id;
+        placedLink.cpB = link.ib;
+        placedLink.a =
+            geometry[link.a].controlPoints[static_cast<std::size_t>(link.ia)];
+        placedLink.b =
+            geometry[link.b].controlPoints[static_cast<std::size_t>(link.ib)];
+        placedLink.turnErr = solve.linkTurnErrors[l];
+        placedLink.pending = link.pending;
+        placedLink.adjacent = link.adjacent;
+        placedLink.autoLink = link.autoLink;
+        placedLink.adjacentUnpaired =
+            adjacentUnpaired(link.adjacent, ordered[link.a]->hvTag, ordered[link.b]->hvTag);
+        placedLink.adjacentDisagrees = link.disagrees();
+        // A link the repair had to drop is winding-suspect whatever its
+        // residual now reads: the map placed its endpoints against it. The
+        // boundary is inclusive because a residual AT the threshold already
+        // solves with zero confidence. An unpaired adjacent link never
+        // constrained (its turn error is unset) and is suspect as an error.
+        placedLink.suspect = placedLink.turnErr >= params.suspectTurns ||
+                             droppedLinks.count(l) != 0 || placedLink.adjacentUnpaired ||
+                             placedLink.adjacentDisagrees;
+        if (placedLink.suspect) {
+            ++result.suspectLinkCount;
+        }
+        result.links.push_back(std::move(placedLink));
+    }
+
+    // Every crossing event goes out as an inspection record, positioned where
+    // the user will look for it: the solver's position is on the raw unrolled
+    // trace; the map draws a resampled (and possibly smoothed) curve, so the
+    // point is projected onto the drawn polyline of the H fiber it belongs to.
+    result.crossingEvents.reserve(solve.events.size());
+    for (const winding::Crossing& crossing : solve.events) {
+        CrossingEvent event;
+        const double x =
+            (crossing.psiH + kTwoPi * solve.placements[crossing.hFiber].turns) *
+            rRefVx;
+        event.posVx = drawable[crossing.hFiber]
+            ? nearestPointOnPolyline(geometry[crossing.hFiber].samples,
+                                     QPointF(x, crossing.zVx))
+            : QPointF(x, crossing.zVx);
+        event.hFiberId = ordered[crossing.hFiber]->id;
+        event.vFiberId = ordered[crossing.vFiber]->id;
+        event.n = crossing.n;
+        event.kind = crossing.kind;
+        event.status = crossing.status;
+        event.deltaR = crossing.deltaR;
+        event.transversality = crossing.transversality;
+        event.tangential = crossing.tangential;
+        event.touch = crossing.touch;
+        event.kollesis = crossing.kollesis;
+        event.kollesisInferred = crossing.kollesisInferred;
+        event.orientation = crossing.orientation;
+        event.mergedCount = crossing.mergedCount;
+        event.confidence = crossing.confidence;
+        event.violationTurns = crossing.violationTurns;
+        event.groupId = crossing.groupIndex;
+        result.crossingEvents.push_back(std::move(event));
+    }
+    result.crossingGroups.reserve(solve.groups.size());
+    for (const winding::CrossingGroup& group : solve.groups) {
+        CrossingGroupRecord record;
+        record.hFiberId = ordered[group.hFiber]->id;
+        record.vFiberId = ordered[group.vFiber]->id;
+        record.n = group.n;
+        record.vBranch = group.vBranch;
+        record.members = group.members;
+        record.multiplicity = group.multiplicity;
+        record.insideCount = group.insideCount;
+        record.orientationSum = group.orientationSum;
+        record.insideOrientationSum = group.insideOrientationSum;
+        record.mixedSigns = group.mixedSigns;
+        record.coverageGap = group.coverageGap;
+        record.unresolved = group.unresolved;
+        record.onCurtain = group.onCurtain;
+        record.traversalCovered = group.traversalCovered;
+        record.seamed = group.seamed;
+        record.minAbsDeltaR = group.minAbsDeltaR;
+        record.meanTransversality = group.meanTransversality;
+        record.hasVerdict = group.hasVerdict;
+        record.verdict = group.verdict;
+        record.confidence = group.confidence;
+        record.status = group.status;
+        record.violationTurns = group.violationTurns;
+        if (group.hasVerdict) {
+            ++result.traversalGroupCount;
+        }
+        result.crossingGroups.push_back(std::move(record));
+    }
+
+    // Declared errors only: a drop the final map SATISFIES anyway is
+    // greedy-repair debris (the real culprit fell in a later cycle), not an
+    // annotation mistake to ring in red. A crossing that constrained through
+    // its group (InGroup) is never declared on its own. An individual
+    // declaration is marked at every event its representative stood for.
+    const auto markFor = [&](std::size_t eventIndex, double violationTurns,
+                             long long groupId) {
+        const CrossingEvent& event = result.crossingEvents[eventIndex];
+        CrossingMark mark;
+        mark.posVx = event.posVx;
+        mark.hFiberId = event.hFiberId;
+        mark.vFiberId = event.vFiberId;
+        mark.n = event.n;
+        mark.kind = event.kind;
+        mark.deltaR = event.deltaR;
+        mark.violationTurns = violationTurns;
+        mark.eventIndex = eventIndex;
+        mark.groupId = groupId;
+        mark.kollesis = event.kollesis;
+        return mark;
+    };
+    std::vector<char> declaredRepresentative(solve.crossings.size(), 0);
+    for (std::size_t c = 0; c < solve.crossings.size(); ++c) {
+        const winding::Crossing& crossing = solve.crossings[c];
+        if (crossing.status != winding::CrossingStatus::Dropped ||
+            crossing.violationTurns < solverParams.declarationViolationTurns) {
+            continue;
+        }
+        ++result.droppedCrossingCount;
+        declaredRepresentative[c] = drawable[crossing.hFiber];
+    }
+    // Every event a declared representative stood for that the map itself
+    // violates: a merged event of the other sign that the map satisfies is
+    // not an error at its place, and an event whose group constrained for it
+    // is the group's to declare. One pass over the events.
+    for (std::size_t e = 0; e < solve.events.size(); ++e) {
+        const winding::Crossing& event = solve.events[e];
+        if (event.representative < declaredRepresentative.size() &&
+            declaredRepresentative[event.representative] &&
+            event.status == winding::CrossingStatus::Dropped &&
+            event.violationTurns >= solverParams.declarationViolationTurns) {
+            result.suspectCrossings.push_back(markFor(e, event.violationTurns, -1));
+        }
+    }
+    // A dropped, violated traversal group is one conflict, marked at every
+    // place the pair met.
+    for (std::size_t g = 0; g < solve.groups.size(); ++g) {
+        const winding::CrossingGroup& group = solve.groups[g];
+        if (!group.hasVerdict || group.status != winding::CrossingStatus::Dropped ||
+            group.violationTurns < solverParams.declarationViolationTurns) {
+            continue;
+        }
+        ++result.declaredGroupCount;
+        if (!drawable[group.hFiber]) {
+            continue;
+        }
+        for (const std::size_t member : group.members) {
+            result.suspectCrossings.push_back(
+                markFor(member, group.violationTurns, static_cast<long long>(g)));
+        }
+    }
+
+    const double padX = std::max(kPadFraction * (hiX - loX), params.minPadXVx);
+    const double padY = std::max(kPadFraction * (hiY - loY), params.minPadYVx);
+    result.x0Vx = loX - padX;
+    result.x1Vx = hiX + padX;
+    result.yMinVx = loY - padY;
+    result.yMaxVx = hiY + padY;
+
+    // One gridline per integer winding across the padded extent; the mark
+    // number IS the winding coordinate (innermost anchored winding = 0).
+    const double circumference = kTwoPi * rRefVx;
+    const long long first =
+        static_cast<long long>(std::ceil(result.x0Vx / circumference));
+    const long long last =
+        static_cast<long long>(std::floor(result.x1Vx / circumference));
+    for (long long mark = first; mark <= last; ++mark) {
+        result.windings.push_back(WindingMark{
+            static_cast<double>(mark) * circumference, static_cast<int>(mark)});
+    }
+
+    // The sheet model: least squares of umbilicus radius against the winding
+    // coordinate over every sample of the anchored, drawable fibers. Winding
+    // W = (chirality * theta) / 2*pi + turns is what the geometry above drew
+    // each sample at, divided by the circumference at rRef.
+    {
+        double sumW = 0.0;
+        double sumR = 0.0;
+        double sumWW = 0.0;
+        double sumWR = 0.0;
+        double count = 0.0;
+        double minW = std::numeric_limits<double>::infinity();
+        double maxW = -std::numeric_limits<double>::infinity();
+        for (std::size_t i = 0; i < fiberCount; ++i) {
+            if (!drawable[i] ||
+                solve.placements[i].anchor == winding::ComponentAnchor::Unresolved) {
+                continue;
+            }
+            const winding::FiberTrace& trace = traces[i];
+            const double turns = solve.placements[i].turns;
+            const std::size_t n = std::min(trace.theta.size(), trace.radius.size());
+            for (std::size_t j = 0; j < n; ++j) {
+                const double w = thetaScale * trace.theta[j] / kTwoPi + turns;
+                const double r = trace.radius[j];
+                if (!std::isfinite(w) || !std::isfinite(r)) {
+                    continue;
+                }
+                sumW += w;
+                sumR += r;
+                sumWW += w * w;
+                sumWR += w * r;
+                count += 1.0;
+                minW = std::min(minW, w);
+                maxW = std::max(maxW, w);
+            }
+        }
+        // Half a winding of span is the least that fixes a slope worth
+        // trusting; below that the map's own reference radius is the honest
+        // answer.
+        constexpr double kMinWindingSpanForPitch = 0.5;
+        result.sheetRadius0Vx = rRefVx;
+        result.sheetPitchVx = 0.0;
+        if (count >= 2.0 && maxW - minW >= kMinWindingSpanForPitch) {
+            const double denominator = count * sumWW - sumW * sumW;
+            if (denominator > 0.0) {
+                const double pitch = (count * sumWR - sumW * sumR) / denominator;
+                const double radius0 = (sumR - pitch * sumW) / count;
+                if (std::isfinite(pitch) && std::isfinite(radius0) && pitch > 0.0 &&
+                    radius0 > 0.0) {
+                    result.sheetRadius0Vx = radius0;
+                    result.sheetPitchVx = pitch;
+                }
+            }
+        }
+    }
+    sortUnplaced();
+    return result;
+}
+
+double sheetDistanceVx(const SheetModel& model, double xVx)
+{
+    if (!(model.rRefVx > 0.0)) {
+        return xVx;
+    }
+    const double w = xVx / (kTwoPi * model.rRefVx);
+    return kTwoPi * (model.radius0Vx * w + 0.5 * model.pitchVx * w * w);
+}
+
+double sheetXForDistanceVx(const SheetModel& model, double distanceVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return std::numeric_limits<double>::quiet_NaN();
+    }
+    const double target = distanceVx / kTwoPi;
+    double w = 0.0;
+    if (model.pitchVx > 0.0) {
+        // pitch/2 * w^2 + radius0 * w - target = 0, the root on the branch where
+        // the radius is positive (w >= -radius0/pitch).
+        const double discriminant =
+            model.radius0Vx * model.radius0Vx + 2.0 * model.pitchVx * target;
+        if (discriminant < 0.0) {
+            return std::numeric_limits<double>::quiet_NaN();
+        }
+        // The rationalised form of (-radius0 + sqrt(disc)) / pitch: the naive
+        // one subtracts two nearly equal numbers as the pitch tends to zero
+        // and loses the answer; this one tends smoothly to the linear case.
+        w = 2.0 * target / (model.radius0Vx + std::sqrt(discriminant));
+    } else {
+        w = target / model.radius0Vx;
+    }
+    return w * kTwoPi * model.rRefVx;
+}
+
+double sheetDomainFloorXVx(const SheetModel& model)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0) || !(model.pitchVx > 0.0)) {
+        return -std::numeric_limits<double>::infinity();
+    }
+    return -(model.radius0Vx / model.pitchVx) * kTwoPi * model.rRefVx;
+}
+
+double sheetDistanceMonotoneVx(const SheetModel& model, double xVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return xVx;
+    }
+    const double xFloor = sheetDomainFloorXVx(model);
+    if (xVx < xFloor) {
+        return sheetDistanceVx(model, xFloor) + (xVx - xFloor);
+    }
+    return sheetDistanceVx(model, xVx);
+}
+
+double sheetXForDistanceMonotoneVx(const SheetModel& model, double distanceVx)
+{
+    if (!(model.rRefVx > 0.0) || !(model.radius0Vx > 0.0)) {
+        return distanceVx;
+    }
+    const double xFloor = sheetDomainFloorXVx(model);
+    if (std::isfinite(xFloor)) {
+        const double distanceFloor = sheetDistanceVx(model, xFloor);
+        // The floor and everything below it are the linear continuation;
+        // the quadratic's own root there is ill-conditioned (zero
+        // discriminant up to rounding) and would land a hair off.
+        if (distanceVx <= distanceFloor) {
+            return xFloor + (distanceVx - distanceFloor);
+        }
+        const double x = sheetXForDistanceVx(model, distanceVx);
+        return std::isfinite(x) ? x : xFloor;
+    }
+    return sheetXForDistanceVx(model, distanceVx);
+}
+
+SheetModel sheetModelOf(const GlobalResult& result)
+{
+    return SheetModel{result.rRefVx, result.sheetRadius0Vx, result.sheetPitchVx};
+}
+
+ContentDigest digestGlobalInputs(const std::vector<InputFiber>& fibers,
+                                 const std::vector<cv::Vec3f>& umbilicusCenters,
+                                 const GlobalLayoutParams& params)
+{
+    ContentDigest digest = seededDigest(0x1B9);
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+    const ContentDigest umb = umbilicusDigest(umbilicus);
+    hashU64(digest, umb.a);
+    hashU64(digest, umb.b);
+    // Snapshot order is content-derived, so hashing fibers in input order is
+    // stable; links are inputs too here (unlike the cache keys, this digest
+    // answers "did ANYTHING the layout consumes change").
+    hashU64(digest, fibers.size());
+    for (const InputFiber& fiber : fibers) {
+        const ContentDigest content = fiberContentDigest(fiber);
+        hashU64(digest, content.a);
+        hashU64(digest, content.b);
+        // Runtime ids belong here (they resolve links and appear in outputs)
+        // but deliberately NOT in the cache keys - ids are reassigned per
+        // package load and this digest only ever compares within a session.
+        hashU64(digest, fiber.id);
+        hashU64(digest, fiber.label.size());
+        hashBytes(digest, fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
+        // Solve-time input (kollesis identification), never detection input:
+        // part of "did anything the layout consumes change" so the
+        // memoization check stays exact, not of the detection shard keys.
+        hashU64(digest, fiber.kollesisTerminations.size());
+        for (const bool tagged : fiber.kollesisTerminations) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
+        // Display-only, but they shape the placed fiber: same reasoning.
+        hashU64(digest, fiber.breaks.size());
+        for (const bool tagged : fiber.breaks) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
+        hashU64(digest, fiber.gapSegments.size());
+        for (const bool gapSpan : fiber.gapSegments) {
+            hashU64(digest, gapSpan ? 1 : 0);
+        }
+        hashU64(digest, fiber.damagedSegments.size());
+        for (const bool damagedSpan : fiber.damagedSegments) {
+            hashU64(digest, damagedSpan ? 1 : 0);
+        }
+        hashU64(digest, fiber.links.size());
+        for (const InputLink& link : fiber.links) {
+            hashU64(digest, static_cast<uint64_t>(
+                                static_cast<int64_t>(link.controlPointIndex)));
+            hashU64(digest, link.branchFiberId);
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(
+                                link.branchControlPointIndex)));
+            hashU64(digest, link.pending ? 1 : 0);
+            hashU64(digest, link.adjacent ? 1 : 0);
+            hashU64(digest, link.autoLink ? 1 : 0);
+        }
+    }
+    hashDouble(digest, params.suspectTurns);
+    hashDouble(digest, params.smoothVx);
+    hashDouble(digest, params.resampleStepVx);
+    hashDouble(digest, params.minPadXVx);
+    hashDouble(digest, params.minPadYVx);
+    const winding::SolverParams& solver = params.solver;
+    hashDouble(digest, solver.tieBandVx);
+    hashDouble(digest, solver.minUmbilicusRadiusVx);
+    hashDouble(digest, solver.maxStepTurns);
+    hashDouble(digest, solver.minTransversality);
+    hashDouble(digest, solver.zMergeVx);
+    hashDouble(digest, solver.neighborhoodZVx);
+    hashDouble(digest, solver.neighborhoodArcVx);
+    hashDouble(digest, solver.radialSlopePerZVx);
+    hashDouble(digest, solver.radialSlopePerArcVx);
+    hashDouble(digest, solver.anchorAmbiguityMargin);
+    hashDouble(digest, solver.linkSuspectTurns);
+    hashDouble(digest, solver.untrustedConfidenceFactor);
+    hashDouble(digest, solver.declarationViolationTurns);
+    hashDouble(digest, solver.endpointClearanceTurns);
+    hashDouble(digest, solver.apexProminenceVx);
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(solver.chiralityOverride)));
+    return digest;
+}
+
+ContentDigest digestGlobalResult(const GlobalResult& result)
+{
+    // Every stable semantic field of the result, so a memoization bug cannot
+    // produce a differing GlobalResult that digests equal. The phase timings
+    // are the one deliberate exclusion: they are telemetry, and warm and
+    // fresh builds necessarily differ there.
+    ContentDigest digest = seededDigest(0x0D16);
+    hashDouble(digest, result.rRefVx);
+    hashDouble(digest, result.x0Vx);
+    hashDouble(digest, result.x1Vx);
+    hashDouble(digest, result.yMinVx);
+    hashDouble(digest, result.yMaxVx);
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chirality)));
+    hashU64(digest, static_cast<uint64_t>(result.chiralityBasis));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chiralityVote)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.chiralityNetVotes)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.comparedChiralityErrors)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.rejectedChiralityErrors)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.islandCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.unresolvedCount)));
+    hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(result.tieCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.suspectLinkCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.droppedCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.declaredGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.traversalGroupCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.unresolvedIntersectionCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisCrossingCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.kollesisInferredCount)));
+    hashU64(digest, static_cast<uint64_t>(
+                        static_cast<int64_t>(result.gatedSegmentCount)));
+    hashU64(digest,
+            static_cast<uint64_t>(static_cast<int64_t>(result.tangentialCount)));
+    hashDouble(digest, result.sheetRadius0Vx);
+    hashDouble(digest, result.sheetPitchVx);
+    hashU64(digest, result.fibers.size());
+    for (const GlobalPlacedFiber& fiber : result.fibers) {
+        hashU64(digest, fiber.fiber.id);
+        hashString(digest, fiber.fiber.fileName);
+        hashU64(digest, static_cast<uint64_t>(fiber.fiber.label.size()));
+        hashBytes(digest, fiber.fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.fiber.label.size()) *
+                      sizeof(QChar));
+        hashU64(digest, static_cast<uint64_t>(fiber.fiber.hvTag));
+        hashU64(digest, static_cast<uint64_t>(fiber.meta.anchor));
+        hashU64(digest, fiber.meta.linked ? 1 : 0);
+        hashU64(digest, fiber.meta.sheetDriftSuspect ? 1 : 0);
+        hashU64(digest, fiber.meta.onKollesis ? 1 : 0);
+        hashU64(digest, static_cast<uint64_t>(
+                            static_cast<int64_t>(fiber.meta.networkId)));
+        hashU64(digest, static_cast<uint64_t>(
+                            static_cast<int64_t>(fiber.meta.networkSize)));
+        hashDouble(digest, fiber.meta.windingLo);
+        hashDouble(digest, fiber.meta.windingHi);
+        hashU64(digest, fiber.fiber.runs.size());
+        for (const Run& run : fiber.fiber.runs) {
+            hashU64(digest, run.traced ? 1 : 0);
+            hashU64(digest, run.gap ? 1 : 0);
+            hashU64(digest, run.damaged ? 1 : 0);
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.firstControl)));
+            hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(run.lastControl)));
+            hashU64(digest, run.points.size());
+            for (const QPointF& point : run.points) {
+                hashDouble(digest, point.x());
+                hashDouble(digest, point.y());
+            }
+            hashU64(digest, run.arclengths.size());
+            for (const double s : run.arclengths) {
+                hashDouble(digest, s);
+            }
+        }
+        hashU64(digest, fiber.fiber.controlPoints.size());
+        for (const QPointF& point : fiber.fiber.controlPoints) {
+            hashDouble(digest, point.x());
+            hashDouble(digest, point.y());
+        }
+        hashU64(digest, fiber.fiber.controlArclength.size());
+        for (const double s : fiber.fiber.controlArclength) {
+            hashDouble(digest, s);
+        }
+        hashDouble(digest, fiber.fiber.thetaScale);
+        hashDouble(digest, fiber.fiber.offsetRad);
+        hashU64(digest, fiber.fiber.kollesisTerminations.size());
+        for (const bool tagged : fiber.fiber.kollesisTerminations) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
+        hashU64(digest, fiber.fiber.breaks.size());
+        for (const bool tagged : fiber.fiber.breaks) {
+            hashU64(digest, tagged ? 1 : 0);
+        }
+    }
+    hashU64(digest, result.links.size());
+    for (const PlacedLink& link : result.links) {
+        hashU64(digest, link.fiberA);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(link.cpA)));
+        hashU64(digest, link.fiberB);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(link.cpB)));
+        hashDouble(digest, link.a.x());
+        hashDouble(digest, link.a.y());
+        hashDouble(digest, link.b.x());
+        hashDouble(digest, link.b.y());
+        hashDouble(digest, link.turnErr);
+        hashU64(digest, link.suspect ? 1 : 0);
+        hashU64(digest, link.pending ? 1 : 0);
+        hashU64(digest, link.adjacent ? 1 : 0);
+        hashU64(digest, link.adjacentUnpaired ? 1 : 0);
+        hashU64(digest, link.adjacentDisagrees ? 1 : 0);
+        hashU64(digest, link.autoLink ? 1 : 0);
+    }
+    hashU64(digest, result.windings.size());
+    for (const WindingMark& mark : result.windings) {
+        hashDouble(digest, mark.xVx);
+        hashU64(digest, static_cast<uint64_t>(static_cast<int64_t>(mark.number)));
+    }
+    const auto hashI64 = [&digest](long long value) {
+        hashU64(digest, static_cast<uint64_t>(value));
+    };
+    hashU64(digest, result.suspectCrossings.size());
+    for (const CrossingMark& mark : result.suspectCrossings) {
+        hashDouble(digest, mark.posVx.x());
+        hashDouble(digest, mark.posVx.y());
+        hashU64(digest, mark.hFiberId);
+        hashU64(digest, mark.vFiberId);
+        hashI64(mark.n);
+        hashU64(digest, static_cast<uint64_t>(mark.kind));
+        hashDouble(digest, mark.deltaR);
+        hashDouble(digest, mark.violationTurns);
+        hashU64(digest, mark.eventIndex);
+        hashI64(mark.groupId);
+        hashU64(digest, mark.kollesis ? 1 : 0);
+    }
+    hashU64(digest, result.crossingEvents.size());
+    for (const CrossingEvent& event : result.crossingEvents) {
+        hashDouble(digest, event.posVx.x());
+        hashDouble(digest, event.posVx.y());
+        hashU64(digest, event.hFiberId);
+        hashU64(digest, event.vFiberId);
+        hashI64(event.n);
+        hashU64(digest, static_cast<uint64_t>(event.kind));
+        hashU64(digest, static_cast<uint64_t>(event.status));
+        hashDouble(digest, event.deltaR);
+        hashDouble(digest, event.transversality);
+        hashU64(digest, (event.tangential ? 1 : 0) | (event.touch ? 2 : 0) |
+                            (event.kollesis ? 4 : 0) | (event.kollesisInferred ? 8 : 0));
+        hashI64(event.orientation);
+        hashI64(event.mergedCount);
+        hashDouble(digest, event.confidence);
+        hashDouble(digest, event.violationTurns);
+        hashI64(event.groupId);
+    }
+    hashU64(digest, result.crossingGroups.size());
+    for (const CrossingGroupRecord& group : result.crossingGroups) {
+        hashU64(digest, group.hFiberId);
+        hashU64(digest, group.vFiberId);
+        hashI64(group.n);
+        hashU64(digest, group.vBranch);
+        hashU64(digest, group.members.size());
+        for (const std::size_t member : group.members) {
+            hashU64(digest, member);
+        }
+        hashI64(group.multiplicity);
+        hashI64(group.insideCount);
+        hashI64(group.orientationSum);
+        hashI64(group.insideOrientationSum);
+        hashU64(digest, (group.mixedSigns ? 1 : 0) | (group.coverageGap ? 2 : 0) |
+                            (group.unresolved ? 4 : 0) | (group.onCurtain ? 8 : 0) |
+                            (group.traversalCovered ? 16 : 0) | (group.hasVerdict ? 32 : 0) |
+                            (group.seamed ? 64 : 0));
+        hashDouble(digest, group.minAbsDeltaR);
+        hashDouble(digest, group.meanTransversality);
+        hashU64(digest, static_cast<uint64_t>(group.verdict));
+        hashDouble(digest, group.confidence);
+        hashU64(digest, static_cast<uint64_t>(group.status));
+        hashDouble(digest, group.violationTurns);
+    }
+    hashU64(digest, result.unplaced.size());
+    for (const UnplacedFiber& fiber : result.unplaced) {
+        hashU64(digest, fiber.id);
+        hashString(digest, fiber.fileName);
+        hashU64(digest, static_cast<uint64_t>(fiber.label.size()));
+        hashBytes(digest, fiber.label.constData(),
+                  static_cast<std::size_t>(fiber.label.size()) * sizeof(QChar));
+        hashU64(digest, static_cast<uint64_t>(fiber.hvTag));
+    }
+    return digest;
+}
+
+std::map<EndpointKey, EndpointReview> aggregateEndpointReviews(
+    const std::vector<InputFiber>& fibers)
+{
+    std::unordered_map<uint64_t, char> tagById;
+    tagById.reserve(fibers.size());
+    for (const InputFiber& fiber : fibers) {
+        tagById[fiber.id] = fiber.hvTag;
+    }
+    struct Accumulator {
+        bool pending = false;
+        bool humanPending = false;
+        bool anyAuto = false;
+        bool sameHvPending = false;
+        bool sameHvApproved = false;
+        bool adjacent = false;
+    };
+    std::map<EndpointKey, Accumulator> accumulators;
+    for (const InputFiber& fiber : fibers) {
+        for (const InputLink& link : fiber.links) {
+            if (link.controlPointIndex < 0) {
+                continue;
+            }
+            Accumulator& acc = accumulators[EndpointKey{fiber.id, link.controlPointIndex}];
+            const bool automatic = link.autoLink && link.pending && !link.adjacent;
+            acc.pending = acc.pending || link.pending;
+            acc.humanPending = acc.humanPending || (link.pending && !automatic);
+            acc.anyAuto = acc.anyAuto || automatic;
+            acc.adjacent = acc.adjacent || link.adjacent;
+            const auto other = tagById.find(link.branchFiberId);
+            const bool sameHv = other != tagById.end() && fiber.hvTag != '?' &&
+                                other->second != '?' && other->second == fiber.hvTag;
+            if (sameHv) {
+                (link.pending ? acc.sameHvPending : acc.sameHvApproved) = true;
+            }
+        }
+    }
+    std::map<EndpointKey, EndpointReview> reviews;
+    for (const auto& [key, acc] : accumulators) {
+        EndpointReview review;
+        review.linked = true;
+        review.pending = acc.pending;
+        review.autoPending = acc.pending && acc.anyAuto && !acc.humanPending;
+        review.anyAuto = acc.anyAuto;
+        review.sameHv = acc.pending ? acc.sameHvPending : acc.sameHvApproved;
+        review.adjacent = acc.adjacent;
+        reviews[key] = review;
+    }
+    return reviews;
+}
+
+std::vector<double> unrolledLineArclengths(const std::vector<cv::Vec3d>& linePoints,
+                                           const std::vector<cv::Vec3f>& umbilicusCenters,
+                                           double thetaScale,
+                                           double offsetRad,
+                                           double rRefVx)
+{
+    const UmbilicusInterp umbilicus = interpolateUmbilicus(umbilicusCenters);
+    const std::vector<double> thetaLine = unwrappedThetaLine(linePoints, umbilicus, nullptr);
+    return arclengths(unrollLinePoints(thetaLine, linePoints, thetaScale, offsetRad, rRefVx));
+}
+
+} // namespace vc3d::fiber_map

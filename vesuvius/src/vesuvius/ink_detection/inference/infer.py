@@ -1,0 +1,1782 @@
+"""Checkpoint-driven flat surface-volume inference to uint8 TIFF."""
+
+from __future__ import annotations
+
+from vesuvius.ink_detection.data.normalization import normalize_image
+
+import argparse
+import json
+import logging
+import math
+import shutil
+import tempfile
+import threading
+from concurrent.futures import Future, ThreadPoolExecutor
+from collections import OrderedDict
+from contextlib import nullcontext
+from dataclasses import dataclass, replace
+from datetime import datetime
+from pathlib import Path
+from typing import Any, Iterator, Mapping, Sequence
+from urllib.parse import urlparse
+
+import numpy as np
+from vc_reader import images
+import torch
+import torch.nn.functional as F
+from torch import nn
+from torch.utils.data import DataLoader, Dataset
+from vc_reader.reader import ZarrWriter
+
+from vesuvius.ink_detection.models.checkpoint import (
+    load_checkpoint,
+    select_inference_weights,
+)
+from vesuvius.ink_detection.config import InkConfig, NormalizationConfig
+from vesuvius.ink_detection.inference.inference_runtime import (
+    DEVICE_CHOICES,
+    TargetModel,
+    flip_spatial,
+    iter_mirror_axes,
+    parse_gpu_ids,
+    prepare_model_for_inference,
+    resolve_amp_dtype,
+)
+from vesuvius.ink_detection.models.model import make_model
+from vesuvius.ink_detection.volume_io import (
+    open_volume,
+    open_volume_root,
+    select_volume_level,
+)
+from vesuvius.utils.cli import HyphenUnderscoreParser
+
+
+
+LOGGER = logging.getLogger(__name__)
+DEFAULT_OCCUPANCY_SCAN_LEVEL = "3"
+DEFAULT_OVERLAP = 0.5
+
+
+@dataclass(frozen=True)
+class Block:
+    """One top-left flat patch and its in-volume spatial extent."""
+
+    y0: int
+    x0: int
+    valid_h: int
+    valid_w: int
+
+
+@dataclass(frozen=True)
+class ChunkKey:
+    """A row/column output chunk identity."""
+
+    row: int
+    col: int
+
+
+@dataclass(frozen=True)
+class ConfiguredModel:
+    """The checkpoint-derived flat model and preprocessing contract."""
+
+    model: nn.Module
+    patch_size: int
+    input_depth: int
+    preprocessing: str
+    amp_dtype: torch.dtype | None
+
+
+def flat_preprocessing_from_config(config: NormalizationConfig) -> str:
+    """Map training normalization settings to flat-inference preprocessing."""
+
+    if config.mode == "robust_mad":
+        percentiles = (config.percentile_lower, config.percentile_upper)
+        if percentiles != (1.0, 99.0):
+            raise ValueError(
+                "Flat inference supports robust_mad only with "
+                "percentile_lower=1 and percentile_upper=99, got "
+                f"{percentiles!r}"
+            )
+        return "tifxyz_robust"
+    if config.mode == "divide":
+        if config.divisor != 255.0:
+            raise ValueError(
+                "Flat inference divide preprocessing requires divisor=255, "
+                f"got {config.divisor!r}"
+            )
+        return "divide_255"
+    raise ValueError(
+        "Flat inference does not support image_normalization mode "
+        f"{config.mode!r}"
+    )
+
+
+def normalize_flat_patch(
+    patch_ZYX: np.ndarray,
+    preprocessing: str,
+) -> np.ndarray:
+    """Normalize one reader-processed ZYX patch by the legacy flat contract."""
+
+    if preprocessing == "tifxyz_robust":
+        return normalize_image(patch_ZYX, NormalizationConfig(mode="robust_mad"))
+    if preprocessing == "divide_255":
+        normalized = np.ascontiguousarray(patch_ZYX, dtype=np.float32)
+        normalized *= 1.0 / 255.0
+        return normalized
+    raise ValueError(f"Unsupported flat preprocessing {preprocessing!r}")
+
+
+def compute_equal_length_mirror_axes(shape: Sequence[int]) -> tuple[int, ...]:
+    """Return axes sharing a length with at least one other patch axis."""
+
+    shape = tuple(int(length) for length in shape)
+    if any(length <= 0 for length in shape):
+        raise ValueError(f"Patch dimensions must be positive, got {shape!r}")
+    axes_by_length: dict[int, list[int]] = {}
+    for axis, length in enumerate(shape):
+        axes_by_length.setdefault(length, []).append(axis)
+    return tuple(
+        axis
+        for axes in axes_by_length.values()
+        if len(axes) > 1
+        for axis in axes
+    )
+
+
+def compute_importance_map_2d(
+    *,
+    patch_size: tuple[int, int],
+    mode: str,
+    sigma_scale: float = 0.125,
+) -> torch.Tensor:
+    """Build the exact flat constant, Gaussian, or floored Hann blend map."""
+
+    patch_h, patch_w = (int(value) for value in patch_size)
+    if patch_h <= 0 or patch_w <= 0:
+        raise ValueError(f"patch_size must be positive, got {patch_size!r}")
+    mode = str(mode).strip().lower()
+    if mode == "constant":
+        return torch.ones((patch_h, patch_w), dtype=torch.float32)
+    if mode == "hann":
+        weight = torch.outer(
+            torch.hann_window(patch_h, periodic=False, dtype=torch.float32),
+            torch.hann_window(patch_w, periodic=False, dtype=torch.float32),
+        )
+        weight /= torch.clamp(weight.max(), min=torch.finfo(weight.dtype).eps)
+        # An exact Hann window is zero at its outermost pixels; flooring keeps a
+        # boundary covered by only one patch normalizable.
+        return torch.clamp(weight, min=0.001)
+    if mode != "gaussian":
+        raise ValueError(f"Unsupported flat blend mode {mode!r}")
+    sigma_y = max(patch_h * float(sigma_scale), 1e-6)
+    sigma_x = max(patch_w * float(sigma_scale), 1e-6)
+    coords_y = torch.arange(patch_h, dtype=torch.float32) - (patch_h - 1) / 2
+    coords_x = torch.arange(patch_w, dtype=torch.float32) - (patch_w - 1) / 2
+    grid_y, grid_x = torch.meshgrid(coords_y, coords_x, indexing="ij")
+    weight = torch.exp(
+        -0.5 * ((grid_y / sigma_y) ** 2 + (grid_x / sigma_x) ** 2)
+    )
+    weight /= torch.clamp(weight.max(), min=torch.finfo(weight.dtype).eps)
+    return torch.clamp(weight, min=torch.finfo(weight.dtype).eps)
+
+
+def resolve_patch_stride(
+    *,
+    patch_size: int,
+    overlap: float,
+    explicit_stride: int | None,
+) -> int:
+    """Resolve inference overlap to stride without using training overlap."""
+
+    patch_size = int(patch_size)
+    if explicit_stride is not None:
+        stride = int(explicit_stride)
+        if not 1 <= stride <= patch_size:
+            raise ValueError(
+                f"--stride must be in [1, {patch_size}], got {stride}"
+            )
+        return stride
+    overlap = float(overlap)
+    if not 0.0 <= overlap < 1.0:
+        raise ValueError(f"--overlap must be in [0, 1), got {overlap}")
+    return max(1, int(round(patch_size * (1.0 - overlap))))
+
+
+def center_crop_layer_indices(
+    layer_indices: np.ndarray,
+    *,
+    output_depth: int,
+) -> np.ndarray:
+    """Center crop source layers, choosing the upper center for even excess."""
+
+    indices = np.asarray(layer_indices, dtype=np.int64)
+    output_depth = int(output_depth)
+    if output_depth <= 0:
+        raise ValueError(f"output_depth must be positive, got {output_depth}")
+    if indices.size <= output_depth:
+        return indices
+    start = indices.size // 2 - output_depth // 2
+    return indices[start : start + output_depth]
+
+
+def select_layer_indices(
+    depth: int,
+    *,
+    layer_start: int | None,
+    layer_end: int | None,
+    output_depth: int,
+    direction: str,
+) -> np.ndarray:
+    """Select, clamp, center crop, and optionally reverse source layers.
+
+    A requested window that is empty after clamping falls back to the full
+    source depth, which is logged as a warning so the run is not silently
+    equivalent to an unwindowed one.
+    """
+
+    depth = int(depth)
+    start = 0 if layer_start is None else int(layer_start)
+    stop = depth if layer_end is None else int(layer_end)
+    if start < 0:
+        start += depth
+    if stop < 0:
+        stop += depth
+    start = max(0, start)
+    stop = min(depth, stop)
+    if stop <= start:
+        if layer_start is not None or layer_end is not None:
+            LOGGER.warning(
+                "Requested source-Z window [%s, %s) is empty after clamping to "
+                "depth=%d; falling back to the full depth [0, %d). This run is "
+                "therefore identical to one with no window requested.",
+                layer_start,
+                layer_end,
+                depth,
+                depth,
+            )
+        start, stop = 0, depth
+    indices = center_crop_layer_indices(
+        np.arange(start, stop, dtype=np.int64),
+        output_depth=output_depth,
+    )
+    if direction == "reverse":
+        indices = indices[::-1]
+    return indices
+
+
+def _sliding_positions_1d(length: int, patch_size: int, stride: int) -> list[int]:
+    if length <= patch_size:
+        return [0]
+    positions = list(range(0, length - patch_size + 1, max(1, stride)))
+    last = length - patch_size
+    if positions[-1] != last:
+        positions.append(last)
+    return positions
+
+
+def resolve_roi_bounds(
+    values: Sequence[int] | None, *, height: int, width: int
+) -> tuple[int, int, int, int]:
+    """Half-open row-start/stop, column-start/stop in the selected input level."""
+
+    if values is None:
+        return (0, height, 0, width)
+    if len(values) != 4 or any(isinstance(v, bool) or not isinstance(v, (int, np.integer)) for v in values):
+        raise ValueError("--roi requires four integer grid indices")
+    r0, r1, c0, c1 = (int(value) for value in values)
+    if not (0 <= r0 < r1 <= height and 0 <= c0 < c1 <= width):
+        raise ValueError(f"--roi must be nonempty and inside shape {(height, width)!r}")
+    return r0, r1, c0, c1
+
+
+def clip_block_to_roi(block: Block, bounds: tuple[int, int, int, int]) -> Block | None:
+    """Clip a parent block and translate its output into the ROI frame."""
+
+    r0, r1, c0, c1 = bounds
+    top, bottom = max(block.y0, r0), min(block.y0 + block.valid_h, r1)
+    left, right = max(block.x0, c0), min(block.x0 + block.valid_w, c1)
+    if top >= bottom or left >= right:
+        return None
+    return Block(top - r0, left - c0, bottom - top, right - left)
+
+
+def iter_blocks(
+    image_shape: tuple[int, int],
+    patch_size: int,
+    stride: int,
+    mask_lowres: np.ndarray | None = None,
+    occupancy_scale: tuple[int, int] = (1, 1),
+    *,
+    roi_bounds: tuple[int, int, int, int] | None = None,
+) -> list[Block]:
+    """Schedule flat patches, including a final boundary-aligned position."""
+
+    height, width = (int(value) for value in image_shape)
+    scale_y, scale_x = (max(1, int(value)) for value in occupancy_scale)
+    if roi_bounds is not None:
+        roi_bounds = resolve_roi_bounds(roi_bounds, height=height, width=width)
+    blocks: list[Block] = []
+    for y0 in _sliding_positions_1d(height, patch_size, stride):
+        valid_h = min(patch_size, height - y0)
+        if roi_bounds is not None and (y0 >= roi_bounds[1] or y0 + valid_h <= roi_bounds[0]):
+            continue
+        for x0 in _sliding_positions_1d(width, patch_size, stride):
+            valid_w = min(patch_size, width - x0)
+            if roi_bounds is not None and (x0 >= roi_bounds[3] or x0 + valid_w <= roi_bounds[2]):
+                continue
+            if mask_lowres is not None:
+                low_y0 = y0 // scale_y
+                low_x0 = x0 // scale_x
+                low_y1 = max(low_y0 + 1, math.ceil((y0 + valid_h) / scale_y))
+                low_x1 = max(low_x0 + 1, math.ceil((x0 + valid_w) / scale_x))
+                if not mask_lowres[low_y0:low_y1, low_x0:low_x1].any():
+                    continue
+            blocks.append(Block(y0, x0, valid_h, valid_w))
+    return blocks
+
+
+def downsample_mask_any(mask: np.ndarray, scale_y: int, scale_x: int) -> np.ndarray:
+    """Any-pool a 2D foreground mask with top-left alignment."""
+
+    mask = np.asarray(mask, dtype=bool)
+    if (scale_y, scale_x) == (1, 1):
+        return mask
+    pad_h = (-mask.shape[0]) % scale_y
+    pad_w = (-mask.shape[1]) % scale_x
+    if pad_h or pad_w:
+        mask = np.pad(mask, ((0, pad_h), (0, pad_w)), constant_values=False)
+    return mask.reshape(
+        mask.shape[0] // scale_y,
+        scale_y,
+        mask.shape[1] // scale_x,
+        scale_x,
+    ).any(axis=(1, 3))
+
+
+def choose_pyramid_array(
+    root: Any,
+    *,
+    preferred_key: str,
+    purpose: str,
+) -> tuple[str, Any]:
+    """Choose an array, preferring the nearest numeric pyramid level."""
+
+    if hasattr(root, "shape"):
+        return "0", root
+    available = [str(key) for key in root.array_keys()]
+    if preferred_key not in available:
+        # HTTP-backed stores may allow direct key access without directory
+        # listing, so probe the requested level before treating the group empty.
+        try:
+            requested = root[preferred_key]
+        except (KeyError, FileNotFoundError):
+            requested = None
+        if requested is not None and hasattr(requested, "shape"):
+            return preferred_key, requested
+    if not available:
+        raise ValueError(f"No arrays found in Zarr group for {purpose}")
+    if preferred_key in available:
+        return preferred_key, root[preferred_key]
+    numeric = [key for key in available if key.isdigit()]
+    if numeric and preferred_key.isdigit():
+        preferred = int(preferred_key)
+        selected = min(
+            numeric,
+            key=lambda key: (abs(int(key) - preferred), int(key)),
+        )
+    else:
+        selected = sorted(available)[0]
+    LOGGER.warning(
+        "Requested %s level %s was not found; using level %s instead",
+        purpose,
+        preferred_key,
+        selected,
+    )
+    return selected, root[selected]
+
+
+def compute_nonempty_mask_from_lowres_array(array: Any) -> np.ndarray:
+    """Collapse a 2D/3D low-resolution array to a 2D occupancy mask."""
+
+    shape = tuple(int(value) for value in array.shape)
+    values = np.asarray(array[:])
+    if len(shape) == 2:
+        return values != 0
+    if len(shape) != 3:
+        raise ValueError(f"Occupancy array must be rank 2 or 3, got {shape!r}")
+    depth_axis = 0 if int(np.argmin(shape)) == 0 else 2
+    return np.any(values != 0, axis=depth_axis)
+
+
+def build_lowres_block_mask(
+    root: Any,
+    *,
+    height: int,
+    width: int,
+    user_mask: np.ndarray | None,
+) -> tuple[np.ndarray | None, tuple[int, int], str | None]:
+    """Combine group occupancy and user mask at occupancy resolution."""
+
+    if hasattr(root, "shape"):
+        occupancy = None
+        occupancy_level = None
+        occupancy_h, occupancy_w = height, width
+    else:
+        occupancy_level, occupancy_array = choose_pyramid_array(
+            root,
+            preferred_key=DEFAULT_OCCUPANCY_SCAN_LEVEL,
+            purpose="occupancy scan",
+        )
+        occupancy = compute_nonempty_mask_from_lowres_array(occupancy_array)
+        occupancy_h, occupancy_w = occupancy.shape
+    scale_y = max(1, int(round(height / max(1, occupancy_h))))
+    scale_x = max(1, int(round(width / max(1, occupancy_w))))
+    if user_mask is not None:
+        pooled = downsample_mask_any(user_mask, scale_y, scale_x)
+        occupancy = pooled if occupancy is None else np.logical_and(occupancy, pooled)
+    return occupancy, (scale_y, scale_x), occupancy_level
+
+
+class FlatPatchReader:
+    """Read H/W/Z patches and apply only the legacy pre-quantization step."""
+
+    def __init__(
+        self,
+        *,
+        input_path: str | Path,
+        resolution: str,
+        depth_axis_first: bool,
+        height: int,
+        width: int,
+        layer_indices: np.ndarray,
+        output_depth: int,
+        preprocessing: str,
+        chunk_cache_size: int = 0,
+    ) -> None:
+        self.input_path = input_path
+        self.chunk_cache_size = max(0, int(chunk_cache_size))
+        self._chunk_cache: OrderedDict[tuple[int, int], np.ndarray] = OrderedDict()
+        self._chunk_inflight: dict[tuple[int, int], Future[np.ndarray]] = {}
+        self._chunk_lock = threading.Lock()
+        self.resolution = str(resolution)
+        self.depth_axis_first = bool(depth_axis_first)
+        self.height = int(height)
+        self.width = int(width)
+        self.layer_indices = np.asarray(layer_indices, dtype=np.int64)
+        self.output_depth = int(output_depth)
+        self.preprocessing = str(preprocessing)
+        if self.layer_indices.size == 0:
+            raise ValueError("Flat inference selected no source layers")
+        if self.output_depth < self.layer_indices.size:
+            raise ValueError(
+                f"output_depth={self.output_depth} is smaller than selected "
+                f"depth={self.layer_indices.size}"
+            )
+        self.output_depth_start = (
+            self.output_depth - self.layer_indices.size
+        ) // 2
+        self._array = None
+        self._read_mode = "fancy"
+        self._z_start = int(self.layer_indices[0])
+        self._z_stop = int(self.layer_indices[-1]) + 1
+        if self.layer_indices.size > 1 and np.all(np.diff(self.layer_indices) == 1):
+            self._read_mode = "ascending"
+        elif self.layer_indices.size > 1 and np.all(np.diff(self.layer_indices) == -1):
+            self._read_mode = "descending"
+            self._z_start = int(self.layer_indices[-1])
+            self._z_stop = int(self.layer_indices[0]) + 1
+
+    def __getstate__(self):
+        state = dict(self.__dict__)
+        state["_array"] = None
+        state["_chunk_cache"] = OrderedDict()
+        state["_chunk_inflight"] = {}
+        state["_chunk_lock"] = None
+        return state
+
+    def __setstate__(self, state):
+        self.__dict__.update(state)
+        self._chunk_lock = threading.Lock()
+
+    def _ensure_array(self):
+        if self._array is None:
+            self._array = open_volume(self.input_path, self.resolution)
+        return self._array
+
+    def _cached_chunk(self, array, row: int, col: int) -> np.ndarray:
+        """Return one Z-cropped source chunk, decoding it at most once while cached."""
+
+        key = (row, col)
+        with self._chunk_lock:
+            chunk = self._chunk_cache.get(key)
+            if chunk is not None:
+                self._chunk_cache.move_to_end(key)
+                return chunk
+            pending = self._chunk_inflight.get(key)
+            owner = pending is None
+            if owner:
+                pending = Future()
+                self._chunk_inflight[key] = pending
+        if not owner:
+            return pending.result()
+
+        # Share both successful reads and failures without serializing reads
+        # of different chunks. Failed reads can be retried by a later request.
+        try:
+            _, chunk_h, chunk_w = array.chunks
+            chunk = np.asarray(
+                array[
+                    self._z_start : self._z_stop,
+                    row * chunk_h : min(self.height, (row + 1) * chunk_h),
+                    col * chunk_w : min(self.width, (col + 1) * chunk_w),
+                ]
+            )
+            with self._chunk_lock:
+                self._chunk_cache[key] = chunk
+                if len(self._chunk_cache) > self.chunk_cache_size:
+                    self._chunk_cache.popitem(last=False)
+        except BaseException as exc:
+            pending.set_exception(exc)
+            raise
+        else:
+            pending.set_result(chunk)
+            return chunk
+        finally:
+            with self._chunk_lock:
+                del self._chunk_inflight[key]
+
+    def _read_raw_cached(self, array, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        """Assemble a Z/Y/X block from cached chunks; overlapping patches share decodes."""
+
+        _, chunk_h, chunk_w = array.chunks
+        block = np.empty(
+            (self._z_stop - self._z_start, y1 - y0, x1 - x0), dtype=array.dtype
+        )
+        for row in range(y0 // chunk_h, (y1 - 1) // chunk_h + 1):
+            for col in range(x0 // chunk_w, (x1 - 1) // chunk_w + 1):
+                chunk = self._cached_chunk(array, row, col)
+                cy0, cx0 = row * chunk_h, col * chunk_w
+                iy0, iy1 = max(y0, cy0), min(y1, cy0 + chunk.shape[1])
+                ix0, ix1 = max(x0, cx0), min(x1, cx0 + chunk.shape[2])
+                block[:, iy0 - y0 : iy1 - y0, ix0 - x0 : ix1 - x0] = chunk[
+                    :, iy0 - cy0 : iy1 - cy0, ix0 - cx0 : ix1 - cx0
+                ]
+        return block
+
+    def _read_raw(self, y0: int, y1: int, x0: int, x1: int) -> np.ndarray:
+        array = self._ensure_array()
+        if (
+            self.chunk_cache_size
+            and self.depth_axis_first
+            and self._read_mode in {"ascending", "descending"}
+            and getattr(array, "chunks", None) is not None
+        ):
+            block = self._read_raw_cached(array, y0, y1, x0, x1)
+            if self._read_mode == "descending":
+                block = block[::-1]
+            return np.transpose(block, (1, 2, 0))
+        if self.depth_axis_first:
+            if self._read_mode == "ascending":
+                block = array[self._z_start : self._z_stop, y0:y1, x0:x1]
+            elif self._read_mode == "descending":
+                block = array[self._z_start : self._z_stop, y0:y1, x0:x1][::-1]
+            else:
+                block = array[self.layer_indices, y0:y1, x0:x1]
+            return np.transpose(np.asarray(block), (1, 2, 0))
+        if self._read_mode == "ascending":
+            block = array[y0:y1, x0:x1, self._z_start : self._z_stop]
+        elif self._read_mode == "descending":
+            block = array[y0:y1, x0:x1, self._z_start : self._z_stop][..., ::-1]
+        else:
+            block = array[y0:y1, x0:x1, self.layer_indices]
+        return np.asarray(block)
+
+    def read(self, y0: int, x0: int, out_h: int, out_w: int) -> np.ndarray:
+        """Read one padded H/W/Z patch with centered short-depth placement."""
+
+        y1, x1 = y0 + out_h, x0 + out_w
+        source_y0, source_x0 = max(0, y0), max(0, x0)
+        source_y1, source_x1 = min(self.height, y1), min(self.width, x1)
+        dtype = np.float32 if self.preprocessing == "tifxyz_robust" else np.uint8
+        output = np.zeros((out_h, out_w, self.output_depth), dtype=dtype)
+        if source_y1 <= source_y0 or source_x1 <= source_x0:
+            return output
+        block = self._read_raw(source_y0, source_y1, source_x0, source_x1)
+        if self.preprocessing == "tifxyz_robust":
+            block = np.asarray(block, dtype=np.float32)
+        elif self.preprocessing == "divide_255":
+            block = np.asarray(block)
+            if block.dtype != np.uint8:
+                raise TypeError(
+                    "Flat divide preprocessing requires uint8 input, got "
+                    f"{block.dtype}"
+                )
+            block = np.ascontiguousarray(block)
+        else:
+            raise ValueError(f"Unsupported flat preprocessing {self.preprocessing!r}")
+        depth_start = self.output_depth_start
+        output[
+            source_y0 - y0 : source_y1 - y0,
+            source_x0 - x0 : source_x1 - x0,
+            depth_start : depth_start + self.layer_indices.size,
+        ] = block
+        return output
+
+
+class FlatBlockDataset(Dataset):
+    """Turn scheduled flat blocks into C/Z/Y/X model tensors and metadata."""
+
+    def __init__(
+        self,
+        *,
+        reader: FlatPatchReader,
+        blocks: Sequence[Block],
+        patch_size: int,
+        preprocessing: str,
+    ) -> None:
+        self.reader = reader
+        self.blocks = tuple(blocks)
+        self.patch_size = int(patch_size)
+        self.preprocessing = str(preprocessing)
+
+    def __len__(self) -> int:
+        return len(self.blocks)
+
+    def __getitem__(self, index: int):
+        block = self.blocks[index]
+        patch_HWZ = self.reader.read(
+            block.y0,
+            block.x0,
+            self.patch_size,
+            self.patch_size,
+        )
+        # Measure occupancy before normalization because robust normalization
+        # maps an all-zero patch to nonzero values.
+        nonempty = int(patch_HWZ.any())
+        patch_ZYX = np.moveaxis(patch_HWZ, -1, 0)
+        patch_ZYX = normalize_flat_patch(patch_ZYX, self.preprocessing)
+        image_CZYX = torch.from_numpy(patch_ZYX).unsqueeze(0)
+        metadata = torch.tensor(
+            [block.y0, block.x0, block.valid_h, block.valid_w, nonempty],
+            dtype=torch.int64,
+        )
+        return image_CZYX, metadata
+
+
+def unflip_spatial_output_for_patch_axes(
+    output: torch.Tensor, patch_axes: Sequence[int]
+) -> torch.Tensor:
+    """Restore only Y/X axes of a BCYX flat output."""
+
+    dimensions = [
+        2 if int(axis) == 1 else 3
+        for axis in patch_axes
+        if int(axis) in {1, 2}
+    ]
+    return output if not dimensions else torch.flip(output, dimensions)
+
+
+def logits_to_probabilities(
+    logits: torch.Tensor,
+    *,
+    image_hw: tuple[int, int],
+) -> torch.Tensor:
+    """Apply sigmoid and bilinearly restore the flat patch size."""
+
+    if logits.ndim != 4:
+        raise ValueError(
+            f"Flat model logits must have shape [B,C,H,W], got {tuple(logits.shape)}"
+        )
+    probabilities = logits.float().sigmoid_()
+    if probabilities.shape[-2:] != image_hw:
+        probabilities = F.interpolate(
+            probabilities,
+            size=image_hw,
+            mode="bilinear",
+            align_corners=False,
+        )
+    return probabilities
+
+
+def predict_with_mirror_tta(
+    model: nn.Module,
+    images_BCZYX: torch.Tensor,
+    *,
+    tta_axes: Sequence[int],
+    tta_batch_size: int | None,
+) -> torch.Tensor:
+    """Average flat mirror variants in stable combination order."""
+
+    variants = iter_mirror_axes(tta_axes)
+    if len(variants) == 1:
+        return logits_to_probabilities(
+            model(images_BCZYX),
+            image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
+        )
+    original_batch = int(images_BCZYX.shape[0])
+    per_forward = (
+        len(variants)
+        if tta_batch_size is None
+        else min(int(tta_batch_size), len(variants))
+    )
+    probability_sum: torch.Tensor | None = None
+    for start in range(0, len(variants), per_forward):
+        selected = variants[start : start + per_forward]
+        variant_images = torch.cat(
+            [flip_spatial(images_BCZYX, axes) for axes in selected]
+        )
+        probabilities_flat = logits_to_probabilities(
+            model(variant_images),
+            image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
+        )
+        probabilities_by_variant = probabilities_flat.reshape(
+            len(selected), original_batch, *probabilities_flat.shape[1:]
+        )
+        for variant_index, axes in enumerate(selected):
+            restored = unflip_spatial_output_for_patch_axes(
+                probabilities_by_variant[variant_index], axes
+            )
+            probability_sum = (
+                restored if probability_sum is None else probability_sum + restored
+            )
+    if probability_sum is None:
+        raise RuntimeError("Mirror TTA produced no variants")
+    return probability_sum / float(len(variants))
+
+
+def iter_overlapping_chunks(
+    y0: int,
+    x0: int,
+    valid_h: int,
+    valid_w: int,
+    chunk_shape: tuple[int, int],
+) -> Iterator[ChunkKey]:
+    """Yield output chunks touched by one valid flat tile."""
+
+    chunk_h, chunk_w = (max(1, int(value)) for value in chunk_shape)
+    final_y = y0 + max(1, valid_h) - 1
+    final_x = x0 + max(1, valid_w) - 1
+    for row in range(y0 // chunk_h, final_y // chunk_h + 1):
+        for col in range(x0 // chunk_w, final_x // chunk_w + 1):
+            yield ChunkKey(row, col)
+
+
+def compute_chunk_contribution_counts(
+    blocks: Sequence[Block],
+    *,
+    chunk_shape: tuple[int, int],
+) -> dict[ChunkKey, int]:
+    """Count scheduled contributions so completed chunks can flush early."""
+
+    counts: dict[ChunkKey, int] = {}
+    for block in blocks:
+        for key in iter_overlapping_chunks(
+            block.y0, block.x0, block.valid_h, block.valid_w, chunk_shape
+        ):
+            counts[key] = counts.get(key, 0) + 1
+    return counts
+
+
+class ChunkAccumulator:
+    """Accumulate float32 probability and weight sums by output chunk."""
+
+    def __init__(
+        self,
+        *,
+        shape: tuple[int, int],
+        chunk_shape: tuple[int, int],
+        prob_sum_store: Any,
+        weight_sum_store: Any,
+        contribution_counts: Mapping[ChunkKey, int],
+    ) -> None:
+        self.height, self.width = (int(value) for value in shape)
+        self.chunk_h, self.chunk_w = (
+            max(1, int(value)) for value in chunk_shape
+        )
+        self.prob_sum_store = prob_sum_store
+        self.weight_sum_store = weight_sum_store
+        self.contribution_counts = dict(contribution_counts)
+        self.seen_counts: dict[ChunkKey, int] = {}
+        self.buffers: dict[ChunkKey, tuple[np.ndarray, np.ndarray]] = {}
+
+    def _bounds(self, key: ChunkKey) -> tuple[int, int, int, int]:
+        y0, x0 = key.row * self.chunk_h, key.col * self.chunk_w
+        return y0, min(self.height, y0 + self.chunk_h), x0, min(
+            self.width, x0 + self.chunk_w
+        )
+
+    def _buffers(self, key: ChunkKey) -> tuple[np.ndarray, np.ndarray]:
+        if key not in self.buffers:
+            y0, y1, x0, x1 = self._bounds(key)
+            self.buffers[key] = (
+                np.zeros((y1 - y0, x1 - x0), dtype=np.float32),
+                np.zeros((y1 - y0, x1 - x0), dtype=np.float32),
+            )
+        return self.buffers[key]
+
+    def add_tile(
+        self,
+        *,
+        y0: int,
+        x0: int,
+        tile: np.ndarray,
+        tile_weights: np.ndarray,
+    ) -> None:
+        """Add one weighted tile and flush every newly completed chunk."""
+
+        valid_h, valid_w = tile.shape
+        y1, x1 = y0 + valid_h, x0 + valid_w
+        for key in iter_overlapping_chunks(
+            y0, x0, valid_h, valid_w, (self.chunk_h, self.chunk_w)
+        ):
+            chunk_y0, chunk_y1, chunk_x0, chunk_x1 = self._bounds(key)
+            iy0, iy1 = max(y0, chunk_y0), min(y1, chunk_y1)
+            ix0, ix1 = max(x0, chunk_x0), min(x1, chunk_x1)
+            if iy1 <= iy0 or ix1 <= ix0:
+                continue
+            probability_buffer, weight_buffer = self._buffers(key)
+            source = (
+                slice(iy0 - y0, iy1 - y0),
+                slice(ix0 - x0, ix1 - x0),
+            )
+            destination = (
+                slice(iy0 - chunk_y0, iy1 - chunk_y0),
+                slice(ix0 - chunk_x0, ix1 - chunk_x0),
+            )
+            weights = tile_weights[source]
+            probability_buffer[destination] += tile[source] * weights
+            weight_buffer[destination] += weights
+            self._finish_contribution(key)
+
+    def skip_tile(
+        self, *, y0: int, x0: int, valid_h: int, valid_w: int
+    ) -> None:
+        """Complete a raw-empty tile without allocating or adding weights."""
+
+        for key in iter_overlapping_chunks(
+            y0, x0, valid_h, valid_w, (self.chunk_h, self.chunk_w)
+        ):
+            self._finish_contribution(key)
+
+    def _finish_contribution(self, key: ChunkKey) -> None:
+        seen = self.seen_counts.get(key, 0) + 1
+        if seen >= self.contribution_counts[key]:
+            if key in self.buffers:
+                self._flush(key)
+            else:
+                self.seen_counts.pop(key, None)
+        else:
+            self.seen_counts[key] = seen
+
+    def _flush(self, key: ChunkKey) -> None:
+        probability, weight = self.buffers.pop(key)
+        self.seen_counts.pop(key, None)
+        y0, y1, x0, x1 = self._bounds(key)
+        self.prob_sum_store[y0:y1, x0:x1] = probability
+        self.weight_sum_store[y0:y1, x0:x1] = weight
+
+    def flush_remaining(self) -> None:
+        """Flush any remaining accumulation buffers."""
+
+        for key in tuple(self.buffers):
+            self._flush(key)
+
+
+class ThreadedBatchLoader:
+    """Ordered batches read by a thread pool, avoiding spawn-worker startup.
+
+    Spawned DataLoader workers re-import torch and vesuvius before their first
+    batch, which costs tens of seconds on Windows. Zarr reads and the uint8
+    copies here release the GIL, so threads overlap them with GPU work.
+    """
+
+    def __init__(self, dataset: Dataset, *, batch_size: int, num_threads: int, prefetch_batches: int) -> None:
+        self.dataset = dataset
+        self.batch_size = int(batch_size)
+        self.num_threads = max(1, int(num_threads))
+        self.prefetch_batches = max(1, int(prefetch_batches))
+
+    def __len__(self) -> int:
+        return math.ceil(len(self.dataset) / self.batch_size)
+
+    def _load(self, start: int):
+        items = [
+            self.dataset[index]
+            for index in range(start, min(len(self.dataset), start + self.batch_size))
+        ]
+        images, metadata = zip(*items)
+        images_BCZYX = torch.stack(images)
+        if torch.cuda.is_available():
+            images_BCZYX = images_BCZYX.pin_memory()
+        return images_BCZYX, torch.stack(metadata)
+
+    def __iter__(self):
+        starts = iter(range(0, len(self.dataset), self.batch_size))
+        with ThreadPoolExecutor(max_workers=self.num_threads) as pool:
+            pending = []
+            for start in starts:
+                pending.append(pool.submit(self._load, start))
+                if len(pending) >= self.num_threads * self.prefetch_batches:
+                    break
+            while pending:
+                batch = pending.pop(0).result()
+                start = next(starts, None)
+                if start is not None:
+                    pending.append(pool.submit(self._load, start))
+                yield batch
+
+
+def run_block_inference(
+    *,
+    loader: DataLoader,
+    model: nn.Module,
+    accumulator: ChunkAccumulator,
+    weight_map: np.ndarray,
+    mask: np.ndarray | None,
+    device: torch.device,
+    amp_dtype: torch.dtype | None,
+    tta_axes: Sequence[int],
+    tta_batch_size: int | None,
+    roi_bounds: tuple[int, int, int, int] | None = None,
+) -> None:
+    """Forward nonempty flat patches and feed their weighted probabilities."""
+
+    mask_f32 = None if mask is None else mask.astype(np.float32, copy=False)
+    autocast = (
+        torch.autocast("cuda", dtype=amp_dtype)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with torch.inference_mode(), autocast:
+        for images_BCZYX, metadata in loader:
+            # The dataset records occupancy on raw patches; normalized all-zero
+            # input is not a valid signal for this skip.
+            keep = metadata[:, 4] > 0
+            for values in metadata[~keep].numpy():
+                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+                if roi_bounds is not None:
+                    clipped = clip_block_to_roi(
+                        Block(y0, x0, valid_h, valid_w), roi_bounds
+                    )
+                    if clipped is None:
+                        continue
+                    y0, x0 = clipped.y0, clipped.x0
+                    valid_h, valid_w = clipped.valid_h, clipped.valid_w
+                accumulator.skip_tile(
+                    y0=y0, x0=x0, valid_h=valid_h, valid_w=valid_w
+                )
+            if not bool(keep.any()):
+                continue
+            # Only CUDA gets non_blocking: on torch 2.11/2.12 an MPS copy can
+            # read this boolean-index temporary after it is freed
+            # (pytorch/pytorch#189690).
+            images_BCZYX = images_BCZYX[keep].to(
+                device, non_blocking=device.type == "cuda"
+            )
+            metadata = metadata[keep]
+            if tta_axes:
+                probabilities = predict_with_mirror_tta(
+                    model,
+                    images_BCZYX,
+                    tta_axes=tta_axes,
+                    tta_batch_size=tta_batch_size,
+                )
+            else:
+                probabilities = logits_to_probabilities(
+                    model(images_BCZYX),
+                    image_hw=tuple(int(value) for value in images_BCZYX.shape[-2:]),
+                )
+            probabilities_np = probabilities.cpu().numpy()[:, 0]
+            for probability, values in zip(probabilities_np, metadata.numpy()):
+                y0, x0, valid_h, valid_w = (int(value) for value in values[:4])
+                tile = probability[:valid_h, :valid_w]
+                weights = weight_map[:valid_h, :valid_w]
+                if mask_f32 is not None:
+                    weights = weights * mask_f32[
+                        y0 : y0 + valid_h, x0 : x0 + valid_w
+                    ]
+                if roi_bounds is not None:
+                    clipped = clip_block_to_roi(Block(y0, x0, valid_h, valid_w), roi_bounds)
+                    if clipped is None:
+                        continue
+                    source_y0 = clipped.y0 + roi_bounds[0] - y0
+                    source_x0 = clipped.x0 + roi_bounds[2] - x0
+                    source = (
+                        slice(source_y0, source_y0 + clipped.valid_h),
+                        slice(source_x0, source_x0 + clipped.valid_w),
+                    )
+                    tile, weights = tile[source], weights[source]
+                    y0, x0 = clipped.y0, clipped.x0
+                accumulator.add_tile(
+                    y0=y0,
+                    x0=x0,
+                    tile=tile,
+                    tile_weights=weights,
+                )
+
+
+def iter_probability_tiles(
+    prob_sum_store: Any,
+    weight_sum_store: Any,
+    tile_shape: tuple[int, int],
+) -> Iterator[np.ndarray]:
+    """Encode normalized chunks by clipping, scaling, and truncating to uint8."""
+
+    height, width = (int(value) for value in prob_sum_store.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    for y0 in range(0, height, tile_h):
+        for x0 in range(0, width, tile_w):
+            y1, x1 = min(height, y0 + tile_h), min(width, x0 + tile_w)
+            probability = np.asarray(
+                prob_sum_store[y0:y1, x0:x1], dtype=np.float32
+            )
+            weight = np.asarray(
+                weight_sum_store[y0:y1, x0:x1], dtype=np.float32
+            )
+            np.divide(probability, weight, out=probability, where=weight > 1e-6)
+            np.clip(probability, 0, 1, out=probability)
+            probability *= 255
+            yield probability.astype(np.uint8, copy=False)
+
+
+def write_output_tiff(
+    prob_sum_store: Any,
+    weight_sum_store: Any,
+    output_path: Path,
+    tile_shape: tuple[int, int],
+) -> None:
+    """Write one tiled, LZW, BigTIFF-compatible flat probability image."""
+
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    height, width = (int(value) for value in prob_sum_store.shape)
+    tile_h, tile_w = (int(value) for value in tile_shape)
+    positions = ((y0, x0) for y0 in range(0, height, tile_h) for x0 in range(0, width, tile_w))
+    with images.TiffWriter(output_path, (height, width), np.uint8, compression="lzw", tile=(tile_h, tile_w)) as writer:
+        for (y0, x0), tile in zip(positions, iter_probability_tiles(prob_sum_store, weight_sum_store, tile_shape)):
+            writer.write_tile(y0, x0, tile)
+
+
+def open_temp_zarr_array(
+    path: Path,
+    *,
+    shape: tuple[int, int],
+    chunks: tuple[int, int],
+):
+    """Create one explicit-v2 float32 accumulation array."""
+
+    return ZarrWriter.create(path, shape=shape, chunks=chunks, dtype=np.float32, overwrite=True, auth=None)
+
+
+def load_grayscale_mask(path: Path, target_shape: tuple[int, int]) -> np.ndarray:
+    """Read a nonzero foreground TIFF with top-left crop/pad alignment."""
+
+    image = np.squeeze(np.asarray(images.read(path)))
+    if image.ndim == 3:
+        image = image[..., 0]
+    if image.ndim != 2:
+        raise ValueError(f"Mask must be 2D, got {image.shape!r} from {path}")
+    output = np.zeros(target_shape, dtype=bool)
+    height = min(target_shape[0], image.shape[0])
+    width = min(target_shape[1], image.shape[1])
+    output[:height, :width] = image[:height, :width] != 0
+    if tuple(int(value) for value in image.shape[:2]) != tuple(target_shape):
+        LOGGER.warning(
+            "Mask shape %s did not match Zarr shape %s; applied top-left "
+            "crop/pad alignment",
+            tuple(int(value) for value in image.shape[:2]),
+            tuple(int(value) for value in target_shape),
+        )
+    return output
+
+
+def load_flat_inference_state(
+    model: nn.Module, state: Mapping[str, Any]
+):
+    """Load a flat inference state permissively after uniform DDP unwrapping."""
+
+    if state and all(str(key).startswith("module.") for key in state):
+        state = {
+            str(key)[len("module.") :]: value for key, value in state.items()
+        }
+    return model.load_state_dict(state, strict=False)
+
+
+class ProbabilityMeanEnsemble(nn.Module):
+    """Average member sigmoid probabilities and return them as logits.
+
+    Returning ``logit(mean(sigmoid(member)))`` keeps the downstream sigmoid,
+    mirror-TTA, and overlap-add path unchanged while the blended output is the
+    mean member probability.
+    """
+
+    def __init__(self, members: Sequence[nn.Module], *, eps: float = 1e-6) -> None:
+        super().__init__()
+        if len(members) < 2:
+            raise ValueError("An ensemble requires at least two member models")
+        self.members = nn.ModuleList(members)
+        self.eps = float(eps)
+
+    def forward(self, image_BCZYX: torch.Tensor) -> torch.Tensor:
+        probability_sum: torch.Tensor | None = None
+        for member in self.members:
+            probabilities = member(image_BCZYX).float().sigmoid()
+            if probability_sum is not None and (
+                probabilities.shape != probability_sum.shape
+            ):
+                raise ValueError(
+                    "Ensemble members produced different logits shapes: "
+                    f"{tuple(probability_sum.shape)} vs {tuple(probabilities.shape)}"
+                )
+            probability_sum = (
+                probabilities
+                if probability_sum is None
+                else probability_sum + probabilities
+            )
+        assert probability_sum is not None
+        return torch.logit(probability_sum / float(len(self.members)), eps=self.eps)
+
+
+def resolve_checkpoint_paths(args: argparse.Namespace) -> list[Path]:
+    """Return the primary checkpoint followed by any ensemble members."""
+
+    extra = getattr(args, "ensemble_checkpoint", None) or ()
+    return [Path(args.checkpoint), *(Path(path) for path in extra)]
+
+
+def configure_model(args: argparse.Namespace) -> ConfiguredModel:
+    """Rebuild flat model(s) and one shared preprocessing contract."""
+
+    checkpoints = resolve_checkpoint_paths(args)
+    members = [
+        configure_single_model(checkpoint, amp_dtype=args.amp_dtype)
+        for checkpoint in checkpoints
+    ]
+    if len(members) == 1:
+        return members[0]
+    reference = members[0]
+    contract = ("patch_size", "input_depth", "preprocessing", "amp_dtype")
+    for checkpoint, member in zip(checkpoints[1:], members[1:]):
+        mismatched = [
+            f"{field}={getattr(member, field)!r} (expected "
+            f"{getattr(reference, field)!r})"
+            for field in contract
+            if getattr(member, field) != getattr(reference, field)
+        ]
+        if mismatched:
+            raise ValueError(
+                f"Ensemble checkpoint {str(checkpoint)!r} is incompatible with "
+                f"{str(checkpoints[0])!r}: " + ", ".join(mismatched)
+            )
+    LOGGER.info(
+        "Averaging probabilities of %d checkpoints: %s",
+        len(members),
+        ", ".join(str(path) for path in checkpoints),
+    )
+    return replace(
+        reference,
+        model=ProbabilityMeanEnsemble([member.model for member in members]).eval(),
+    )
+
+
+def configure_single_model(
+    checkpoint: Path, *, amp_dtype: str
+) -> ConfiguredModel:
+    """Rebuild one strict flat model and preprocessing contract from checkpoint."""
+
+    payload = load_checkpoint(checkpoint)
+    if not isinstance(payload, Mapping) or not isinstance(
+        payload.get("config"), Mapping
+    ):
+        raise ValueError(
+            f"Inference checkpoint {str(checkpoint)!r} requires a config mapping"
+        )
+    config = InkConfig.from_mapping(payload["config"])
+    if config.data.mode != "flat":
+        raise ValueError(
+            f"Flat inference requires checkpoint mode='flat', got {config.data.mode!r}"
+        )
+    selected_state, state = select_inference_weights(
+        payload, source=checkpoint
+    )
+    base_model = make_model(config)
+    incompatibility = load_flat_inference_state(base_model, state)
+    LOGGER.info(
+        "Loaded %s weights from %s (missing_keys=%d unexpected_keys=%d)",
+        selected_state,
+        checkpoint,
+        len(incompatibility.missing_keys),
+        len(incompatibility.unexpected_keys),
+    )
+    base_model.eval()
+    crop_z, crop_y, crop_x = config.model.crop_size
+    if crop_y != crop_x:
+        raise ValueError(
+            f"Flat inference requires square Y/X patches, got {config.model.crop_size!r}"
+        )
+    model = TargetModel(
+        base_model,
+        input_pad_depth_to=config.model.input_pad_depth_to,
+    ).eval()
+    return ConfiguredModel(
+        model=model,
+        patch_size=crop_y,
+        input_depth=crop_z,
+        preprocessing=flat_preprocessing_from_config(config.data.normalization),
+        amp_dtype=resolve_amp_dtype(amp_dtype, payload, checkpoint),
+    )
+
+
+def _volume_axes(array: Any) -> tuple[bool, int, int, int, int, int]:
+    shape = tuple(int(value) for value in array.shape)
+    if len(shape) != 3:
+        raise ValueError(f"Flat input array must be rank 3, got {shape!r}")
+    chunks = tuple(int(value) for value in (array.chunks or shape))
+    depth_first = int(np.argmin(shape)) == 0
+    if depth_first:
+        depth, height, width = shape
+        _, chunk_h, chunk_w = chunks
+    else:
+        height, width, depth = shape
+        chunk_h, chunk_w, _ = chunks
+    return depth_first, depth, height, width, chunk_h, chunk_w
+
+
+def infer_single_zarr(
+    *,
+    args: argparse.Namespace,
+    input_zarr: str | Path,
+    configured_model: ConfiguredModel,
+    device: torch.device,
+    output_tiff: Path,
+    layer_direction: str = "forward",
+) -> None:
+    """Run one direction over one surface-volume input and replace a TIFF."""
+
+    root = open_volume_root(input_zarr)
+    resolution = "0" if hasattr(root, "shape") else str(args.resolution)
+    volume = select_volume_level(root, resolution, source=str(input_zarr))
+    depth_first, depth, height, width, chunk_h, chunk_w = _volume_axes(volume)
+    roi_values = getattr(args, "roi", None)
+    output_bounds = resolve_roi_bounds(roi_values, height=height, width=width)
+    roi_bounds = output_bounds if roi_values is not None else None
+    r0, r1, c0, c1 = output_bounds
+    output_shape = (r1 - r0, c1 - c0)
+    patch_size = configured_model.patch_size
+    stride = resolve_patch_stride(
+        patch_size=patch_size,
+        overlap=args.overlap,
+        explicit_stride=args.stride,
+    )
+    blend_mode = str(args.blend_mode)
+    if blend_mode == "auto":
+        blend_mode = "constant" if stride >= patch_size else "hann"
+    tile_shape = (patch_size, patch_size)
+    if patch_size % 16:
+        tile_shape = (chunk_h, chunk_w)
+    layer_indices = select_layer_indices(
+        depth,
+        layer_start=args.layer_start,
+        layer_end=args.layer_end,
+        output_depth=configured_model.input_depth,
+        direction=layer_direction,
+    )
+    LOGGER.info("Selected source layer indices=%s", layer_indices.tolist())
+    LOGGER.info(
+        "Input level=%s shape=(depth=%d, height=%d, width=%d) "
+        "chunks=(%d, %d) patch=%d stride=%d requested_overlap=%.3f "
+        "blend_mode=%s tta_mirror=%s",
+        resolution,
+        depth,
+        height,
+        width,
+        chunk_h,
+        chunk_w,
+        patch_size,
+        stride,
+        float(args.overlap),
+        blend_mode,
+        bool(args.tta_mirror),
+    )
+    reader = FlatPatchReader(
+        input_path=input_zarr,
+        resolution=resolution,
+        depth_axis_first=depth_first,
+        height=height,
+        width=width,
+        layer_indices=layer_indices,
+        output_depth=configured_model.input_depth,
+        preprocessing=configured_model.preprocessing,
+        chunk_cache_size=args.chunk_cache_size,
+    )
+    mask = (
+        None
+        if args.mask_path is None
+        else load_grayscale_mask(args.mask_path, (height, width))
+    )
+    if mask is None:
+        LOGGER.info("No mask supplied; using the entire Zarr")
+    else:
+        LOGGER.info(
+            "Loaded mask %s with foreground coverage %.3f%%",
+            args.mask_path,
+            100.0 * float(mask.mean()),
+        )
+    occupancy, occupancy_scale, occupancy_level = build_lowres_block_mask(
+        root,
+        height=height,
+        width=width,
+        user_mask=mask,
+    )
+    if occupancy is None:
+        LOGGER.warning(
+            "No low-resolution occupancy scan is available for %s; all tiles "
+            "will be scheduled",
+            input_zarr,
+        )
+    else:
+        LOGGER.info(
+            "Using occupancy scan level=%s shape=%s scale=(%d, %d) "
+            "nonempty_coverage=%.3f%%",
+            occupancy_level,
+            tuple(int(value) for value in occupancy.shape),
+            int(occupancy_scale[0]),
+            int(occupancy_scale[1]),
+            100.0 * float(occupancy.mean()),
+        )
+    blocks = iter_blocks(
+        (height, width),
+        patch_size,
+        stride,
+        occupancy,
+        occupancy_scale,
+        roi_bounds=roi_bounds,
+    )
+    LOGGER.info("Selected %d patches for inference", len(blocks))
+    output_blocks = blocks if roi_bounds is None else [clip_block_to_roi(block, roi_bounds) for block in blocks]
+    LOGGER.info("Output bounds=(%d, %d, %d, %d) shape=%s; parent patch grid retained", *output_bounds, output_shape)
+    dataset = FlatBlockDataset(
+        reader=reader,
+        blocks=blocks,
+        patch_size=patch_size,
+        preprocessing=configured_model.preprocessing,
+    )
+    effective_batch_size = args.batch_size * max(1, len(args.gpu_ids))
+    loader_kwargs: dict[str, Any] = {
+        "dataset": dataset,
+        "batch_size": effective_batch_size,
+        "shuffle": False,
+        "num_workers": args.num_workers,
+        "pin_memory": device.type == "cuda",
+        "drop_last": False,
+    }
+    if args.num_workers > 0:
+        loader_kwargs.update(
+            persistent_workers=True,
+            prefetch_factor=args.prefetch_factor,
+            multiprocessing_context="spawn",
+        )
+    if args.loader_threads > 0:
+        loader = ThreadedBatchLoader(
+            dataset,
+            batch_size=effective_batch_size,
+            num_threads=args.loader_threads,
+            prefetch_batches=args.prefetch_factor,
+        )
+    else:
+        loader = DataLoader(**loader_kwargs)
+    weight_map = compute_importance_map_2d(
+        patch_size=(patch_size, patch_size), mode=blend_mode
+    ).numpy()
+    tta_axes = (
+        compute_equal_length_mirror_axes(
+            (configured_model.input_depth, patch_size, patch_size)
+        )
+        if args.tta_mirror
+        else ()
+    )
+
+    temporary = Path(tempfile.mkdtemp(prefix="ink_flat_infer_"))
+    try:
+        accumulation_chunks = (
+            min(tile_shape[0], output_shape[0]),
+            min(tile_shape[1], output_shape[1]),
+        )
+        accumulation_bytes = 2 * 4 * output_shape[0] * output_shape[1]
+        if accumulation_bytes <= args.max_ram_accumulation_gb * 1024**3:
+            # Two float32 planes in RAM avoid one temp-zarr write per chunk
+            # here and one read per chunk when the TIFF is encoded.
+            LOGGER.info(
+                "Accumulating in RAM (%.2f GiB)", accumulation_bytes / 1024**3
+            )
+            probability_sum = np.zeros(output_shape, dtype=np.float32)
+            weight_sum = np.zeros(output_shape, dtype=np.float32)
+        else:
+            probability_sum = open_temp_zarr_array(
+                temporary / "probability.zarr",
+                shape=output_shape,
+                chunks=accumulation_chunks,
+            )
+            weight_sum = open_temp_zarr_array(
+                temporary / "weight.zarr",
+                shape=output_shape,
+                chunks=accumulation_chunks,
+            )
+        accumulator = ChunkAccumulator(
+            shape=output_shape,
+            chunk_shape=accumulation_chunks,
+            prob_sum_store=probability_sum,
+            weight_sum_store=weight_sum,
+            contribution_counts=compute_chunk_contribution_counts(
+                output_blocks, chunk_shape=accumulation_chunks
+            ),
+        )
+        if blocks:
+            run_block_inference(
+                loader=loader,
+                model=configured_model.model,
+                accumulator=accumulator,
+                weight_map=weight_map,
+                mask=mask,
+                device=device,
+                amp_dtype=configured_model.amp_dtype,
+                tta_axes=tta_axes,
+                tta_batch_size=args.tta_batch_size,
+                roi_bounds=roi_bounds,
+            )
+            accumulator.flush_remaining()
+        else:
+            LOGGER.warning(
+                "No occupied blocks were found; writing an all-zero output"
+            )
+        metadata_path = output_tiff.with_suffix(output_tiff.suffix + ".roi.json")
+        # An overwritten full-frame image must not inherit a previous ROI's frame.
+        # Invalidate the old metadata before replacing its associated image.
+        metadata_path.unlink(missing_ok=True)
+        write_output_tiff(
+            probability_sum,
+            weight_sum,
+            output_tiff,
+            tile_shape,
+        )
+        if roi_bounds is not None:
+            metadata_path.write_text(json.dumps({
+                "input": str(input_zarr), "input_resolution": resolution,
+                "parent_shape_yx": [height, width],
+                "roi_row_start_stop_col_start_stop": list(roi_bounds),
+                "patch_size": patch_size, "stride": stride, "blend_mode": blend_mode,
+                "layer_indices": layer_indices.tolist(), "direction": layer_direction,
+                "parent_grid_retained": True,
+            }, indent=2) + "\n", encoding="utf-8")
+    finally:
+        shutil.rmtree(temporary, ignore_errors=True)
+
+
+def resolve_run_directions(direction: str) -> tuple[str, ...]:
+    """Expand the CLI direction to concrete ordered runs."""
+
+    return ("forward", "reverse") if direction == "both" else (direction,)
+
+
+def resolve_single_output_path(
+    output_tiff: Path,
+    *,
+    direction: str,
+    requested_direction: str,
+) -> Path:
+    """Append only the reverse suffix for a two-direction single run."""
+
+    if requested_direction != "both" or direction == "forward":
+        return output_tiff
+    return output_tiff.with_name(
+        f"{output_tiff.stem}_{direction}{output_tiff.suffix}"
+    )
+
+
+def resolve_segment_zarr_path(segment_dir: Path) -> Path:
+    """Resolve the frozen folder-mode direct candidates or sole discovery."""
+
+    candidates = (
+        segment_dir / segment_dir.name,
+        segment_dir / f"{segment_dir.name}.zarr",
+        segment_dir / f"{segment_dir.name}.ome.zarr",
+    )
+    for candidate in candidates:
+        if candidate.exists():
+            return candidate
+    discovered = []
+    for child in sorted(segment_dir.iterdir()):
+        if not child.is_dir():
+            continue
+        if child.suffix == ".zarr" or any(
+            (child / marker).exists()
+            for marker in (".zgroup", ".zarray", "zarr.json")
+        ):
+            discovered.append(child)
+    if len(discovered) == 1:
+        return discovered[0]
+    raise FileNotFoundError(
+        f"Could not resolve exactly one Zarr for segment {segment_dir.name!r}"
+    )
+
+
+def infer_folder(
+    args: argparse.Namespace,
+    configured_model: ConfiguredModel,
+    *,
+    device: torch.device,
+) -> None:
+    """Run sorted folder segments, skipping any previously dated prediction."""
+
+    folder = Path(args.folder)
+    if not folder.is_dir():
+        raise NotADirectoryError(f"--folder is not a directory: {folder}")
+    try:
+        resolve_segment_zarr_path(folder)
+    except FileNotFoundError:
+        segment_dirs = sorted(path for path in folder.iterdir() if path.is_dir())
+        if not segment_dirs:
+            raise FileNotFoundError(f"No segment directories found under {folder}")
+    else:
+        segment_dirs = [folder]
+    checkpoint_count = len(resolve_checkpoint_paths(args))
+    checkpoint_stem = Path(args.checkpoint).stem
+    if checkpoint_count > 1:
+        checkpoint_stem = f"{checkpoint_stem}_ens{checkpoint_count}"
+    date = datetime.now().strftime("%d%m%y")
+    prefix = f"{args.output_prefix}_" if args.output_prefix else ""
+    ran_count = 0
+    skipped_count = 0
+    for segment_dir in segment_dirs:
+        try:
+            input_zarr = resolve_segment_zarr_path(segment_dir)
+        except FileNotFoundError as exc:
+            LOGGER.warning("Skipping %s: %s", segment_dir, exc)
+            skipped_count += 1
+            continue
+        for direction in resolve_run_directions(args.direction):
+            name_prefix = (
+                f"{prefix}{segment_dir.name}_{checkpoint_stem}_{direction}_"
+            )
+            prediction_dir = segment_dir / "preds"
+            existing = (
+                next(prediction_dir.glob(f"{name_prefix}*.tif"), None)
+                if prediction_dir.exists()
+                else None
+            )
+            if existing is not None:
+                LOGGER.info(
+                    "Skipping segment=%s direction=%s — already have %s",
+                    segment_dir.name,
+                    direction,
+                    existing.name,
+                )
+                skipped_count += 1
+                continue
+            infer_single_zarr(
+                args=args,
+                input_zarr=input_zarr,
+                configured_model=configured_model,
+                device=device,
+                output_tiff=prediction_dir / f"{name_prefix}{date}.tif",
+                layer_direction=direction,
+            )
+            ran_count += 1
+    LOGGER.info(
+        "Folder run complete. segments_ran=%d segments_skipped=%d",
+        ran_count,
+        skipped_count,
+    )
+
+
+def _is_url(path: str | Path) -> bool:
+    parsed = urlparse(str(path))
+    return bool(parsed.scheme and parsed.netloc)
+
+
+def normalize_inference_paths(args: argparse.Namespace) -> argparse.Namespace:
+    """Normalize the two accepted positional/folder command shapes."""
+
+    if args.input_zarr is not None and not _is_url(args.input_zarr):
+        args.input_zarr = Path(args.input_zarr)
+    args.output_tiff = None if args.output_tiff is None else Path(args.output_tiff)
+    args.folder = None if args.folder is None else Path(args.folder)
+    args.checkpoint = None if args.checkpoint is None else Path(args.checkpoint)
+    if args.checkpoint_path is not None:
+        args.checkpoint = Path(args.checkpoint_path)
+    if (
+        args.folder is not None
+        and args.checkpoint is None
+        and args.input_zarr is not None
+        and args.output_tiff is None
+    ):
+        args.checkpoint = Path(args.input_zarr)
+        args.input_zarr = None
+    if args.checkpoint is None:
+        raise ValueError(
+            "Checkpoint is required as a positional or --checkpoint-path"
+        )
+    if args.folder is not None:
+        if args.output_tiff is not None:
+            raise ValueError("output_tiff is forbidden with --folder")
+    elif args.input_zarr is None or args.output_tiff is None:
+        raise ValueError(
+            "Single mode requires <input_zarr> <checkpoint> <output_tiff>"
+        )
+    return args
+
+
+def parse_args(argv: Sequence[str] | None = None):
+    """Parse the frozen flat-inference CLI with separator aliases."""
+
+    parser = HyphenUnderscoreParser(
+        description="Run ink inference on a flat surface-volume Zarr"
+    )
+    parser.add_argument("input_zarr", nargs="?")
+    parser.add_argument("checkpoint", nargs="?", type=Path)
+    parser.add_argument("output_tiff", nargs="?", type=Path)
+    parser.add_argument("--folder", type=Path)
+    parser.add_argument("--checkpoint-path", type=Path)
+    parser.add_argument(
+        "--ensemble-checkpoint",
+        type=Path,
+        action="append",
+        default=[],
+        help=(
+            "Additional checkpoint whose probabilities are averaged with the "
+            "primary checkpoint before blending. Repeatable; every member must "
+            "share patch size, input depth, preprocessing, and AMP dtype."
+        ),
+    )
+    parser.add_argument("--output-prefix", default="")
+    parser.add_argument("--mask-path", type=Path)
+    parser.add_argument(
+        "--roi", nargs=4, type=int,
+        metavar=("ROW_START", "ROW_STOP", "COL_START", "COL_STOP"),
+        help="Half-open output rectangle at --resolution; retain original parent patches and CT context.",
+    )
+    parser.add_argument("--resolution", default="0")
+    parser.add_argument(
+        "--num-workers", "--workers", dest="num_workers", type=int, default=4
+    )
+    parser.add_argument("--prefetch-factor", type=int, default=2)
+    parser.add_argument(
+        "--max-ram-accumulation-gb",
+        type=float,
+        default=2.0,
+        help="Keep the float32 probability/weight sums in RAM when they fit "
+        "in this many GiB; larger outputs use temporary Zarr arrays",
+    )
+    parser.add_argument(
+        "--loader-threads",
+        type=int,
+        default=0,
+        help="Read patches with this many threads instead of spawned "
+        "--num-workers processes (avoids per-worker import cost on Windows)",
+    )
+    parser.add_argument(
+        "--chunk-cache-size",
+        type=int,
+        default=0,
+        help="Decoded source chunks kept per loader worker so overlapping "
+        "patches reuse reads (default: 0, disabled); RAM use scales with "
+        "chunk dimensions, dtype, selected depth, and worker count",
+    )
+    parser.add_argument(
+        "--overlap",
+        type=float,
+        default=DEFAULT_OVERLAP,
+        help="Sliding-window overlap fraction. Default: 0.5.",
+    )
+    parser.add_argument("--stride", type=int)
+    parser.add_argument(
+        "--blend-mode",
+        choices=("auto", "constant", "gaussian", "hann"),
+        default="auto",
+        help=(
+            "Overlap-add importance window. 'auto' selects constant without "
+            "overlap, Hann otherwise."
+        ),
+    )
+    parser.add_argument("--layer-start", type=int)
+    parser.add_argument("--layer-end", type=int)
+    parser.add_argument("--batch-size", type=int, default=1)
+    parser.add_argument(
+        "--direction", choices=("forward", "reverse", "both"), default="forward"
+    )
+    parser.add_argument(
+        "--amp-dtype",
+        choices=("auto", "default", "fp16", "bf16"),
+        default="auto",
+    )
+    parser.add_argument("--tta-mirror", action="store_true")
+    parser.add_argument("--tta-batch-size", type=int)
+    parser.add_argument(
+        "--device",
+        choices=DEVICE_CHOICES,
+        default="auto",
+        help="Device for the model. auto picks CUDA, then MPS, then CPU; --gpus implies CUDA.",
+    )
+    parser.add_argument("--gpus")
+    parser.add_argument("--compile-mode", default="reduce-overhead")
+    parser.add_argument("--no-compile", dest="compile_model", action="store_false")
+    parser.set_defaults(compile_model=True)
+    args = parser.parse_args(argv)
+    if args.num_workers < 0:
+        parser.error("--num-workers must be nonnegative")
+    if args.prefetch_factor <= 0:
+        parser.error("--prefetch-factor must be positive")
+    if args.loader_threads < 0:
+        parser.error("--loader-threads must be nonnegative")
+    if args.chunk_cache_size < 0:
+        parser.error("--chunk-cache-size must be nonnegative")
+    if args.batch_size <= 0:
+        parser.error("--batch-size must be positive")
+    if args.tta_batch_size is not None and args.tta_batch_size <= 0:
+        parser.error("--tta-batch-size must be positive")
+    try:
+        args.gpu_ids = parse_gpu_ids(args.gpus)
+    except ValueError as exc:
+        parser.error(str(exc))
+    return args
+
+
+def main(argv: Sequence[str] | None = None) -> int:
+    """Run the flat inference command."""
+
+    args = normalize_inference_paths(parse_args(argv))
+    logging.basicConfig(
+        level=logging.INFO,
+        format="[%(asctime)s] %(levelname)s %(message)s",
+    )
+    if hasattr(torch, "set_float32_matmul_precision"):
+        torch.set_float32_matmul_precision("high")
+    configured = configure_model(args)
+    prepared_model, device = prepare_model_for_inference(
+        configured.model,
+        gpu_ids=args.gpu_ids,
+        device_type=args.device,
+        compile_model=args.compile_model,
+        compile_mode=args.compile_mode,
+    )
+    configured = replace(configured, model=prepared_model)
+    if args.folder is not None:
+        infer_folder(args, configured, device=device)
+    else:
+        for direction in resolve_run_directions(args.direction):
+            infer_single_zarr(
+                args=args,
+                input_zarr=args.input_zarr,
+                configured_model=configured,
+                device=device,
+                output_tiff=resolve_single_output_path(
+                    args.output_tiff,
+                    direction=direction,
+                    requested_direction=args.direction,
+                ),
+                layer_direction=direction,
+            )
+    return 0
+
+
+if __name__ == "__main__":
+    raise SystemExit(main())

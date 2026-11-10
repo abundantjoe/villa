@@ -1,15 +1,21 @@
 #include "CFiberWidget.hpp"
+#include "FiberNameDisplay.hpp"
 
 #include <QAction>
 #include <QApplication>
 #include <QCheckBox>
+#include <QDoubleSpinBox>
 #include <QHeaderView>
 #include <QLineEdit>
+#include <QLabel>
 #include <QMetaObject>
+#include <QPersistentModelIndex>
 #include <QPushButton>
 #include <QScrollBar>
 #include <QStandardItemModel>
+#include <QSlider>
 #include <QTreeView>
+#include <QThreadPool>
 
 #include <cstdlib>
 #include <iostream>
@@ -78,12 +84,15 @@ int main(int argc, char** argv)
 
     std::unique_ptr<QApplication> app;
     ensureApplication(argc, argv, app);
+    QThreadPool::globalInstance()->setMaxThreadCount(1);
 
     CFiberWidget widget;
     auto first = makeFiber(1, "aa_20260605T184821587_000001.json", 2, 20, 12.0, {"source-a"});
     first.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38)});
     auto second = makeFiber(2, "kb_20260605T184821587_000002.json", 3, 30, 24.0, {"review"});
     second.alignment = makeMetric(25.0, 50.0, 58);
+    second.linkedFiberCount = 2;
+    second.pendingLinkCount = 1;
     second.spans.push_back({0, 0, 1, 2, 14, 11.0, makeMetric(7.0, 20.0, 26)});
     second.spans.push_back({1, 1, 2, 2, 17, 13.0, makeMetric(31.0, 52.0, 32)});
     auto third = makeFiber(3, "zz_20260605T184821587_000003.json", 4, 40, 36.0);
@@ -94,7 +103,14 @@ int main(int argc, char** argv)
     auto* treeView = widget.findChild<QTreeView*>(QStringLiteral("fiberTreeView"));
     require(treeView != nullptr, "Fiber tree view was not found");
     require(treeView->model() != nullptr, "Fiber tree view model was not found");
-    require(treeView->model()->columnCount() == 8, "Fiber tree should expose eight columns");
+    const QFontMetrics metrics(treeView->font());
+    const QString adaptedName = vc3d::adaptFiberNameToWidth(
+        QStringLiteral("kb_20260605T184821587_000002"),
+        metrics,
+        metrics.horizontalAdvance(QStringLiteral("kb_..._000002")));
+    require(adaptedName.endsWith(QStringLiteral("_000002")),
+            "Fiber name elision should preserve the sequence suffix");
+    require(treeView->model()->columnCount() == 9, "Fiber tree should expose nine columns");
     require(treeView->header()->sectionResizeMode(0) == QHeaderView::Interactive,
             "Fiber tree header should allow changing column widths");
     require(treeView->model()->index(1, 0).data().toString() ==
@@ -104,12 +120,25 @@ int main(int argc, char** argv)
             "Fiber tree row should not show the JSON extension");
     require(!treeView->model()->index(1, 0).data().toString().startsWith(QStringLiteral("2 ")),
             "Fiber tree row should not show the runtime fiber ID");
+    // Span children are lazy: a collapsed fiber carries one placeholder
+    // child (so the expand arrow shows) and the real span rows are built on
+    // first expansion.
+    require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 1,
+            "Collapsed fiber row should carry exactly one placeholder child");
+    treeView->expand(treeView->model()->index(1, 0));
     require(treeView->model()->rowCount(treeView->model()->index(1, 0)) == 2,
-            "Fiber tree row did not expose span children");
-    require(treeView->model()->index(1, 5).data().toString() == QStringLiteral("review"),
+            "Fiber tree row did not expose span children after expansion");
+    require(treeView->model()->index(1, 2).data().toString() == QStringLiteral("2"),
+            "Fiber tree link column did not show the linked fiber count");
+    require(treeView->model()->index(1, 3).data().toString() == QStringLiteral("1"),
+            "Fiber tree pending column did not show the pending link count");
+    require(treeView->model()->index(0, 3).data().toString().isEmpty(),
+            "Fiber tree pending column should be blank when no links are pending");
+    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("review"),
             "Fiber tree tags column did not show fiber tags");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("-"),
-            "Metrics should be hidden before Calc metrics is enabled");
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString().contains(
+                QStringLiteral("Enable Calc metrics")),
+            "Row tooltip should explain metrics before Calc metrics is enabled");
     require(widget.orderedFiberIds() == std::vector<uint64_t>({1, 2, 3}),
             "Initial fiber order should match the sorted list order");
 
@@ -147,14 +176,68 @@ int main(int argc, char** argv)
                      });
     auto* calcMetrics = widget.findChild<QCheckBox*>(QStringLiteral("fiberCalcMetricsCheckBox"));
     require(calcMetrics != nullptr, "Calc metrics checkbox was not found");
+    auto* showFibers = widget.findChild<QCheckBox*>(QStringLiteral("fiberShowFibersCheckBox"));
+    require(showFibers != nullptr, "Show fibers checkbox was not found");
+    auto* sliceDistance = widget.findChild<QDoubleSpinBox*>(QStringLiteral("fiberSliceDistanceSpinBox"));
+    require(sliceDistance != nullptr, "Slice distance spinbox was not found");
+    require(widget.displayOptions() == FiberDisplayOptions{}, "Display options should start at their defaults");
+    int optionRequests = 0;
+    FiberDisplayOptions requestedOptions;
+    QObject::connect(&widget,
+                     &CFiberWidget::displayOptionsChanged,
+                     &widget,
+                     [&](FiberDisplayOptions options) {
+                         ++optionRequests;
+                         requestedOptions = options;
+                     });
+    FiberDisplayOptions programmatic;
+    programmatic.sliceDistance = 25.0;
+    programmatic.showLinked = true;
+    widget.setDisplayOptions(programmatic);
+    require(widget.displayOptions() == programmatic,
+            "Programmatic display options did not update the controls");
+    require(optionRequests == 0, "Programmatic display options should not emit a request");
+    sliceDistance->setValue(30.0);
+    require(optionRequests == 1 && requestedOptions.sliceDistance == 30.0 && requestedOptions.showLinked,
+            "User slice distance change did not emit the complete options");
+    showFibers->setChecked(false);
+    require(optionRequests == 2 && !requestedOptions.showFibers,
+            "User Show fibers toggle did not emit the requested state");
+
+    auto* detach = widget.findChild<QPushButton*>(QStringLiteral("fiberDetachStoreButton"));
+    auto* nextPage = widget.findChild<QPushButton*>(QStringLiteral("fiberNextPageButton"));
+    auto* fiberId = widget.findChild<QLineEdit*>(QStringLiteral("fiberIdEdit"));
+    require(detach && nextPage && fiberId, "Store controls were not found");
+    require(!detach->isEnabled() && !fiberId->isEnabled(), "Store controls should start detached");
+    widget.setStoreStatus(true, QStringLiteral("2 fibers in store"));
+    widget.setNextPageAvailable(true);
+    require(detach->isEnabled() && nextPage->isEnabled() && fiberId->isEnabled(),
+            "An attached store should enable its controls");
+    uint64_t activated = 0;
+    QObject::connect(&widget, &CFiberWidget::fiberActivated, &widget, [&](uint64_t id) { activated = id; });
+    fiberId->setText(QStringLiteral("42"));
+    QMetaObject::invokeMethod(fiberId, "returnPressed");
+    require(activated == 42, "Entering a fiber ID should activate it");
+    widget.setStoreStatus(false, QStringLiteral("No object store attached."));
+    require(!detach->isEnabled() && !nextPage->isEnabled(), "Detaching should disable the store controls");
+
+    auto* trace = widget.findChild<QSlider*>(QStringLiteral("fiberTraceSlider"));
+    require(trace && !trace->isEnabled(), "Trace slider should start disabled");
+    int traceIndex = -1;
+    QObject::connect(&widget, &CFiberWidget::traceIndexChanged, &widget, [&](int index) { traceIndex = index; });
+    widget.setTraceSelection(QStringLiteral("#7"), {}, 11, 5, true);
+    require(trace->isEnabled() && trace->maximum() == 10 && trace->value() == 5 && traceIndex == -1,
+            "Trace selection should set the slider without emitting");
+    trace->setValue(8);
+    require(traceIndex == 8, "Moving the trace slider should emit its index");
     auto* model = qobject_cast<QStandardItemModel*>(treeView->model());
     require(model != nullptr, "Fiber tree should use a standard item model");
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     require(widget.orderedFiberIds() == std::vector<uint64_t>({3, 2, 1}),
             "Fiber order should track the current sorted list order");
     QStandardItem* secondItemBeforeMetrics = model->item(1, 0);
@@ -164,40 +247,33 @@ int main(int argc, char** argv)
             "Calc metrics request should use the current fiber list order");
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Toggling Calc metrics should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("25.0"),
-            "Mean alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("50.0"),
-            "Max alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7).data(Qt::BackgroundRole).isValid(),
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString() ==
+                QStringLiteral("58 samples"),
+            "Row tooltip should carry the alignment sample count");
+    require(treeView->model()->index(1, 0).data(Qt::BackgroundRole).isValid(),
             "Fiber row with max alignment error > 45 deg was not highlighted");
     const QModelIndex secondParent = treeView->model()->index(1, 0);
-    require(treeView->model()->index(1, 7, secondParent).data().toString() == QStringLiteral("52.0"),
-            "Span max alignment error metric was not displayed");
-    require(treeView->model()->index(1, 7, secondParent).data(Qt::BackgroundRole).isValid(),
+    require(!treeView->model()->index(0, 0, secondParent).data(Qt::BackgroundRole).isValid(),
+            "Span row within the alignment threshold should not be highlighted");
+    require(treeView->model()->index(1, 0, secondParent).data(Qt::BackgroundRole).isValid(),
             "Span row with max alignment error > 45 deg was not highlighted");
-    widget.setAlignmentMetricsPending(true);
-    require(model->item(1, 0) == secondItemBeforeMetrics,
-            "Marking metrics pending should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("..."),
-            "Pending metric state should be displayed in-place");
     widget.updateAlignmentMetrics(
         2,
         makeMetric(26.0, 51.0, 60),
         {makeMetric(9.0, 21.0, 27), makeMetric(32.0, 53.0, 33)});
     require(model->item(1, 0) == secondItemBeforeMetrics,
             "Live metric update should update cells without rebuilding the fiber rows");
-    require(treeView->model()->index(1, 6).data().toString() == QStringLiteral("26.0"),
-            "Live fiber mean alignment metric was not displayed");
-    require(treeView->model()->index(1, 7).data().toString() == QStringLiteral("51.0"),
-            "Live fiber max alignment metric was not displayed");
-    require(treeView->model()->index(1, 7, secondParent).data().toString() == QStringLiteral("53.0"),
-            "Live span alignment metric was not displayed");
+    require(treeView->model()->index(1, 0).data(Qt::ToolTipRole).toString() ==
+                QStringLiteral("60 samples"),
+            "Live fiber metric update should refresh the row tooltip");
+    require(treeView->model()->index(1, 0, secondParent).data(Qt::BackgroundRole).isValid(),
+            "Live span metric update should keep the over-threshold highlight");
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     QMetaObject::invokeMethod(treeView->header(),
                               "sectionClicked",
-                              Q_ARG(int, 2));
+                              Q_ARG(int, 4));
     require(treeView->model()->index(0, 0).data().toString() ==
                 QStringLiteral("zz_20260605T184821587_000003"),
             "Sorting by length descending should reorder only top-level fibers");
@@ -213,10 +289,12 @@ int main(int argc, char** argv)
 
     auto* deleteButton = widget.findChild<QPushButton*>(QStringLiteral("fiberDeleteButton"));
     require(deleteButton != nullptr, "Fiber delete button was not found");
+    auto* importButton = widget.findChild<QPushButton*>(QStringLiteral("fiberImportButton"));
+    require(importButton != nullptr, "Fiber import button was not found");
+    auto* exportButton = widget.findChild<QPushButton*>(QStringLiteral("fiberExportButton"));
+    require(exportButton != nullptr, "Fiber export button was not found");
     require(!deleteButton->isEnabled(), "Delete button should start disabled");
     require(!widget.canDeleteSelection(), "Empty selection should not allow delete");
-    require(!widget.canCreateAtlasFromSelection(), "Empty selection should not allow atlas creation");
-    require(!widget.canShowFiberSlice(), "Empty selection should not allow fiber slice");
     require(!widget.canRenameFiberFile(), "Empty selection should not allow JSON rename");
 
     widget.selectFiber(2);
@@ -224,25 +302,14 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {2}), "Single selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for a single selection");
     require(widget.canDeleteSelection(), "Single selection should allow delete");
-    require(widget.canCreateAtlasFromSelection(), "Single selection should allow atlas creation");
-    require(widget.canShowFiberSlice(), "Single selection should allow fiber slice");
     require(widget.canRenameFiberFile(), "Single selection should allow JSON rename");
 
-    int sliceRequests = 0;
     int renameRequests = 0;
     int tagRequests = 0;
-    uint64_t requestedSliceFiberId = 0;
     uint64_t requestedRenameFiberId = 0;
     uint64_t requestedTagFiberId = 0;
     QString requestedTag;
     bool requestedTagEnabled = false;
-    QObject::connect(&widget,
-                     &CFiberWidget::fiberSliceRequested,
-                     &widget,
-                     [&](uint64_t fiberId) {
-                         ++sliceRequests;
-                         requestedSliceFiberId = fiberId;
-                     });
     QObject::connect(&widget,
                      &CFiberWidget::renameFiberFileRequested,
                      &widget,
@@ -259,11 +326,6 @@ int main(int argc, char** argv)
                          requestedTag = tag;
                          requestedTagEnabled = enabled;
                      });
-    auto* showSliceAction = widget.createShowFiberSliceAction(&widget);
-    require(showSliceAction->isEnabled(), "Single selection should enable Show fiber slice action");
-    showSliceAction->trigger();
-    require(sliceRequests == 1, "Show fiber slice action did not emit one request");
-    require(requestedSliceFiberId == 2, "Show fiber slice emitted the wrong fiber ID");
     auto* renameAction = widget.createRenameFiberFileAction(&widget);
     require(renameAction->isEnabled(), "Single selection should enable Rename JSON file action");
     renameAction->trigger();
@@ -271,7 +333,10 @@ int main(int argc, char** argv)
     require(requestedRenameFiberId == 2, "Rename JSON file emitted the wrong fiber ID");
 
     auto tagCheckboxes = widget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxes.size() == 3, "Known tags did not create three checkboxes");
+    // Three known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxes.size() == 4, "Known tags did not create four checkboxes");
+    require(tagCheckboxes.front()->text() == QStringLiteral("reviewed"),
+            "The 'reviewed' tag checkbox should be pinned first");
     QCheckBox* reviewCheckbox = nullptr;
     QCheckBox* todoCheckbox = nullptr;
     for (auto* checkbox : tagCheckboxes) {
@@ -286,6 +351,7 @@ int main(int argc, char** argv)
     require(reviewCheckbox->isChecked(), "Selected fiber tag should be checked");
     require(!todoCheckbox->isChecked(), "Unchecked known tag should not be checked");
     todoCheckbox->setChecked(true);
+    QApplication::processEvents();
     require(tagRequests == 1, "Checking a tag did not emit one tag request");
     require(requestedTagFiberId == 2, "Tag check emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("todo"), "Tag check emitted the wrong tag");
@@ -297,6 +363,7 @@ int main(int argc, char** argv)
     require(addTagButton != nullptr, "Add tag button was not found");
     newTagEdit->setText(QStringLiteral("needs-proofread"));
     addTagButton->click();
+    QApplication::processEvents();
     require(tagRequests == 2, "Adding a tag did not emit a second tag request");
     require(requestedTagFiberId == 2, "Added tag emitted the wrong fiber ID");
     require(requestedTag == QStringLiteral("needs-proofread"), "Added tag emitted the wrong tag");
@@ -307,11 +374,7 @@ int main(int argc, char** argv)
     require(sameIds(widget.selectedFiberIds(), {1, 3}), "Multi-selection IDs are wrong");
     require(deleteButton->isEnabled(), "Delete button should enable for multi-selection");
     require(widget.canDeleteSelection(), "Multi-selection should allow delete");
-    require(!widget.canCreateAtlasFromSelection(), "Multi-selection should gray out atlas creation");
-    require(!widget.canShowFiberSlice(), "Multi-selection should gray out fiber slice");
     require(!widget.canRenameFiberFile(), "Multi-selection should gray out JSON rename");
-    auto* multiShowSliceAction = widget.createShowFiberSliceAction(&widget);
-    require(!multiShowSliceAction->isEnabled(), "Multi-selection should disable Show fiber slice action");
     auto* multiRenameAction = widget.createRenameFiberFileAction(&widget);
     require(!multiRenameAction->isEnabled(), "Multi-selection should disable Rename JSON file action");
     require(!newTagEdit->isEnabled(), "Multi-selection should disable new tag text field");
@@ -352,7 +415,8 @@ int main(int argc, char** argv)
 
     const auto tagCheckboxesBefore =
         scrollWidget.findChildren<QCheckBox*>(QStringLiteral("fiberTagCheckBox"));
-    require(tagCheckboxesBefore.size() == 4, "Scrollable fiber widget should expose four tag checkboxes");
+    // Four known tags plus the always-offered pinned 'reviewed' tag.
+    require(tagCheckboxesBefore.size() == 5, "Scrollable fiber widget should expose five tag checkboxes");
     scrollBar->setValue(scrollBar->maximum());
     QApplication::processEvents();
     const int directSelectionScroll = scrollBar->value();
@@ -379,8 +443,22 @@ int main(int argc, char** argv)
 
     int confirmations = 0;
     int batchDeletes = 0;
+    int importRequests = 0;
+    int exportRequests = 0;
     std::vector<uint64_t> confirmedIds;
     std::vector<uint64_t> deletedIds;
+    QObject::connect(&widget,
+                     &CFiberWidget::importFibersRequested,
+                     &widget,
+                     [&]() {
+                         ++importRequests;
+                     });
+    QObject::connect(&widget,
+                     &CFiberWidget::exportFibersRequested,
+                     &widget,
+                     [&]() {
+                         ++exportRequests;
+                     });
     QObject::connect(&widget,
                      &CFiberWidget::deleteFibersRequested,
                      &widget,
@@ -388,6 +466,10 @@ int main(int argc, char** argv)
                          ++batchDeletes;
                          deletedIds = std::move(ids);
                      });
+    importButton->click();
+    require(importRequests == 1, "Import button did not emit one import request");
+    exportButton->click();
+    require(exportRequests == 1, "Export button did not emit one export request");
 
     widget.setDeleteConfirmationForTesting([&](const std::vector<uint64_t>& ids) {
         ++confirmations;
@@ -409,5 +491,94 @@ int main(int argc, char** argv)
     require(batchDeletes == 1, "Confirmed delete did not emit one batch delete request");
     require(sameIds(deletedIds, {1, 3}), "Batch delete request IDs are wrong");
 
+    // Interpolation-status column.
+    auto legacyFiber = makeFiber(11, "aa_20260605T184821587_000011.json", 2, 20, 12.0);
+    legacyFiber.spans.push_back({0, 0, 1, 2, 20, 12.0, makeMetric(8.0, 12.0, 38), 'L'});
+    auto tracedFiber = makeFiber(12, "kb_20260605T184821587_000012.json", 3, 30, 24.0);
+    tracedFiber.traceState = CFiberWidget::FiberEntry::TraceState::Predictions;
+    tracedFiber.spans.push_back({0, 0, 1, 2, 14, 11.0, makeMetric(7.0, 20.0, 26), 'T'});
+    tracedFiber.spans.push_back({1, 1, 2, 2, 17, 13.0, makeMetric(9.0, 21.0, 28), 'C'});
+    auto mixedFiber = makeFiber(13, "zz_20260605T184821587_000013.json", 2, 20, 12.0);
+    mixedFiber.traceState = CFiberWidget::FiberEntry::TraceState::Mixed;
+    widget.setFibers({legacyFiber, tracedFiber, mixedFiber});
+
+    const auto rowOfFiber = [&](uint64_t fiberId) {
+        const auto ordered = widget.orderedFiberIds();
+        for (size_t row = 0; row < ordered.size(); ++row) {
+            if (ordered[row] == fiberId) {
+                return static_cast<int>(row);
+            }
+        }
+        return -1;
+    };
+    require(treeView->model()->index(rowOfFiber(11), 8).data().toString() ==
+                QStringLiteral("legacy"),
+            "Legacy fiber should show 'legacy' in the interp column");
+    require(treeView->model()->index(rowOfFiber(12), 8).data().toString() ==
+                QStringLiteral("predictions"),
+            "Traced fiber should show 'predictions'");
+    require(treeView->model()->index(rowOfFiber(13), 8).data().toString() ==
+                QStringLiteral("mixed"),
+            "Mixed fiber should show 'mixed'");
+    const QModelIndex tracedParent = treeView->model()->index(rowOfFiber(12), 0);
+    treeView->expand(tracedParent);  // span rows are built lazily on expansion
+    require(treeView->model()->index(0, 8, tracedParent).data().toString() ==
+                QStringLiteral("T"),
+            "Traced span row should show its 'T' producer marker");
+    require(treeView->model()->index(1, 8, tracedParent).data().toString() ==
+                QStringLiteral("C"),
+            "Cspline span row should show its 'C' producer marker");
+
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 8));
+    if (widget.orderedFiberIds().front() != 11) {
+        // The first click toggled an existing interp sort to descending;
+        // click again for ascending.
+        QMetaObject::invokeMethod(treeView->header(),
+                                  "sectionClicked",
+                                  Q_ARG(int, 8));
+    }
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({11, 13, 12}),
+            "Ascending interp sort should order legacy, mixed, predictions");
+    QMetaObject::invokeMethod(treeView->header(),
+                              "sectionClicked",
+                              Q_ARG(int, 8));
+    require(widget.orderedFiberIds() == std::vector<uint64_t>({12, 13, 11}),
+            "Descending interp sort should order predictions, mixed, legacy");
+
+    {
+        CFiberWidget lazy;
+        CFiberWidget::FiberEntry pending; pending.id = 99; pending.fileName = "deferred.json";
+        pending.controlPointCount = 3; pending.linePointCount = 100; pending.lengthVx = 40.0; pending.detailsLoaded = false;
+        lazy.setFibers({pending});
+        require(lazy.totalLengthVx() == 40.0, "Catalog rows contribute their stored lengths");
+
+        auto* tree = lazy.findChild<QTreeView*>();
+        require(tree && tree->model()->rowCount(tree->model()->index(0,0)) == 1, "Deferred span geometry retains an expand arrow");
+        uint64_t requested = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberDetailsRequested, &lazy, [&](uint64_t id) { requested = id; });
+        tree->expand(tree->model()->index(0,0));
+        require(requested == 99, "Expanding a deferred fiber requests only its geometry");
+
+        const QPersistentModelIndex row(tree->model()->index(0,0));
+        auto detailed = pending;
+        detailed.detailsLoaded = true;
+        detailed.lengthVx = 38.0;
+        detailed.spans = {CFiberWidget::FiberEntry::SpanEntry{0, 0, 1, 2, 50, 20.0},
+                          CFiberWidget::FiberEntry::SpanEntry{1, 1, 2, 2, 51, 18.0}};
+        lazy.updateFiberDetails(detailed);
+        // A double click on the row that requested these details keeps its press.
+        require(row.isValid() && row == tree->model()->index(0,0), "Details update the listed row in place");
+        require(tree->isExpanded(row) && tree->model()->rowCount(row) == 2,
+                "Details keep the row expanded with its span rows");
+        require(lazy.totalLengthVx() == 38.0, "Details replace the listed length");
+        uint64_t opened = 0;
+        QObject::connect(&lazy, &CFiberWidget::fiberOpenRequested, &lazy, [&](uint64_t id) { opened = id; });
+        QMetaObject::invokeMethod(tree, "doubleClicked", Q_ARG(QModelIndex, QModelIndex(row)));
+        require(opened == 99, "Double clicking a fiber requests opening it");
+    }
+
+    QThreadPool::globalInstance()->waitForDone();
     return 0;
 }

@@ -11,6 +11,9 @@ import torch
 import fit_data
 import model
 from tifxyz_io import load_tifxyz, surface_step_stats
+from vc3d_fiber_format_adapter import (
+	parse_vc3d_fiber_format,
+)
 
 
 @dataclass(frozen=True)
@@ -32,40 +35,12 @@ def _load_json_path(path: str | Path, *, label: str) -> dict[str, Any]:
 
 def load_vc3d_fiber_line(path: str | Path) -> list[tuple[float, float, float]]:
 	obj = _load_json_path(path, label="vc3d_fiber")
-	if obj.get("type", "vc3d_fiber") != "vc3d_fiber":
-		raise ValueError(f"unsupported fiber JSON type at {path}: {obj.get('type')!r}")
-	points = obj.get("line_points")
-	if not isinstance(points, list):
-		raise ValueError(f"vc3d_fiber requires line_points[]: {path}")
-	out: list[tuple[float, float, float]] = []
-	for i, item in enumerate(points):
-		if not isinstance(item, list) or len(item) != 3:
-			raise ValueError(f"vc3d_fiber line_points[{i}] must be [x,y,z]")
-		p = tuple(float(v) for v in item)
-		if not all(math.isfinite(v) for v in p):
-			raise ValueError(f"vc3d_fiber line_points[{i}] contains non-finite values")
-		out.append(p)
-	return out
+	return list(parse_vc3d_fiber_format(obj, path=path).line_points_xyz)
 
 
 def load_vc3d_fiber_control_points(path: str | Path) -> list[tuple[float, float, float]]:
 	obj = _load_json_path(path, label="vc3d_fiber")
-	if obj.get("type", "vc3d_fiber") != "vc3d_fiber":
-		raise ValueError(f"unsupported fiber JSON type at {path}: {obj.get('type')!r}")
-	points = obj.get("control_points", [])
-	if points is None:
-		points = []
-	if not isinstance(points, list):
-		raise ValueError(f"vc3d_fiber control_points must be a list: {path}")
-	out: list[tuple[float, float, float]] = []
-	for i, item in enumerate(points):
-		if not isinstance(item, list) or len(item) != 3:
-			raise ValueError(f"vc3d_fiber control_points[{i}] must be [x,y,z]")
-		p = tuple(float(v) for v in item)
-		if not all(math.isfinite(v) for v in p):
-			raise ValueError(f"vc3d_fiber control_points[{i}] contains non-finite values")
-		out.append(p)
-	return out
+	return list(parse_vc3d_fiber_format(obj, path=path).control_points_xyz)
 
 
 def load_vc3d_atlas_fiber_mapping(path: str | Path) -> dict[str, Any]:
@@ -340,6 +315,9 @@ def build_atlas_init(
 	device: torch.device,
 	mesh_step: int,
 	winding_step: int,
+	store: str | None = None,
+	volume: str | None = None,
+	target_scale: float = 1.0,
 ) -> AtlasInit:
 	if atlas_obj.get("type") != "lasagna_atlas" or int(atlas_obj.get("version", 0)) != 1:
 		raise ValueError("atlas config must be type=lasagna_atlas version=1")
@@ -351,7 +329,8 @@ def build_atlas_init(
 		metadata = {}
 	zero_col = int(metadata.get("zero_winding_column", 0))
 
-	base_xyz, base_valid, _base_meta = load_tifxyz(str(base["path"]), device=device)
+	base_xyz, base_valid, _base_meta = load_tifxyz(
+		str(base["path"]), device=device, store=store, volume=volume, target_scale=target_scale)
 	period_columns = _validate_wrapped_base(base_xyz, base_valid)
 	if int(metadata.get("period_columns", period_columns)) != period_columns:
 		raise ValueError(

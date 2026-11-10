@@ -26,6 +26,7 @@ import getpass
 import hashlib
 import importlib
 import json
+import math
 import multiprocessing
 import os
 import queue
@@ -44,6 +45,7 @@ from pathlib import Path
 from typing import Any
 from urllib.parse import parse_qs, quote, urlparse
 
+import stored_surfaces
 import volume_scale
 
 
@@ -54,9 +56,9 @@ import volume_scale
 _data_dir: str | None = None  # Set via --data-dir CLI flag
 _object_store_dir: Path | None = None  # Set via --object-store-dir CLI flag
 _gpu_pause_enabled: bool = True  # Set via --no-gpu-pause CLI flag
-_sparse_prefetch_backend: str = "tensorstore"  # Set via --sparse-prefetch-backend
 _capture_jobs: bool = False  # Set via --capture-jobs
 _capture_dir: Path | None = None  # Set via --capture-dir
+_store: stored_surfaces.StoreSession | None = None  # Set via --store
 _API_VERSION = "2"
 _API_VERSION_HEADER = "X-Fit-Service-API-Version"
 _VC3D_SOURCE_HEADER = "X-VC3D-Source"
@@ -64,6 +66,20 @@ _VC3D_SOURCE_HEADER = "X-VC3D-Source"
 # One debug switch for sparse coverage and coordinate sanity guards. The service
 # enables it by default so optimizer jobs fail before CUDA indexing asserts.
 os.environ.setdefault("LASAGNA_CHECK_SPARSE_CACHE", "1")
+
+
+def _gpu_pause_or_null():
+    """Return the GPU-pause context, or a no-op where pausing is disabled.
+
+    gpu_pause is imported here rather than at module scope because it is
+    built on fcntl and unix sockets. A host started with --no-gpu-pause has
+    nothing to coordinate with and may not have either.
+    """
+    if not _gpu_pause_enabled:
+        from contextlib import nullcontext
+        return nullcontext()
+    from gpu_pause import gpu_pause_context
+    return gpu_pause_context()
 
 
 def _mib(n_bytes: int) -> float:
@@ -149,7 +165,19 @@ def _normalize_single_tifxyz_output(output_dir: Path, output_name: str) -> Path 
     if meta_path.is_file():
         meta = json.loads(meta_path.read_text(encoding="utf-8"))
         if isinstance(meta, dict):
-            meta["uuid"] = requested
+            # A rename keeps the surface's identity, whatever form it takes
+            # (a random UUID in any case, or a catalog id assigned by the
+            # producer). Only a missing uuid or a legacy one derived from
+            # the output's own name is replaced: name-derived values repeat
+            # across unrelated outputs, so they are not identities.
+            current = meta.get("uuid")
+            if (
+                not isinstance(current, str)
+                or not current
+                or current == child.name
+                or current == meta.get("name")
+            ):
+                meta["uuid"] = str(uuid.uuid4())
             meta["name"] = requested
             meta_path.write_text(json.dumps(meta, indent=2) + "\n", encoding="utf-8")
     print(
@@ -631,6 +659,79 @@ def _store_uploaded_object(body: dict[str, Any]) -> dict[str, str]:
         raise
 
 
+def _is_surface_ref(ref: Any) -> bool:
+    """A stored surface: {"type": "surface", "uuid": ...}, at a numbered version with "generation" and "version"."""
+    return isinstance(ref, dict) and ref.get("type") == "surface"
+
+
+def _require_store() -> stored_surfaces.StoreSession:
+    if _store is None:
+        raise ValueError("stored surface references need a service started with --store")
+    return _store
+
+
+def _stored_surface_path(ref: dict[str, Any]) -> str:
+    """The fit's reference to a stored surface (read from the service store)."""
+    _require_store()
+    if "revision" in ref:
+        raise ValueError("stored surface references select a numbered version (generation and version), not a revision")
+    version = ref.get("version")
+    if version is None:
+        return stored_surfaces.surface_ref(str(ref.get("uuid") or ""))
+    return stored_surfaces.surface_ref(str(ref.get("uuid") or ""), (str(ref.get("generation") or ""), int(version)))
+
+
+def _stored_model_path(ref: dict[str, Any]) -> Path:
+    """The model checkpoint a fit published with a stored surface (its ``model.pt`` artifact), as a local copy in
+    the service's object cache."""
+    path = _require_store().artifact_file(str(ref.get("uuid") or ""), "model.pt", _object_store_root() / "artifacts")
+    if path is None:
+        raise ValueError(f"surface {ref.get('uuid')} has no Lasagna model")
+    return path
+
+
+def _stored_corr_points(uuids: list[Any], volume: str | None, target_scale: float) -> dict[str, Any]:
+    """The job's correction point collections, read from the service store in ``volume``'s voxels at
+    ``target_scale``, as VC3D's
+    collection JSON: ``{"collections": {"1": {uuid, name, points: {id: {p, ...}}, ...}, ...}}`` in request order."""
+    if volume is None:
+        raise ValueError("corr_point_collections needs a store request (store_uuid and volume_uuid)")
+    from vc_object_store.documents import point_collections
+    collections: dict[str, Any] = {}
+    for index, stored in enumerate(point_collections(_require_store().location, [str(u) for u in uuids], volume,
+                                                                target_scale), start=1):
+        collection = dict(stored["source"])
+        collection["uuid"] = stored["uuid"]
+        collection["name"] = stored["name"]
+        collection["points"] = {
+            str(point_id): {**(annotation if isinstance(annotation, dict) else {}), "p": list(point)}
+            for point_id, point, annotation in zip(stored["ids"], stored["points"], stored["annotations"])}
+        collections[str(index)] = collection
+    return {"collections": collections}
+
+
+def _request_store_volume(body: dict[str, Any]) -> str | None:
+    """The volume a store-mode request works in (one naming this service's store), else None."""
+    store_uuid = body.get("store_uuid")
+    if not store_uuid:
+        return None
+    store = _require_store()
+    if str(store_uuid) != store.store_uuid:
+        raise ValueError(f"request names store {store_uuid}; this service writes to {store.store_uuid}")
+    volume = str(body.get("volume_uuid") or "")
+    if not volume:
+        raise ValueError("a store request needs volume_uuid")
+    return volume
+
+
+def _request_voxel_scale(body: dict[str, Any]) -> float:
+    """The scale of a store request's voxels to its volume's own (``voxel_scale``, 2^-N at working level N)."""
+    scale = float(body.get("voxel_scale", 1.0))
+    if not math.isfinite(scale) or scale <= 0:
+        raise ValueError(f"voxel_scale must be finite and positive, got {scale}")
+    return scale
+
+
 def _resolve_object_ref(ref_raw: Any) -> Path:
     ref = _validate_object_ref(ref_raw)
     if not _object_present(ref):
@@ -653,7 +754,8 @@ def _resolve_lasagna_atlas_ref(ref_raw: Any) -> dict[str, Any]:
     base = resolved.get("base")
     if not isinstance(base, dict) or not isinstance(base.get("ref"), dict):
         raise ValueError("atlas JSON requires base.ref")
-    base["path"] = str(_resolve_object_ref(base["ref"]))
+    base["path"] = (_stored_surface_path(base["ref"]) if _is_surface_ref(base["ref"])
+                    else str(_resolve_object_ref(base["ref"])))
 
     objects = resolved.get("objects")
     if not isinstance(objects, dict):
@@ -944,15 +1046,25 @@ def _body_with_resolved_job_spec(body: dict[str, Any]) -> dict[str, Any]:
             if not isinstance(surface_raw, dict):
                 raise ValueError(f"job_spec.config.external_surfaces[{i}] must be an object")
             surface = dict(surface_raw)
-            if all(k in surface for k in ("type", "name", "hash")):
+            if _is_surface_ref(surface):
+                surface["path"] = _stored_surface_path(surface)
+            elif all(k in surface for k in ("type", "name", "hash")):
                 surface["path"] = str(_resolve_object_ref(surface))
             external_surfaces.append(surface)
         resolved_cfg["external_surfaces"] = external_surfaces
 
+    collection_uuids = resolved_cfg.pop("corr_point_collections", None)
+    if collection_uuids is not None:
+        if not isinstance(collection_uuids, list):
+            raise ValueError("job_spec.config.corr_point_collections must be a list of UUIDs")
+        resolved_cfg["corr_points"] = _stored_corr_points(
+            collection_uuids, _request_store_volume(body), _request_voxel_scale(body))
+
     model_ref = spec.get("model")
     model_object_refs: dict[str, Any] | None = None
     if model_ref not in (None, {}, ""):
-        resolved_model_path = str(_resolve_object_ref(model_ref))
+        resolved_model_path = str(
+            _stored_model_path(model_ref) if _is_surface_ref(model_ref) else _resolve_object_ref(model_ref))
         resolved["model_input"] = resolved_model_path
         model_object_refs = _checkpoint_object_refs(resolved_model_path)
 
@@ -1267,6 +1379,7 @@ class _JobState:
         self._error: str | None = None
         self._cancel = False
         self._output_dir: str | None = None
+        self._output_surfaces: list[str] = []
         self._results_tmp: str | None = None  # temp dir to clean up after download
         self._tmp_dirs: list[str] = []
         self._events: list[dict[str, Any]] = []
@@ -1296,6 +1409,7 @@ class _JobState:
                 "stage_name": self._stage_name,
                 "error": self._error,
                 "output_dir": self._output_dir,
+                "output_surfaces": list(self._output_surfaces),
                 "submitted_at": self.submitted_at,
                 "started_at": self.started_at,
                 "finished_at": self.finished_at,
@@ -1337,10 +1451,12 @@ class _JobState:
             self._overall_progress = overall_progress
             self._stage_name = stage_name
 
-    def set_finished(self, output_dir: str, results_tmp: str | None = None) -> None:
+    def set_finished(self, output_dir: str | None, results_tmp: str | None = None,
+                     output_surfaces: list[str] | None = None) -> None:
         with self._lock:
             self._state = "finished"
             self._output_dir = output_dir
+            self._output_surfaces = list(output_surfaces or [])
             self._results_tmp = results_tmp
             self.finished_at = time.time()
 
@@ -1542,6 +1658,7 @@ class _JobQueue:
                     "stage_name": "",
                     "error": None,
                     "output_dir": None,
+                    "output_surfaces": [],
                 }
             snap = job.snapshot(self.queue_position(job.job_id))
             if snap["state"] in {"upload", "waiting"}:
@@ -1744,7 +1861,11 @@ def _run_laplace_rank_job(job: _JobState, body: dict[str, Any]) -> None:
 def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     """Run fit.py then fit2tifxyz.py based on the request body.
 
-    Supports two modes:
+    Supports three modes:
+      - Store (VC3D): the request names the service store (store_uuid) and a
+        volume_uuid; inputs are stored-surface refs, results are new surfaces
+        in the store (their model checkpoints in artifact directories), and
+        the job reports their UUIDs as output_surfaces.
       - Local (internal): model_input and output_dir are local paths.
       - Remote (external): model_data contains base64-encoded model bytes,
         output goes to a temp dir, caller downloads results via GET /results.
@@ -1758,6 +1879,10 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
     )
 
     try:
+        store_volume = _request_store_volume(body)
+        store_voxel_scale = _request_voxel_scale(body)
+        if store_volume is not None:
+            _require_store()
         body = _body_with_resolved_job_spec(body)
     except Exception as exc:
         job.set_error(str(exc))
@@ -1802,7 +1927,10 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
 
         # If no output_dir, create a temp dir for results (external mode)
         results_tmp = None
-        if not output_dir:
+        if store_volume is not None:
+            if output_dir or body.get("export_flatten_map", False):
+                raise ValueError("store requests export surfaces to the store, not to files")
+        elif not output_dir:
             results_tmp = tempfile.mkdtemp(prefix="fit_results_")
             job.add_tmp_dir(results_tmp)
             output_dir = results_tmp
@@ -1811,6 +1939,18 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         # into the exported tifxyz so results remain self-contained.
         if not model_output:
             model_output = str(Path(tmp_dir) / "model_reopt.pt")
+
+        # A flatten client that consumes only the exported tifxyz and the
+        # flatten-map sidecar can skip the checkpoint file entirely: the
+        # exports below run from the in-memory state instead.
+        omit_model_output = bool(body.get("omit_model_output", False))
+        if omit_model_output:
+            if model_init_requested != "flatten":
+                raise ValueError("omit_model_output requires args.model-init=flatten")
+            if not body.get("omit_model", False):
+                raise ValueError("omit_model_output requires omit_model")
+            if body.get("embed_job_metadata", True):
+                raise ValueError("omit_model_output requires embed_job_metadata=false")
 
         # Build argv for fit.py from the config dict.
         cfg = dict(config)
@@ -1846,10 +1986,14 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
         args_section = dict(cfg.get("args", {}))
         if model_init != "flatten":
             args_section["input"] = str(data_input)
-            args_section.setdefault("sparse-prefetch-backend", _sparse_prefetch_backend)
         if model_init == "model" and model_input:
             args_section["model-input"] = str(model_input)
-        args_section["model-output"] = str(model_output)
+        if store_volume is not None:
+            args_section["store"] = _require_store().location
+            args_section["volume-uuid"] = store_volume
+            args_section["voxel-scale"] = store_voxel_scale
+        if not omit_model_output:
+            args_section["model-output"] = str(model_output)
         # Only set fit.py out-dir if explicitly requested. pred_dt_flow_gate
         # debug slices use their own debug_out_dir so enabling them does not
         # make fit.py export model_final/tifxyz into the service cwd.
@@ -1901,18 +2045,33 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
             kwargs["cancel_fn"] = _check_cancel
             return _orig_optimize(**kwargs)
 
-        from contextlib import nullcontext
-        from gpu_pause import gpu_pause_context
-
         opt_mod.optimize = _patched_optimize
-        with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+        with _gpu_pause_or_null():
             try:
                 import fit as fit_mod
                 job.set_running("loading", 0, 0, 0.0)
-                fit_mod.main([cfg_path])
-                if isinstance(job_spec, dict) and Path(model_output).is_file():
+
+                def _fit_lifecycle(stage: str, stage_name: str) -> None:
+                    job.set_running(
+                        stage, 0, 0, 0.0, stage_name=stage_name)
+                    _check_cancel()
+
+                # Flatten runs hand their checkpoint state back in host
+                # memory; the exports below then never re-read the multi-GB
+                # checkpoint file they just asked fit.py to write.
+                fit_state_sink: dict = {}
+                fit_mod.main([cfg_path], lifecycle_fn=_fit_lifecycle,
+                             state_sink=fit_state_sink)
+                if (body.get("embed_job_metadata", True)
+                        and isinstance(job_spec, dict)
+                        and Path(model_output).is_file()):
+                    job.set_running(
+                        "saving", 0, 0, 0.0,
+                        stage_name="Embedding Lasagna job metadata")
                     import torch
-                    st = torch.load(str(model_output), map_location="cpu", weights_only=False)
+                    st = fit_state_sink.get("flatten_state")
+                    if st is None:
+                        st = torch.load(str(model_output), map_location="cpu", weights_only=False)
                     if isinstance(st, dict):
                         st["_job_spec_"] = job_spec
                         object_refs = body.get("_object_refs_")
@@ -1927,14 +2086,31 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                 return
 
             save_t0 = time.perf_counter()
-            job.set_running("exporting", 0, 0, 0.0)
+            job.set_running(
+                "exporting", 0, 0, 0.0,
+                stage_name="Exporting flattened preview surface")
             import fit2tifxyz
-            export_argv = ["--input", str(model_output), "--output", str(output_dir)]
+            export_argv = ["--input", str(model_output)]
+            if store_volume is not None:
+                export_argv.extend(["--store", _require_store().location, "--volume-uuid", store_volume,
+                                    "--voxel-scale", repr(store_voxel_scale)])
+            else:
+                export_argv.extend(["--output", str(output_dir)])
             if body.get("single_segment"):
                 export_argv.append("--single-segment")
             output_name = body.get("output_name")
             if output_name:
                 export_argv.extend(["--output-name", str(output_name)])
+                # The store picks the free name (VC3D sends the root and how to version it).
+                if store_volume is not None and body.get("output_name_mode"):
+                    export_argv.extend(["--output-name-mode", str(body["output_name_mode"])])
+            if body.get("omit_model", False):
+                export_argv.append("--omit-model")
+            if body.get("export_flatten_map", False):
+                export_argv.extend([
+                    "--flatten-map-output",
+                    str(Path(output_dir) / ".flatten-map.npy"),
+                ])
             print(
                 f"[fit-service] exporting tifxyz: output_name={str(output_name or '').strip()!r} "
                 f"output_dir={output_dir}",
@@ -1951,25 +2127,40 @@ def _run_optimization(job: _JobState, body: dict[str, Any]) -> None:
                     str(int(request_volume_shape_zyx[2])),
                 ])
             _check_cancel()
-            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel)
-            _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
-            _check_cancel()
-            save_s = time.perf_counter() - save_t0
-            try:
-                saved_bytes = _dir_size_bytes(Path(output_dir))
-            except OSError:
-                saved_bytes = 0
-            print(
-                f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
-                f"in {save_s:.3f}s",
-                flush=True,
-            )
+            output_surfaces: list[str] = []
+            fit2tifxyz.main(export_argv, cancel_fn=_check_cancel,
+                            state=fit_state_sink.get("flatten_state"),
+                            store_session=_store if store_volume is not None else None,
+                            created_surfaces=output_surfaces)
+            fit_state_sink.clear()
+            job.set_running(
+                "finalizing", 0, 0, 0.0,
+                stage_name="Finalizing Lasagna preview export")
+            if store_volume is not None:
+                print(f"[fit-service] results stored: surfaces {output_surfaces} "
+                      f"in {time.perf_counter() - save_t0:.3f}s", flush=True)
+            else:
+                _normalize_single_tifxyz_output(Path(output_dir), str(output_name or ""))
+                _check_cancel()
+                save_s = time.perf_counter() - save_t0
+                try:
+                    saved_bytes = _dir_size_bytes(Path(output_dir))
+                except OSError:
+                    saved_bytes = 0
+                print(
+                    f"[fit-service] results saved: {_mib(saved_bytes):.3f} MiB "
+                    f"in {save_s:.3f}s",
+                    flush=True,
+                )
 
         # Clean up intermediate files (but keep results_tmp for download)
         shutil.rmtree(tmp_dir, ignore_errors=True)
 
-        job.set_finished(str(output_dir), results_tmp=results_tmp)
-        print(f"[fit-service] optimization finished, output: {output_dir}", flush=True)
+        if store_volume is not None:
+            job.set_finished(None, output_surfaces=output_surfaces)
+        else:
+            job.set_finished(str(output_dir), results_tmp=results_tmp)
+        print(f"[fit-service] optimization finished, output: {output_dir or output_surfaces}", flush=True)
 
     except KeyboardInterrupt:
         job.set_cancelled()
@@ -2053,7 +2244,7 @@ class _Handler(BaseHTTPRequestHandler):
         path = "/" + "/".join(parts)
 
         if path == "/health":
-            self._send_json({"status": "ok"})
+            self._send_json({"status": "ok", "store_uuid": _store.store_uuid if _store is not None else None})
         elif path == "/status":
             self._send_json(_jobs.legacy_status())
         elif path == "/datasets":
@@ -2297,7 +2488,9 @@ class _Handler(BaseHTTPRequestHandler):
         try:
             tmp_dir = tempfile.mkdtemp(prefix="fit_vis_")
 
-            if model_data:
+            if _is_surface_ref(body.get("model")):
+                model_input = str(_stored_model_path(body["model"]))
+            elif model_data:
                 model_bytes = base64.b64decode(model_data)
                 tmp = tempfile.NamedTemporaryFile(suffix=".pt", delete=False)
                 tmp.write(model_bytes)
@@ -2325,9 +2518,7 @@ class _Handler(BaseHTTPRequestHandler):
                         data_input = str(candidate)
 
             import lasagna_analyze
-            from contextlib import nullcontext
-            from gpu_pause import gpu_pause_context
-            with (gpu_pause_context() if _gpu_pause_enabled else nullcontext()):
+            with _gpu_pause_or_null():
                 lasagna_analyze.export_vis_obj(
                     model_path=str(model_input),
                     data_path=str(data_input),
@@ -2381,27 +2572,33 @@ class _Handler(BaseHTTPRequestHandler):
 # ---------------------------------------------------------------------------
 
 def main() -> None:
-    global _data_dir, _object_store_dir, _gpu_pause_enabled, _sparse_prefetch_backend
-    global _capture_jobs, _capture_dir
+    global _data_dir, _object_store_dir, _gpu_pause_enabled
+    global _capture_jobs, _capture_dir, _store
 
     p = argparse.ArgumentParser(description="Fit optimizer HTTP service for VC3D")
     p.add_argument("--port", type=int, default=9999, help="Port (default 9999)")
     p.add_argument("--host", default="127.0.0.1")
     p.add_argument("--data-dir", default=None,
                    help="Directory containing .lasagna.json datasets")
+    p.add_argument("--allow-no-data-dir", action="store_true", default=False,
+                   help="Start without datasets for flatten-only jobs")
     p.add_argument("--object-store-dir", default=None,
                    help="Directory for content-addressed VC3D artifacts")
     p.add_argument("--no-gpu-pause", action="store_true", default=False,
                    help="Disable automatic GPU pause/resume of training")
-    p.add_argument("--sparse-prefetch-backend",
-                   choices=("tensorstore", "python-zarr"),
-                   default="tensorstore",
-                   help="Sparse streaming prefetch backend for fit jobs")
     p.add_argument("--capture-jobs", action="store_true", default=False,
                    help="Capture queued job requests, events, and final results")
     p.add_argument("--capture-dir", default=None,
                    help="Directory for captured queued jobs (default: ./job_captures)")
+    p.add_argument("--store", default=None,
+                   help="VC object store VC3D jobs read surfaces from and write to: a store file, or the "
+                        "endpoint of the vc_object_server VC3D attached (http://...)")
+    p.add_argument("--shared-store", action="store_true", default=False,
+                   help="--store is the store file of the VC3D that started this service")
     args = p.parse_args()
+    if args.store:
+        _store = stored_surfaces.StoreSession(args.store, shared=args.shared_store)
+        atexit.register(_store.close)
 
     if args.data_dir:
         _data_dir = str(Path(args.data_dir).resolve())
@@ -2409,13 +2606,12 @@ def main() -> None:
         _object_store_dir = Path(args.object_store_dir).resolve()
     if args.no_gpu_pause:
         _gpu_pause_enabled = False
-    _sparse_prefetch_backend = str(args.sparse_prefetch_backend)
     _capture_jobs = bool(args.capture_jobs)
     if args.capture_dir:
         _capture_dir = Path(args.capture_dir).resolve()
 
     datasets = _list_datasets()
-    if not datasets:
+    if not datasets and not args.allow_no_data_dir:
         data_dir_msg = _data_dir if _data_dir else "<not set>"
         print(
             f"[fit-service] error: no .lasagna.json datasets found in --data-dir {data_dir_msg}",
@@ -2423,6 +2619,9 @@ def main() -> None:
             flush=True,
         )
         raise SystemExit(2)
+    if not datasets:
+        print("[fit-service] starting without datasets (flatten-only mode)",
+              flush=True)
 
     server = ThreadingHTTPServer((args.host, args.port), _Handler)
     actual_port = server.server_address[1]

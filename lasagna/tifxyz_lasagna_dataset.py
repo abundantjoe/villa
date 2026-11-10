@@ -14,14 +14,15 @@ import warnings
 from pathlib import Path
 
 import numpy as np
+from dtypes import numpy_float_hi
 import torch
 from torch.utils.data import Dataset
 
-import vesuvius.tifxyz as tifxyz
+from vc_reader import tifxyz
+from vc_reader.errors import CacheMissError
 from vesuvius.neural_tracing.datasets.chunk_finding import find_training_chunks
 from vesuvius.neural_tracing.datasets.common import (
     ChunkPatch,
-    OfflineCacheMiss,
     open_zarr,
     open_zarr_group,
     _compute_wrap_order_stats,
@@ -52,17 +53,17 @@ TAG = "[tifxyz_lasagna_dataset]"
 def _parse_transform(dataset: dict) -> np.ndarray | None:
     """Parse inline 3×4 affine from dataset config, optionally inverting.
 
-    Returns (3, 4) float64 ndarray in XYZ order (matching transform.json
+    Returns a (3, 4) float ndarray in XYZ order (matching transform.json
     convention), or None if no transform is specified.
     """
     raw = dataset.get("transform")
     if raw is None:
         return None
-    m = np.array(raw, dtype=np.float64)
+    m = np.array(raw, dtype=numpy_float_hi)
     if m.shape != (3, 4):
         raise ValueError(f"transform must be (3,4), got {m.shape}")
     if dataset.get("transform_invert", False):
-        m4 = np.eye(4, dtype=np.float64)
+        m4 = np.eye(4, dtype=numpy_float_hi)
         m4[:3, :] = m
         m4 = np.linalg.inv(m4)
         m = m4[:3, :]
@@ -87,7 +88,7 @@ def _build_cache_to_volume_zyx(
     down = 1.0 / float(2 ** volume_scale)
 
     # Compose in 4×4 XYZ space
-    m4 = np.eye(4, dtype=np.float64)
+    m4 = np.eye(4, dtype=numpy_float_hi)
     m4[:3, :] = transform_xyz
     # Pre-multiply by scale-up (acts on input): multiply columns 0-2 by up
     m4[:3, :3] *= up
@@ -102,7 +103,7 @@ def _build_cache_to_volume_zyx(
     # Column swap: input is (z, y, x) instead of (x, y, z)
     m4_zyx[:, 0], m4_zyx[:, 2] = m4_zyx[:, 2].copy(), m4_zyx[:, 0].copy()
 
-    return m4_zyx[:3, :].astype(np.float64)
+    return m4_zyx[:3, :].astype(numpy_float_hi)
 
 
 def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
@@ -118,8 +119,8 @@ def _apply_affine_zyx(affine_3x4: np.ndarray, zyx: np.ndarray) -> np.ndarray:
     (..., 3) array — transformed points
     """
     shape = zyx.shape
-    pts = zyx.reshape(-1, 3).astype(np.float64)
-    ones = np.ones((pts.shape[0], 1), dtype=np.float64)
+    pts = zyx.reshape(-1, 3).astype(numpy_float_hi)
+    ones = np.ones((pts.shape[0], 1), dtype=numpy_float_hi)
     homo = np.hstack([pts, ones])  # (N, 4)
     out = (affine_3x4 @ homo.T).T  # (N, 3)
     return out.astype(np.float32).reshape(shape)
@@ -353,9 +354,9 @@ def build_patch_chains(patch, max_wraps: int) -> dict:
         seg_path = getattr(seg, "path", None)
         from pathlib import Path as _P
         seg_name = _P(seg_path).name if seg_path is not None else ""
+        # Winding ids come from the segment directory name only; meta.json
+        # uuid is an opaque random identity and never encodes a winding.
         wrap_ids = _extract_wrap_ids(seg_name)
-        if not wrap_ids:
-            wrap_ids = _extract_wrap_ids(getattr(seg, "uuid", ""))
         wrap_stats.append({
             "wrap_idx": wrap_idx,
             "segment_idx": int(wrap["segment_idx"]),
@@ -461,7 +462,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
     target_size = tuple(int(v) for v in patch_size_zyx)
 
     patches = []
-    volume_groups = {}  # {dataset_idx: zarr.Group} for multi-scale CT reads
+    volume_groups = {}  # {dataset_idx: ZarrGroup} for multi-scale CT reads
     for dataset_idx, dataset in enumerate(config["datasets"]):
         volume_path = dataset.get("volume_path")
         if volume_path is None:
@@ -533,7 +534,7 @@ def _find_patches_world_chunks(config, patch_size_zyx):
         # coordinates (same convention as original datasets).
         retarget_factor = 2 ** cache_scale
         z_range = _parse_z_range(dataset.get("z_range"))
-        dataset_segments = list(tifxyz.load_folder(segments_path))
+        dataset_segments = [tifxyz.read(entry.location) for entry in tifxyz.list_surfaces(segments_path)]
         scaled_segments = []
         dropped_by_z_range = 0
         for seg in dataset_segments:
@@ -541,7 +542,6 @@ def _find_patches_world_chunks(config, patch_size_zyx):
             if not _segment_overlaps_z_range(seg_scaled, z_range):
                 dropped_by_z_range += 1
                 continue
-            seg_scaled.volume = volume
             scaled_segments.append(seg_scaled)
 
         if not scaled_segments:
@@ -715,7 +715,7 @@ class TifxyzLasagnaDataset(Dataset):
         # and dev runs where we want to train against pre-cached data without
         # any network access. open_zarr() has already configured the store in
         # offline mode (volume_cache_offline=True), so any cache miss raises
-        # OfflineCacheMiss instead of fetching.
+        # CacheMissError instead of fetching.
         if bool(config.get("volume_cache_offline", False)):
             self.patches = self._filter_to_cached_patches(self.patches)
             print(f"{TAG} offline filter: {len(self.patches)} patches with full local cache")
@@ -765,7 +765,7 @@ class TifxyzLasagnaDataset(Dataset):
                     min_corner=min_corner, max_corner=max_corner,
                     image_normalization="unit",
                 )
-            except OfflineCacheMiss:
+            except CacheMissError:
                 dropped += 1
                 continue
             kept.append(patch)
@@ -824,7 +824,7 @@ class TifxyzLasagnaDataset(Dataset):
         r_min, r_max, c_min, c_max = wrap["bbox_2d"]
 
         # Clamp to segment bounds
-        seg_h, seg_w = seg._valid_mask.shape
+        seg_h, seg_w = seg.shape
         r_min = max(0, r_min)
         r_max = min(seg_h - 1, r_max)
         c_min = max(0, c_min)
@@ -833,15 +833,12 @@ class TifxyzLasagnaDataset(Dataset):
             return _empty()
 
         # Read stored-resolution grid
-        seg.use_stored_resolution()
-        scale_y, scale_x = seg._scale
-        x_s, y_s, z_s, valid_s = seg[r_min:r_max + 1, c_min:c_max + 1]
-        if x_s.size == 0:
-            return _empty()
-
+        scale_y, scale_x = seg.scale
         # Skip wraps with invalid cells in stored grid (upsampling requires all-valid)
-        if valid_s is not None and not valid_s.all():
+        if not seg.valid[r_min:r_max + 1, c_min:c_max + 1].all():
             return _empty()
+        xyz_s = seg.xyz[r_min:r_max + 1, c_min:c_max + 1]
+        x_s, y_s, z_s = xyz_s[..., 0], xyz_s[..., 1], xyz_s[..., 2]
 
         # Upsample to full resolution
         try:
@@ -979,7 +976,7 @@ class TifxyzLasagnaDataset(Dataset):
         try:
             return self._getitem_impl(idx)
         except (PermissionError, OSError, ConnectionError,
-                TimeoutError, OfflineCacheMiss) as e:
+                TimeoutError, CacheMissError) as e:
             # Transient zarr/S3 read errors (expired token, network
             # hiccup, stale credential, missing cache chunk). Return
             # None → collate_variable_surfaces filters it, and the
@@ -1038,13 +1035,13 @@ class TifxyzLasagnaDataset(Dataset):
                 for z in (z0, z1)
                 for y in (y0, y1)
                 for x in (x0, x1)
-            ], dtype=np.float64)
+            ], dtype=numpy_float_hi)
             corners_vol = _apply_affine_zyx(patch.cache_to_volume, corners_zyx)
             aabb_min = corners_vol.min(axis=0)
             aabb_max = corners_vol.max(axis=0)
             aabb_center = (aabb_min + aabb_max) / 2.0
             label_min = np.round(
-                aabb_center - np.array(label_size, dtype=np.float64) / 2.0
+                aabb_center - np.array(label_size, dtype=numpy_float_hi) / 2.0
             ).astype(np.int64)
         else:
             label_min = np.array([z0, y0, x0], dtype=np.int64)
@@ -1452,7 +1449,7 @@ class TifxyzLasagnaDataset(Dataset):
             (bbox[0] + bbox[1]) / 2.0,
             (bbox[2] + bbox[3]) / 2.0,
             (bbox[4] + bbox[5]) / 2.0,
-        ], dtype=np.float64)
+        ], dtype=numpy_float_hi)
 
         sample = {
             "image": vol_crop_t,                        # (1, Z, Y, X)
@@ -1465,7 +1462,7 @@ class TifxyzLasagnaDataset(Dataset):
             "patch_info": {
                 "segment_uuid": str(patch.wraps[0]["segment"].uuid) if patch.wraps else "",
                 "world_bbox": patch.world_bbox,
-                "world_center": world_center,           # (3,) float64 — base-level voxels
+                "world_center": world_center,           # (3,) numpy_float_hi — base-level voxels
                 "world_min": min_corner,                # (3,) int64 — CT read origin
                 "scale": patch.scale,                   # zarr level
                 "idx": patch.dataset_local_idx,

@@ -3,6 +3,7 @@
 #include <QWidget>
 
 class ViewerManager;
+class QDoubleSpinBox;
 
 class ViewerNavigationPanel : public QWidget
 {
@@ -10,12 +11,15 @@ class ViewerNavigationPanel : public QWidget
 
 public:
     explicit ViewerNavigationPanel(ViewerManager* viewerManager, QWidget* parent = nullptr);
+    void setViewerManager(ViewerManager* viewerManager);
 
 private:
+    void connectViewerManager();
     void addSensitivityControl(class QVBoxLayout* layout,
                                const QString& label,
                                const char* settingsKey,
                                double defaultValue);
 
     ViewerManager* _viewerManager{nullptr};
+    QDoubleSpinBox* _zScrollSpin{nullptr};
 };

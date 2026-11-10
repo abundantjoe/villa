@@ -1,0 +1,42 @@
+### about this repo
+this package is intended as a c++ first app with python bindings available. behavior that is not python-specific should exist both in c++ and exposed to python via bindings.
+
+this package is intended to provide useful tools for working with the vesuvius challenge data
+- metadata browsing and parsing
+- volume and image data fetching and sampling
+- augmentations
+
+performance must be prioritized for anything implemented in this repository. these tools are intended for very large scale multidimensional image processing and machine learning training. it is critical that we account for performance with any changes. 
+
+### general rules
+- for augmentations, sampling, and other operations that naturally work well on cuda devices, whenever we add a cpu implementation we should have a matching cuda implementation
+- in many cases, these tools will be used in pytorch dataloaders or within ml training pipelines, and this should be considered when designing things
+- readme files and other repository files must not contain development notes unless they are relevant to the implementation (nonstandard implementation or gotcha that would be helpful to future developers). during development you are welcome to keep notes in a gitignored development_notes folder. 
+- you can access a nvidia-gpu on most development machines by elevating the request
+- before adding anything to this package, first ensure that nothing which closely matches this behavior does not already exist. prefer to extend existing implementations than to create duplicates which only differ slightly
+- build times can be quite slow. you shuold use incremental builds during development (ie: `ninja -C build`), we do not need to create a new build dir for every single change 
+
+### capability map
+- before adding anything, check the [capability map](README.md#capability-map) and extend what it lists rather than adding a second implementation. when you add or move a public capability, update its row.
+
+### c++ first, python binds
+- there must be absolutely zero behavior in vc_reader that exists only in python. everything vc_reader can do is implemented in c++ and available to c++ callers, and python binds that code. new functionality goes into c++ first.
+- the only python that stays is what c++ has nothing equivalent to bind, as thin layers over c++: torch tensor and dataloader integration, numpy-style indexing and array conversion, pickling and rebuilding after a fork, and the cli entry point. real work they do underneath is in c++.
+
+### cuda implementations
+- vc_reader has two backends -- cpu and cuda -- for most things within vc_reader that operate on volumes or images, wherever a cpu implementation exists there should be a cuda implementation as well  
+
+### precision and dtypes
+- any dtype higher than float32 must be justified. do not use higher dtypes just because you've seen them used elsewhere in the codebase. 
+
+### optimization and performance
+when writing code for this repository especially when doing work on performance optimization, consider the type of work you are doing:
+- for augmentations, bit identical outputs are not necessary. we can tolerate some differences because we are after all changing the input image in the first place. we care more about semantic equivalence
+- for some things like coordinate sampling _before_ augmentations , precision or near-equivalence may be more necessary.
+- negating the upload time to gpu , if an equivalent cuda implementation comes out slower than a cpu side version, this should alert you that something is wrong. very rarely should this be the case 
+- when working on performance , do not just limit yourself to making tiny hillclimb changes
+- do not assume the implementations of anything or the dtypes chosen or sizes of anything are static or chosen correctly. 
+- there may be implementations that are doing far more work than necessary, and it would be a mistake to optimize that rather than starting out by reducing unnecessary work
+
+### legacy and compatibilty handling
+in general, do not handle old implementations or legacy implementations. do not use compatibility shims or anything like this. do not mention old code or legacy implementations anywhere in readmes or code comments. if you think compatibility like this is necessary, you must ask before writing it. 

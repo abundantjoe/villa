@@ -1,8 +1,12 @@
 #include "vc/lasagna/Manifest.hpp"
 
+#include <vc_reader/zarr_write.hpp>
+
 #include <algorithm>
+#include <cmath>
 #include <fstream>
 #include <stdexcept>
+#include <unordered_set>
 
 namespace vc::lasagna {
 namespace {
@@ -75,7 +79,8 @@ std::vector<LasagnaChannelGroup> parseGroups(
 
         LasagnaChannelGroup group;
         group.name = it.key();
-        group.zarrPath = resolvePath(baseDirectory, groupJson.at("zarr").get<std::string>());
+        group.relativeZarrKey = groupJson.at("zarr").get<std::string>();
+        group.zarrPath = resolvePath(baseDirectory, group.relativeZarrKey);
         group.scaledown = groupJson.value("scaledown", 0);
         if (group.scaledown < 0 || group.scaledown > 30) {
             throw std::runtime_error("Lasagna channel group '" + it.key() + "' has invalid scaledown");
@@ -88,9 +93,69 @@ std::vector<LasagnaChannelGroup> parseGroups(
 
 } // namespace
 
+double dyadicCoordinateScaleBetweenShapes(
+    const std::array<std::size_t, 3>& fromShapeZYX,
+    const std::array<std::size_t, 3>& toShapeZYX,
+    int maximumAbsoluteLevel)
+{
+    if (maximumAbsoluteLevel < 0 || maximumAbsoluteLevel > 30) {
+        throw std::invalid_argument(
+            "maximum dyadic coordinate level must be between 0 and 30");
+    }
+    if (std::any_of(fromShapeZYX.begin(), fromShapeZYX.end(),
+                    [](std::size_t extent) { return extent == 0; }) ||
+        std::any_of(toShapeZYX.begin(), toShapeZYX.end(),
+                    [](std::size_t extent) { return extent == 0; })) {
+        throw std::invalid_argument("coordinate-domain shapes must be positive");
+    }
+
+    std::vector<int> matches;
+    for (int level = -maximumAbsoluteLevel;
+         level <= maximumAbsoluteLevel; ++level) {
+        const std::size_t divisor = std::size_t{1} << std::abs(level);
+        const auto& larger = level >= 0 ? toShapeZYX : fromShapeZYX;
+        const auto& smaller = level >= 0 ? fromShapeZYX : toShapeZYX;
+        bool compatible = true;
+        for (std::size_t axis = 0; axis < larger.size(); ++axis) {
+            if (level == 0) {
+                // Published volume shapes use both voxel-count and inclusive
+                // maximum-coordinate conventions. Those describe the same
+                // level while differing by one on an axis.
+                const auto minimum = std::min(larger[axis], smaller[axis]);
+                const auto maximum = std::max(larger[axis], smaller[axis]);
+                if (maximum - minimum > 1) {
+                    compatible = false;
+                    break;
+                }
+                continue;
+            }
+            const std::size_t ceilExtent =
+                (larger[axis] + divisor - 1) / divisor;
+            const std::size_t floorExtent =
+                std::max<std::size_t>(1, larger[axis] / divisor);
+            if (smaller[axis] != ceilExtent && smaller[axis] != floorExtent) {
+                compatible = false;
+                break;
+            }
+        }
+        if (compatible) matches.push_back(level);
+    }
+    if (matches.size() != 1) {
+        throw std::runtime_error(
+            "coordinate-domain shapes do not identify exactly one supported "
+            "power-of-two scale");
+    }
+    return std::ldexp(1.0, matches.front());
+}
+
 int LasagnaChannelGroup::scaleFactor() const noexcept
 {
     return 1 << scaledown;
+}
+
+bool LasagnaChannelGroup::isRemote() const noexcept
+{
+    return zarrPath.empty() && !sourceLocation.empty();
 }
 
 bool LasagnaChannelGroup::hasChannel(std::string_view channel) const noexcept
@@ -124,16 +189,73 @@ const LasagnaChannelGroup* LasagnaDatasetManifest::groupForChannel(std::string_v
     return nullptr;
 }
 
-LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
+std::vector<std::string> LasagnaDatasetManifest::fiberPredictionPrefixes() const
 {
-    std::ifstream input(manifestPath);
-    if (!input) {
-        throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
+    std::vector<std::string> prefixes;
+    if (groupForChannel("presence") != nullptr &&
+        groupForChannel("nx") != nullptr &&
+        groupForChannel("ny") != nullptr) {
+        prefixes.emplace_back();
     }
 
+    constexpr std::string_view suffix = "_presence";
+    for (const auto& group : groups) {
+        for (const auto& channel : group.channels) {
+            if (channel.size() < suffix.size() ||
+                channel.compare(channel.size() - suffix.size(), suffix.size(), suffix) != 0) {
+                continue;
+            }
+            const std::string prefix = channel.substr(0, channel.size() - suffix.size());
+            if (groupForChannel(prefix + "_nx") != nullptr &&
+                groupForChannel(prefix + "_ny") != nullptr) {
+                prefixes.push_back(prefix);
+            }
+        }
+    }
+
+    std::sort(prefixes.begin(), prefixes.end());
+    prefixes.erase(std::unique(prefixes.begin(), prefixes.end()), prefixes.end());
+    return prefixes;
+}
+
+LasagnaDatasetManifest LasagnaDatasetManifest::parseFile(const std::filesystem::path& manifestPath)
+{
+    // A compact manifest is the "lasagna" attribute of a Zarr group.
+    const bool compact = std::filesystem::is_directory(manifestPath);
     nlohmann::json root;
-    input >> root;
-    LasagnaDatasetManifest manifest = parseText(root.dump(), manifestPath);
+    if (compact) {
+        root = vcr::zarr::readAttributes(manifestPath);
+    } else {
+        std::ifstream input(manifestPath);
+        if (!input) {
+            throw std::runtime_error("Failed to open Lasagna manifest: " + manifestPath.string());
+        }
+        input >> root;
+    }
+    if (compact) {
+        root = root.at("lasagna");
+        if (root.at("version") != 3)
+            throw std::runtime_error("embedded Lasagna manifest must have version 3");
+        if (!root.at("source_to_base").is_number() ||
+            !root.at("base_shape_zyx").is_array() || root.at("base_shape_zyx").size() != 3)
+            throw std::runtime_error("embedded manifest requires source scale and base shape");
+        const auto validity = root.at("validity_channel").get<std::string>();
+        bool found = false;
+        std::unordered_set<std::string> channels;
+        for (const auto& [name, group] : root.at("groups").items()) {
+            const auto n = group.at("scaledown").get<int>();
+            if (n < 0 || n > 30 || name != "sd" + std::to_string(n) ||
+                group.at("zarr") != name + "/" + std::to_string(n))
+                throw std::runtime_error("invalid embedded resolution group");
+            for (const auto& channel : group.at("channels")) {
+                if (!channels.insert(channel.get<std::string>()).second)
+                    throw std::runtime_error("duplicate embedded channel");
+                found = found || channel == validity;
+            }
+        }
+        if (!found) throw std::runtime_error("invalid embedded validity_channel");
+    }
+    LasagnaDatasetManifest manifest = parseText(root.dump(), compact ? manifestPath / ".zattrs" : manifestPath);
     manifest.raw = std::move(root);
     return manifest;
 }
@@ -152,11 +274,26 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
         ? std::filesystem::path{}
         : std::filesystem::absolute(manifestPath).lexically_normal();
     manifest.baseDirectory = manifestBaseDir(manifestPath);
+    manifest.manifestLocation = manifest.manifestPath.string();
+    manifest.manifestIsRemote = false;
     manifest.raw = root;
     manifest.version = root.value("version", 0);
     manifest.sourceToBase = root.value("source_to_base", 1.0);
-    if (!(manifest.sourceToBase > 0.0)) {
+    if (!(manifest.sourceToBase > 0.0) || !std::isfinite(manifest.sourceToBase)) {
         throw std::runtime_error("Lasagna manifest source_to_base must be positive");
+    }
+    if (root.contains("base_shape_zyx")) {
+        const auto& shape = root.at("base_shape_zyx");
+        if (!shape.is_array() || shape.size() != 3 ||
+            !shape.at(0).is_number_unsigned() ||
+            !shape.at(1).is_number_unsigned() ||
+            !shape.at(2).is_number_unsigned()) {
+            throw std::runtime_error("Lasagna manifest base_shape_zyx must contain three unsigned integers");
+        }
+        manifest.baseShapeZYX = std::array<std::size_t, 3>{
+            shape.at(0).get<std::size_t>(),
+            shape.at(1).get<std::size_t>(),
+            shape.at(2).get<std::size_t>()};
     }
     if (root.contains("init_shell_dir")) {
         if (!root.at("init_shell_dir").is_string()) {
@@ -167,24 +304,49 @@ LasagnaDatasetManifest LasagnaDatasetManifest::parseText(
     }
     manifest.groups = parseGroups(root, manifest.baseDirectory);
 
-    if (manifest.hasNormalSource()) {
-        manifest.normalPath = manifest.manifestPath;
-        manifest.normalSourceKind = NormalSourceKind::DenseZarr;
-        manifest.normalSourceKey = "groups.grad_mag_nx_ny";
-    }
-
     return manifest;
 }
 
-std::string toString(NormalSourceKind kind)
+bool lasagnaChannelShapeCompatible(
+    const std::array<std::size_t, 3>& baseShapeZYX,
+    double baseSpacing,
+    const std::array<std::size_t, 3>& shapeZYX,
+    const std::array<std::size_t, 3>& chunksZYX) noexcept
 {
-    switch (kind) {
-    case NormalSourceKind::None:
-        return "none";
-    case NormalSourceKind::DenseZarr:
-        return "dense_zarr";
+    if (!(baseSpacing > 0.0) || !std::isfinite(baseSpacing))
+        return false;
+    for (std::size_t axis = 0; axis < baseShapeZYX.size(); ++axis) {
+        if (baseShapeZYX[axis] == 0 || shapeZYX[axis] == 0 ||
+            chunksZYX[axis] == 0) {
+            return false;
+        }
+        const auto expected = static_cast<std::size_t>(std::ceil(
+            static_cast<double>(baseShapeZYX[axis]) / baseSpacing));
+        if (shapeZYX[axis] < expected ||
+            shapeZYX[axis] - expected > chunksZYX[axis]) {
+            return false;
+        }
     }
-    return "unknown";
+    return true;
+}
+
+LasagnaDatasetManifest fiberNormalManifest(const LasagnaDatasetManifest& source)
+{
+    auto result=source;
+    result.groups.clear();
+    for(const auto* name:{"nx","ny","grad_mag"}) {
+        const std::string original=std::string("sheet_")+name;
+        const auto* group=source.groupForChannel(original);
+        if(!group)throw std::invalid_argument("missing predicted normal channel "+original);
+        auto alias=*group;
+        alias.name=name;
+        for(auto& channel:alias.channels)
+            channel=channel==original?name:"unused_fiber_normal_"+channel;
+        result.groups.push_back(std::move(alias));
+    }
+    result.raw["grad_mag_encode_scale"]=1.0;
+    result.raw["grad_mag_factor"]=1.0;
+    return result;
 }
 
 } // namespace vc::lasagna

@@ -1,19 +1,19 @@
-// Local zarr volume creation + chunk I/O. Exercises Volume / VcDataset /
-// Zarr.cpp paths that the live S3 test never hits (writes, downsample,
-// fill-value, removeChunk, readChunkOrFill).
+// Local Volume metadata (meta.json). Zarr reading is vc_reader's and tested there.
 
 #define DOCTEST_CONFIG_IMPLEMENT_WITH_MAIN
 #include <doctest/doctest.h>
 
 #include "vc/core/types/Volume.hpp"
-#include "vc/core/types/Array3D.hpp"
+#include <nlohmann/json.hpp>
+#include <vc_reader/zarr.hpp>
+#include <vc_reader/zarr_write.hpp>
+#include <filesystem>
+#include <fstream>
+#include "vc/core/util/LoadJson.hpp"
 
-#include <opencv2/core.hpp>
 
 #include <array>
 #include <cstddef>
-#include <cstring>
-#include <filesystem>
 #include <random>
 #include <string>
 #include <vector>
@@ -31,197 +31,102 @@ fs::path tmpDir(const std::string& tag)
     return p;
 }
 
-Volume::ZarrCreateOptions makeOpts(std::array<size_t, 3> shape = {64, 64, 64},
-                                   std::array<size_t, 3> chunks = {32, 32, 32},
-                                   size_t numLevels = 2)
+void writeTextFile(const fs::path& path, const std::string& text)
 {
-    Volume::ZarrCreateOptions opts;
-    opts.shapeZYX = shape;
-    opts.chunkShapeZYX = chunks;
-    opts.numLevels = numLevels;
-    opts.fillValue = 0.0;
-    opts.voxelSize = 1.0;
-    opts.uuid = "test-vol-uuid";
-    opts.name = "test-vol";
-    opts.overwriteExisting = true;
-    // The build-bot blosc support is optional; force uncompressed so the
-    // test runs regardless of whether libblosc was linked.
-    opts.compressor = "none";
-    return opts;
+    std::ofstream out(path, std::ios::binary | std::ios::trunc);
+    REQUIRE(out.good());
+    out << text;
 }
 
 } // namespace
 
-TEST_CASE("Volume::New(path, opts): creates a fresh local zarr pyramid")
+TEST_CASE("Volume: an unusable voxelsize field reports 0 instead of throwing")
 {
-    auto d = tmpDir("create");
-    auto opts = makeOpts();
-    auto v = Volume::New(d, opts);
-    REQUIRE(v);
-    CHECK_FALSE(v->isRemote());
-    CHECK(v->id() == "test-vol-uuid");
-    CHECK(v->numScales() == 2);
+    // voxelSize() promises 0 for "unknown". A document may state the key as
+    // null, as text, or not at all, and each of those used to make the
+    // accessor throw from deep inside whatever asked for a physical area.
+    auto d = tmpDir("unusable_voxelsize");
+    const std::filesystem::path volumeRoot = d;
+    const vcr::zarr::CreateOptions levelZero{.shape = {32, 32, 32}, .chunks = {16, 16, 16}, .compressor = "", .overwrite = true};
+    vcr::zarr::Writer::create(volumeRoot / "0", levelZero);
+    std::ofstream(volumeRoot / "meta.json") << nlohmann::json{{"type", "vol"}, {"uuid", "test-vol-uuid"}, {"name", "test-vol"}, {"format", "zarr"}, {"width", 32}, {"height", 32}, {"slices", 32}, {"voxelsize", 1.0}}.dump();
+    const auto meta = nlohmann::json::parse(std::ifstream(d / "meta.json"));
+    const auto metaWithVoxelSize = [&](const std::string& voxelsizeJson) {
+        std::string text = R"({"type": "vol", "uuid": ")" + meta["uuid"].get<std::string>() +
+                           R"(", "width": 32, "height": 32, "slices": 32)";
+        if (!voxelsizeJson.empty()) {
+            text += R"(, "voxelsize": )" + voxelsizeJson;
+        }
+        return text + "}";
+    };
 
-    auto s0 = v->levelShape(0);
-    CHECK(s0[0] == 64);
-    CHECK(s0[1] == 64);
-    CHECK(s0[2] == 64);
-
-    auto s1 = v->levelShape(1);
-    CHECK(s1[0] == 32);
-    CHECK(s1[1] == 32);
-    CHECK(s1[2] == 32);
-
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: reopen existing local zarr without options")
-{
-    auto d = tmpDir("reopen");
-    auto opts = makeOpts();
+    SUBCASE("meta.json without a voxelsize key")
     {
-        auto v = Volume::New(d, opts);
-        REQUIRE(v);
+        writeTextFile(d / "meta.json", metaWithVoxelSize(""));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
     }
-    // Second open without options finds the existing pyramid on disk.
-    auto v = Volume::New(d);
-    REQUIRE(v);
-    CHECK_FALSE(v->isRemote());
-    CHECK(v->numScales() == 2);
-    fs::remove_all(d);
-}
 
-TEST_CASE("Volume::checkDir: true for created volume, false for arbitrary")
-{
-    auto d = tmpDir("checkdir");
+    SUBCASE("meta.json with a null voxelsize")
     {
-        auto v = Volume::New(d, makeOpts());
-        REQUIRE(v);
+        writeTextFile(d / "meta.json", metaWithVoxelSize("null"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
     }
-    CHECK(Volume::checkDir(d));
-    CHECK_FALSE(Volume::checkDir("/__nonexistent__/x"));
+
+    SUBCASE("meta.json with a non-positive voxelsize")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize("-1"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
+    SUBCASE("meta.json with voxelsize as unknown text")
+    {
+        writeTextFile(d / "meta.json", metaWithVoxelSize(R"("unknown")"));
+        auto v = Volume::New(d);
+        CHECK(v->voxelSize() == 0.0);
+    }
+
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: chunkByteSize and chunkExists on a fresh volume")
+TEST_CASE("Volume: base dimensions and level shapes follow the pyramid's placement, not powers of two")
 {
-    auto d = tmpDir("chunkexist");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    // No chunks written yet — none should exist.
-    CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
-    // chunkByteSize = chunk_volume * dtype_size = 32*32*32 * 1 (uint8) = 32768
-    CHECK(v->chunkByteSize(0) == 32768);
+    // Level 1 is placed by an OME scale of 3. The base dimensions come from level 0 as
+    // placed, and level 1's shape is checked against ceil(base / 3), so the volume opens.
+    auto d = tmpDir("placement");
+    vcr::zarr::MultiscalesOptions multiscales;
+    multiscales.levels = 1;
+    multiscales.factors = {3, 3, 3};
+    vcr::zarr::createGroup(d, vcr::zarr::Json{{"multiscales", vcr::zarr::Json::array({vcr::zarr::omeMultiscales(multiscales)})}});
+    vcr::zarr::CreateOptions level0;
+    level0.shape = {9, 12, 15};
+    level0.chunks = {3, 3, 3};
+    (void)vcr::zarr::Writer::create(d / "0", level0);
+    vcr::zarr::PyramidOptions pyramid;
+    pyramid.levels = 1;
+    pyramid.factors = {3, 3, 3};
+    vcr::zarr::createPyramidLevels(d, level0, pyramid);
+    REQUIRE(vcr::zarr::openArray((d / "1").string(), {}).meta.shape == vcr::Index{3, 4, 5});
+
+    const auto v = Volume::New(d);
+    CHECK(v->shape() == std::array<int, 3>{9, 12, 15});
     fs::remove_all(d);
 }
 
-TEST_CASE("Volume: writeZYX then readZYX round-trips a small buffer")
+TEST_CASE("Volume: metadata.json's scan is flattened, and a shape that disagrees with it throws")
 {
-    auto d = tmpDir("writeread");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
+    auto d = tmpDir("sidecar");
+    vcr::zarr::Writer::create(d / "0", {.shape = {4, 6, 8}, .chunks = {4, 6, 8}, .compressor = ""});
+    writeTextFile(d / "metadata.json",
+                  R"({"scan": {"type": "vol", "uuid": "from-scan", "width": 8, "height": 6, "slices": 4}})");
+    const auto v = Volume::New(d);
+    CHECK(v->id() == "from-scan");
+    CHECK(v->shape() == std::array<int, 3>{4, 6, 8});
 
-    // Write a small region of known values.
-    Array3D<uint8_t> in({16, 16, 16}, /*fill=*/0);
-    // Set a deterministic gradient.
-    for (size_t z = 0; z < 16; ++z)
-        for (size_t y = 0; y < 16; ++y)
-            for (size_t x = 0; x < 16; ++x)
-                in(z, y, x) = static_cast<uint8_t>((z * 31 + y * 13 + x) & 0xFF);
-
-    v->writeZYX(in, {0, 0, 0}, /*level=*/0);
-
-    Array3D<uint8_t> out({16, 16, 16});
-    bool ok = v->readZYX(out, {0, 0, 0}, 0);
-    CHECK(ok);
-    // Spot-check a few values.
-    CHECK(int(out(0, 0, 0)) == int(in(0, 0, 0)));
-    CHECK(int(out(15, 15, 15)) == int(in(15, 15, 15)));
-    CHECK(int(out(7, 3, 11)) == int(in(7, 3, 11)));
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: readChunkOrFill returns fill when chunk is absent")
-{
-    auto d = tmpDir("orfill");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    auto bytes = v->readChunkOrFill(0, {0, 0, 0});
-    CHECK(bytes.size() == v->chunkByteSize(0));
-    // Fill value = 0; every byte should be 0.
-    for (auto b : bytes) CHECK(std::to_integer<int>(b) == 0);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: chunkExists turns true after writeChunk")
-{
-    auto d = tmpDir("wc");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    std::vector<std::byte> chunk(v->chunkByteSize(0));
-    // Fill with something non-zero so we don't get write_empty_chunks=false elided.
-    std::memset(chunk.data(), 0xAB, chunk.size());
-    v->writeChunk(0, {0, 0, 0}, chunk);
-    CHECK(v->chunkExists(0, {0, 0, 0}));
-    auto opt = v->readChunk(0, {0, 0, 0});
-    REQUIRE(opt.has_value());
-    CHECK(opt->size() == chunk.size());
-    CHECK(std::to_integer<int>((*opt)[0]) == 0xAB);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: removeChunk drops the chunk file")
-{
-    auto d = tmpDir("rm");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    std::vector<std::byte> chunk(v->chunkByteSize(0));
-    std::memset(chunk.data(), 0x55, chunk.size());
-    v->writeChunk(0, {0, 0, 0}, chunk);
-    CHECK(v->chunkExists(0, {0, 0, 0}));
-    CHECK(v->removeChunk(0, {0, 0, 0}));
-    CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
-    // Second remove is a no-op (chunk already gone).
-    CHECK_FALSE(v->removeChunk(0, {0, 0, 0}));
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: empty-chunk write with writeEmptyChunks=false is elided")
-{
-    auto d = tmpDir("empty");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    std::vector<std::byte> zero(v->chunkByteSize(0));
-    // all zero == fill value
-    Volume::ChunkWriteOptions o;
-    o.writeEmptyChunks = false;
-    v->writeChunk(0, {0, 0, 0}, zero, o);
-    CHECK_FALSE(v->chunkExists(0, {0, 0, 0}));
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: writeXYZ and readXYZ obey UI-order offsets")
-{
-    auto d = tmpDir("xyz");
-    auto v = Volume::New(d, makeOpts());
-    REQUIRE(v);
-    Array3D<uint8_t> in({4, 4, 4}, /*fill=*/77);
-    v->writeXYZ(in, /*offsetXYZ=*/{0, 0, 0}, 0);
-    Array3D<uint8_t> out({4, 4, 4});
-    bool ok = v->readXYZ(out, {0, 0, 0}, 0);
-    CHECK(ok);
-    CHECK(int(out(0, 0, 0)) == 77);
-    fs::remove_all(d);
-}
-
-TEST_CASE("Volume: shape() / sliceWidth() / sliceHeight() / numSlices() agree")
-{
-    auto d = tmpDir("shape");
-    auto v = Volume::New(d, makeOpts({100, 50, 200}, {25, 25, 25}, 1));
-    REQUIRE(v);
-    auto sh = v->shape();
-    CHECK(sh[0] == v->numSlices());
-    CHECK(sh[1] == v->sliceHeight());
-    CHECK(sh[2] == v->sliceWidth());
+    fs::remove(d / "metadata.json");
+    writeTextFile(d / "meta.json", R"({"type": "vol", "uuid": "wrong", "width": 800, "height": 6, "slices": 4})");
+    CHECK_THROWS_WITH_AS(Volume::New(d), doctest::Contains("does not match"), std::runtime_error);
     fs::remove_all(d);
 }

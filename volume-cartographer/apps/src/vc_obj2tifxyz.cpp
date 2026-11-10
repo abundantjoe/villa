@@ -1,11 +1,12 @@
 #include "vc/core/util/Surface.hpp"
 #include "vc/core/util/QuadSurface.hpp"
-#include "vc/core/util/Slicing.hpp"
+#include "vc/core/util/StoreSurfaces.hpp"
+#include "vc/core/util/SurfaceMeshing.hpp"
+#include <vc_object_store/Uuid.hpp>
 #include <cctype>
 
 #include <iostream>
 #include <fstream>
-#include <sstream>
 #include <filesystem>
 #include <unordered_map>
 #include <map>
@@ -13,507 +14,38 @@
 #include <limits>
 #include <cmath>
 #include <memory>
-
-struct Vertex {
-    cv::Vec3f pos;
-};
-
-struct UV {
-    cv::Vec2f coord;
-};
-
-// Per-vertex source grid (col,row), parsed from the <obj>.griduv sidecar.
-// Used to resample the original approval mask onto the new flattened grid.
-struct GridUV {
-    cv::Vec2f cr;  // (col, row) in the original source grid
-};
-
-struct Face {
-    int v[3];  // vertex indices
-    int vt[3]; // texture coordinate indices
-};
+#include <stdexcept>
 
 // Helpers for flag parsing
 static bool starts_with(const std::string& s, const std::string& p) {
     return s.size() >= p.size() && std::equal(p.begin(), p.end(), s.begin());
 }
 
-class ObjToTifxyzConverter {
-private:
-    std::vector<Vertex> vertices;
-    std::vector<UV> uvs;
-    std::vector<Face> faces;
-    std::vector<GridUV> grid_uv;  // per-vertex source (col,row); empty if no sidecar
-
-    cv::Vec2f uv_min, uv_max;
-    cv::Vec2i grid_size;
-    cv::Vec2f scale;
-    // UV handling
-    bool uv_is_metric = true;   // if true, scale comes from UV spacing
-    float uv_to_obj   = 1.0f;   // OBJ units per 1 UV unit (used when uv_is_metric)
-    // UV decimation / capping
-    float uv_downsample = 1.0f;            // user-specified uniform decimation
-    uint64_t grid_cap_pixels = 0;          // cap total pixel count (0=off)
-    // Approval resampling: original mask (BGR or 1-ch) + output accumulator.
-    cv::Mat src_approval;                  // empty if not resampling approval
-    cv::Mat_<cv::Vec3b> out_approval;      // sized to grid_size when active
-    // Source scale (cells-per-OBJ-unit, from the original tifxyz meta.json).
-    // When set, the output grid is sized to the source sampling density so the
-    // flattened tifxyz keeps the input's scale instead of metric mode's 1.0.
-    cv::Vec2f src_scale = cv::Vec2f(0.f, 0.f);  // <=0 = unset
-
-public:
-    void setUVMetric(bool v) { uv_is_metric = v; }
-    void setUVToObj(float r) { uv_to_obj = r; }
-    void setUVDownsample(float f) { uv_downsample = std::max(1.0f, f); }
-    void setGridCapPixels(uint64_t cap) { grid_cap_pixels = cap; }
-    void setSrcScale(const cv::Vec2f& s) { src_scale = s; }
-    void setSrcApproval(const cv::Mat& m) { src_approval = m; }
-    bool hasApproval() const { return !src_approval.empty() && !grid_uv.empty(); }
-    const cv::Mat_<cv::Vec3b>& outApproval() const { return out_approval; }
-
-    bool loadObj(const std::string& filename) {
-        std::ifstream file(filename);
-        if (!file.is_open()) {
-            std::cerr << "Cannot open OBJ file: " << filename << std::endl;
-            return false;
-        }
-        
-        std::string line;
-        while (std::getline(file, line)) {
-            if (line.empty() || line[0] == '#')
-                continue;
-                
-            std::istringstream iss(line);
-            std::string prefix;
-            iss >> prefix;
-            
-            if (prefix == "v") {
-                Vertex v;
-                iss >> v.pos[0] >> v.pos[1] >> v.pos[2];
-                vertices.push_back(v);
-            }
-            else if (prefix == "vt") {
-                UV uv;
-                iss >> uv.coord[0] >> uv.coord[1];
-                uvs.push_back(uv);
-            }
-            else if (prefix == "f") {
-                Face face;
-                std::string vertex_str;
-                int idx = 0;
-                
-                while (iss >> vertex_str && idx < 3) {
-                    // Parse vertex/texture/normal indices
-                    std::replace(vertex_str.begin(), vertex_str.end(), '/', ' ');
-                    std::istringstream viss(vertex_str);
-                    
-                    viss >> face.v[idx];
-                    face.v[idx]--; // Convert to 0-based
-                    
-                    if (viss >> face.vt[idx]) {
-                        face.vt[idx]--; // Convert to 0-based
-                    } else {
-                        face.vt[idx] = -1;
-                    }
-                    
-                    idx++;
-                }
-                
-                if (idx == 3) {
-                    faces.push_back(face);
-                }
-            }
-        }
-        
-        file.close();
-        
-        std::cout << "Loaded OBJ file:" << std::endl;
-        std::cout << "  Vertices: " << vertices.size() << std::endl;
-        std::cout << "  UVs: " << uvs.size() << std::endl;
-        std::cout << "  Faces: " << faces.size() << std::endl;
-
-        return !vertices.empty() && !faces.empty() && !uvs.empty();
-    }
-
-    // Load the per-vertex grid-UV sidecar (<obj>.griduv: "col row" per line, in
-    // OBJ vertex order). Returns false if absent or count mismatches vertices.
-    bool loadGridUV(const std::string& obj_filename) {
-        const std::string sidecar = obj_filename + ".griduv";
-        std::ifstream file(sidecar);
-        if (!file.is_open()) {
-            return false;
-        }
-        grid_uv.clear();
-        grid_uv.reserve(vertices.size());
-        float col = 0, row = 0;
-        while (file >> col >> row) {
-            grid_uv.push_back(GridUV{cv::Vec2f(col, row)});
-        }
-        if (grid_uv.size() != vertices.size()) {
-            std::cerr << "warning: grid-UV sidecar has " << grid_uv.size()
-                      << " entries but OBJ has " << vertices.size()
-                      << " vertices; skipping approval resample\n";
-            grid_uv.clear();
-            return false;
-        }
-        std::cout << "Loaded grid-UV sidecar: " << grid_uv.size() << " entries\n";
-        return true;
-    }
-    
-    void determineGridDimensions(float stretch_factor = 1.0f) {
-        // Find UV bounds from all UVs used in faces
-        uv_min = cv::Vec2f(std::numeric_limits<float>::max(), std::numeric_limits<float>::max());
-        uv_max = cv::Vec2f(std::numeric_limits<float>::lowest(), std::numeric_limits<float>::lowest());
-        
-        for (const auto& face : faces) {
-            for (int i = 0; i < 3; i++) {
-                if (face.vt[i] >= 0 && face.vt[i] < (int)uvs.size()) {
-                    cv::Vec2f uv = uvs[face.vt[i]].coord;
-                    uv_min[0] = std::min(uv_min[0], uv[0]);
-                    uv_min[1] = std::min(uv_min[1], uv[1]);
-                    uv_max[0] = std::max(uv_max[0], uv[0]);
-                    uv_max[1] = std::max(uv_max[1], uv[1]);
-                }
-            }
-        }
-        
-        std::cout << "UV bounds: [" << uv_min[0] << ", " << uv_min[1] << "] to [" 
-                  << uv_max[0] << ", " << uv_max[1] << "]" << std::endl;
-        
-        // Build raw grid (pre-decimation) from UV range and stretch factor
-        const cv::Vec2f uv_range = uv_max - uv_min;
-        const int gw_raw = std::max(2, static_cast<int>(std::ceil(uv_range[0] * stretch_factor)) + 1);
-        const int gh_raw = std::max(2, static_cast<int>(std::ceil(uv_range[1] * stretch_factor)) + 1);
-
-        // Apply uniform decimation / capping to the resolution (NOT to the scale)
-        const auto apply_decimation = [](int n, double d) {
-            if (d <= 1.0) return n;
-            // keep endpoints: 1 + floor((n-1)/d)
-            const double eff = std::max(1.0, d);
-            return std::max(2, static_cast<int>(std::floor((n - 1) / eff)) + 1);
-        };
-
-        double decim = std::max(1.0, static_cast<double>(uv_downsample));
-        if (grid_cap_pixels > 0) {
-            const long double raw_px = static_cast<long double>(gw_raw) * static_cast<long double>(gh_raw);
-            if (raw_px > static_cast<long double>(grid_cap_pixels)) {
-                const double need = std::sqrt(static_cast<double>(raw_px / static_cast<long double>(grid_cap_pixels)));
-                decim = std::max(decim, std::ceil(need));
-            }
-        }
-        const int gw_dec = apply_decimation(gw_raw, decim);
-        const int gh_dec = apply_decimation(gh_raw, decim);
-        grid_size[0] = gw_dec;
-        grid_size[1] = gh_dec;
-
-        // Effective decimation per axis (accounts for rounding at endpoints)
-        const double eff_decim_x = (gw_dec > 1) ? (double)(gw_raw - 1) / (double)(gw_dec - 1) : 1.0;
-        const double eff_decim_y = (gh_dec > 1) ? (double)(gh_raw - 1) / (double)(gh_dec - 1) : 1.0;
-
-        // When the source tifxyz scale is known, size the output grid to the
-        // source sampling density and adopt its scale verbatim. vc_tifxyz2obj
-        // wrote UVs as grid_idx*(1/src_scale), so the source cell count per axis
-        // is ~uv_range*src_scale + 1. This keeps the flattened tifxyz at the
-        // input's resolution/scale instead of metric mode's 1 cell / UV unit
-        // (which inflated the grid by ~1/src_scale per axis). Decimation/caps
-        // still apply on top, never finer than source.
-        if (src_scale[0] > 0.f && src_scale[1] > 0.f) {
-            int gw_src = std::max(2, static_cast<int>(std::lround(uv_range[0] * src_scale[0])) + 1);
-            int gh_src = std::max(2, static_cast<int>(std::lround(uv_range[1] * src_scale[1])) + 1);
-            // Honor any further user decimation / pixel cap on top of source density.
-            gw_src = apply_decimation(gw_src, decim);
-            gh_src = apply_decimation(gh_src, decim);
-            grid_size[0] = gw_src;
-            grid_size[1] = gh_src;
-            scale[0] = src_scale[0];
-            scale[1] = src_scale[1];
-            std::cout << "Source-scale mode: grid " << grid_size[0] << " x " << grid_size[1]
-                      << "  scale: " << scale[0] << ", " << scale[1]
-                      << "  (matched to input tifxyz)" << std::endl;
-        } else if (uv_is_metric) {
-            // --- Preserve physical pixel size (scale) from the RAW grid ---
-            // du_raw/dv_raw are UV units per pixel *before* decimation.
-            const float du_raw = (gw_raw > 1) ? uv_range[0] / float(gw_raw - 1) : 0.f;
-            const float dv_raw = (gh_raw > 1) ? uv_range[1] / float(gh_raw - 1) : 0.f;
-            scale[0] = du_raw * uv_to_obj; // OBJ units per pixel (unchanged by decimation)
-            scale[1] = dv_raw * uv_to_obj;
-
-            std::cout << "UV-metric mode: grid " << grid_size[0] << " x " << grid_size[1]
-                      << "  scale(OBJ units): " << scale[0] << ", " << scale[1] << std::endl;
-            if (decim > 1.0) {
-                std::cout << "  (applied UV decimation ~" << decim << "x per axis; "
-                          << "effective decim [" << eff_decim_x << ", " << eff_decim_y << "]; "
-                          << "preserved per-pixel physical scale)\n";
-            }
-        } else {
-            // --- Legacy non-metric: measure from 3D on decimated grid, then compensate ---
-            std::cout << "Creating preliminary grid " << grid_size[0] << " x " << grid_size[1]
-                      << " to measure scale from 3D..." << std::endl;
-
-            cv::Mat_<cv::Vec3f> preliminary_points(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
-            for (const auto& face : faces) {
-                rasterizeTriangle(preliminary_points, face);
-            }
-            // This fills 'scale' with the distance between adjacent samples on the DECIMATED grid
-            calculateScaleFromGrid(preliminary_points);
-
-            // Compensate by the effective decimation so that scale matches the raw-grid pixel size
-            if (scale[0] > 0) scale[0] = static_cast<float>(scale[0] / eff_decim_x);
-            if (scale[1] > 0) scale[1] = static_cast<float>(scale[1] / eff_decim_y);
-
-            // Keep original behavior for the final log (do not fight it further)
-            const cv::Vec2f measured = scale;
-            grid_size[0] = std::max(2, static_cast<int>(std::round(measured[0] * stretch_factor)) + 1);
-            grid_size[1] = std::max(2, static_cast<int>(std::round(measured[1] * stretch_factor)) + 1);
-
-            std::cout << "Final grid: " << grid_size[0] << " x " << grid_size[1] << std::endl;
-            std::cout << "Scale(OBJ units; compensated to raw-pixel spacing): "
-                      << measured[0] << ", " << measured[1] << std::endl;
-        }
-    }
-    
-    QuadSurface* createQuadSurface(float mesh_units = 1.0f) {
-        // Create points matrix initialized with invalid values
-        cv::Mat_<cv::Vec3f>* points = new cv::Mat_<cv::Vec3f>(grid_size[1], grid_size[0], cv::Vec3f(-1, -1, -1));
-
-        // Approval accumulator (unapproved = black) when resampling is active.
-        if (hasApproval()) {
-            out_approval = cv::Mat_<cv::Vec3b>(grid_size[1], grid_size[0], cv::Vec3b(0, 0, 0));
-        }
-
-        // Rasterize triangles onto the grid
-        for (const auto& face : faces) {
-            rasterizeTriangle(*points, face);
-        }
-        
-        // Count valid points
-        int valid_count = 0;
-        for (int y = 0; y < grid_size[1]; y++) {
-            for (int x = 0; x < grid_size[0]; x++) {
-                if ((*points)(y, x)[0] != -1) {
-                    valid_count++;
-                }
-            }
-        }
-        
-        std::cout << "Valid grid points: " << valid_count << " / " << (grid_size[0] * grid_size[1]) 
-                  << " (" << (100.0f * valid_count / (grid_size[0] * grid_size[1])) << "%)" << std::endl;
-        
-        // Scale is currently in OBJ units. Convert to micrometers now.
-        if (valid_count == 0) {
-            std::cerr << "Warning: no valid grid points were rasterized." << std::endl;
-        }
-        const bool src_scale_mode = (src_scale[0] > 0.f && src_scale[1] > 0.f);
-        if (src_scale_mode) {
-            // Scale was adopted verbatim from the source tifxyz; do not rescale.
-            std::cout << "Scale (from source tifxyz): " << scale[0] << ", " << scale[1] << std::endl;
-        } else if (uv_is_metric) {
-            scale[0] *= mesh_units;
-            scale[1] *= mesh_units;
-            std::cout << "Scale from UV (micrometers): " << scale[0] << ", " << scale[1] << std::endl;
-        } else {
-            // Measure from 3D to preserve anisotropy and noise-robustness (already compensated in determineGridDimensions)
-            calculateScaleFromGrid(*points, mesh_units);
-        }
-        
-        return new QuadSurface(points, scale);
-    }
-    
-    void calculateScaleFromGrid(const cv::Mat_<cv::Vec3f>& points, float mesh_units = 1.0f) {
-        // Based on vc_segmentation_scales from Slicing.cpp
-        double sum_x = 0;
-        double sum_y = 0;
-        int count = 0;
-        
-        // Skip borders (10% on each side) to avoid artifacts
-        int jmin = static_cast<int>(points.rows * 0.1) + 1;
-        int jmax = static_cast<int>(points.rows * 0.9);
-        int imin = static_cast<int>(points.cols * 0.1) + 1;
-        int imax = static_cast<int>(points.cols * 0.9);
-        int step = 4;
-        
-        // For small grids, use all points
-        if (points.rows < 20 || points.cols < 20) {
-            jmin = 1;
-            jmax = points.rows;
-            imin = 1;
-            imax = points.cols;
-            step = 1;
-        }
-        
-        // Calculate average distance between adjacent points
-        for (int j = jmin; j < jmax; j += step) {
-            for (int i = imin; i < imax; i += step) {
-                // Skip invalid points
-                if (points(j, i)[0] == -1 || points(j, i-1)[0] == -1 || points(j-1, i)[0] == -1)
-                    continue;
-                
-                // Distance to neighbor in X direction
-                cv::Vec3f v = points(j, i) - points(j, i-1);
-                const double dist_x_sq = v.dot(v);
-                if (dist_x_sq > 0) {
-                    sum_x += std::sqrt(dist_x_sq);
-                }
-                
-                // Distance to neighbor in Y direction
-                v = points(j, i) - points(j-1, i);
-                const double dist_y_sq = v.dot(v);
-                if (dist_y_sq > 0) {
-                    sum_y += std::sqrt(dist_y_sq);
-                }
-                count++;
-            }
-        }
-        
-        if (count > 0 && sum_x > 0 && sum_y > 0) {
-            // Scale is the average distance between points, adjusted by mesh units
-            scale[0] = static_cast<float>((sum_x / count) * mesh_units);
-            scale[1] = static_cast<float>((sum_y / count) * mesh_units);
-        } else {
-            // Fallback to UV-based scale if we couldn't calculate from grid
-            std::cerr << "Warning: Could not calculate scale from grid, using UV-based fallback" << std::endl;
-            // scale already set in determineGridDimensions
-        }
-        
-        std::cout << "Calculated scale factors from grid: " << scale[0] << ", " << scale[1] << " micrometers" << std::endl;
-    }
-    
-private:
-    void rasterizeTriangle(cv::Mat_<cv::Vec3f>& points, const Face& face) {
-        // Validate indices
-        for (int k = 0; k < 3; ++k) {
-            if (face.v[k] < 0 || face.v[k] >= (int)vertices.size()) {
-                return; // skip invalid vertex indices
-            }
-            if (face.vt[k] < 0 || face.vt[k] >= (int)uvs.size()) {
-                return; // skip faces with missing/invalid UVs
-            }
-        }
-        // Get triangle vertices and UVs
-        cv::Vec3f v0 = vertices[face.v[0]].pos;
-        cv::Vec3f v1 = vertices[face.v[1]].pos;
-        cv::Vec3f v2 = vertices[face.v[2]].pos;
-        
-        cv::Vec2f uv0 = uvs[face.vt[0]].coord;
-        cv::Vec2f uv1 = uvs[face.vt[1]].coord;
-        cv::Vec2f uv2 = uvs[face.vt[2]].coord;
-        
-        // Transform UVs to grid coordinates
-        // Map from [uv_min, uv_max] to [0, grid_size-1]
-        cv::Vec2f uv_range = uv_max - uv_min;
-        const float rx = std::max(uv_range[0], 1e-12f);
-        const float ry = std::max(uv_range[1], 1e-12f);
-        uv0 = (uv0 - uv_min);
-        uv0[0] = uv0[0] / rx * (grid_size[0] - 1);
-        uv0[1] = uv0[1] / ry * (grid_size[1] - 1);
-        
-        uv1 = (uv1 - uv_min);
-        uv1[0] = uv1[0] / rx * (grid_size[0] - 1);
-        uv1[1] = uv1[1] / ry * (grid_size[1] - 1);
-        
-        uv2 = (uv2 - uv_min);
-        uv2[0] = uv2[0] / rx * (grid_size[0] - 1);
-        uv2[1] = uv2[1] / ry * (grid_size[1] - 1);
-        
-        // Find bounding box in grid coordinates
-        int min_x = std::max(0, static_cast<int>(std::floor(std::min({uv0[0], uv1[0], uv2[0]}))) - 1);
-        int max_x = std::min(grid_size[0] - 1, static_cast<int>(std::ceil(std::max({uv0[0], uv1[0], uv2[0]}))) + 1);
-        int min_y = std::max(0, static_cast<int>(std::floor(std::min({uv0[1], uv1[1], uv2[1]}))) - 1);
-        int max_y = std::min(grid_size[1] - 1, static_cast<int>(std::ceil(std::max({uv0[1], uv1[1], uv2[1]}))) + 1);
-        
-        // Rasterize triangle
-        for (int y = min_y; y <= max_y; y++) {
-            for (int x = min_x; x <= max_x; x++) {
-                cv::Vec2f p(x, y);
-                
-                // Compute barycentric coordinates
-                cv::Vec3f bary = computeBarycentric(p, uv0, uv1, uv2);
-                
-                // Check if point is inside triangle
-                if (bary[0] >= 0 && bary[1] >= 0 && bary[2] >= 0) {
-                    // Interpolate 3D position
-                    cv::Vec3f pos = bary[0] * v0 + bary[1] * v1 + bary[2] * v2;
-
-                    // Only update if not already set (first triangle wins)
-                    if (points(y, x)[0] == -1) {
-                        points(y, x) = pos;
-
-                        // Same first-wins gate for approval: interpolate the
-                        // original (col,row) with the same weights and sample
-                        // the source mask there.
-                        if (hasApproval()) {
-                            const cv::Vec2f cr = bary[0] * grid_uv[face.v[0]].cr
-                                               + bary[1] * grid_uv[face.v[1]].cr
-                                               + bary[2] * grid_uv[face.v[2]].cr;
-                            out_approval(y, x) = sampleSrcApproval(cr[0], cr[1]);
-                        }
-                    }
-                }
-            }
-        }
-    }
-    
-    // Nearest-neighbor sample of the source approval mask at original grid
-    // (col,row). Returns BGR; 1-channel legacy masks map nonzero -> white.
-    cv::Vec3b sampleSrcApproval(float colf, float rowf) const {
-        int col = static_cast<int>(std::lround(colf));
-        int row = static_cast<int>(std::lround(rowf));
-        col = std::clamp(col, 0, src_approval.cols - 1);
-        row = std::clamp(row, 0, src_approval.rows - 1);
-        if (src_approval.channels() == 1) {
-            return src_approval.at<uint8_t>(row, col) > 0 ? cv::Vec3b(255, 255, 255)
-                                                          : cv::Vec3b(0, 0, 0);
-        }
-        return src_approval.at<cv::Vec3b>(row, col);
-    }
-
-    cv::Vec3f computeBarycentric(const cv::Vec2f& p, const cv::Vec2f& a, const cv::Vec2f& b, const cv::Vec2f& c) {
-        cv::Vec2f v0 = c - a;
-        cv::Vec2f v1 = b - a;
-        cv::Vec2f v2 = p - a;
-        
-        float dot00 = v0.dot(v0);
-        float dot01 = v0.dot(v1);
-        float dot02 = v0.dot(v2);
-        float dot11 = v1.dot(v1);
-        float dot12 = v1.dot(v2);
-        
-        const float denom = (dot00 * dot11 - dot01 * dot01);
-        if (std::fabs(denom) < 1e-20f || !std::isfinite(denom)) {
-            // Degenerate triangle in UV space -> mark "outside"
-            return cv::Vec3f(-1.f, -1.f, -1.f);
-        }
-        float invDenom = 1.0f / denom;
-        float u = (dot11 * dot02 - dot01 * dot12) * invDenom;
-        float v = (dot00 * dot12 - dot01 * dot02) * invDenom;
-        
-        return cv::Vec3f(1.0f - u - v, v, u);
-    }
-};
-
 int main(int argc, char *argv[])
 {
     if (argc < 3) {
         std::cout << "usage: " << argv[0]
-                  << " <input.obj> <output_directory> [stretch_factor] [mesh_units]"
+                  << " <input.obj> <output_directory | --store=<store>> [stretch_factor] [mesh_units]"
                   << " [--uv-metric] [--uv-to-obj=<ratio>] [--uv-downsample=<f>]"
-                  << " [--grid-cap=<pixels>]" << std::endl;
+                  << " [--grid-cap=<pixels>] [--uuid=<id>]" << std::endl;
         std::cout << "Converts an OBJ file to tifxyz format" << std::endl;
         std::cout << std::endl;
         std::cout << "Parameters:" << std::endl;
         std::cout << "  stretch_factor: UV scaling factor (default: 1.0)" << std::endl;
         std::cout << "  mesh_units    : micrometers per OBJ unit (default: 1.0)" << std::endl;
         std::cout << "Flags:" << std::endl;
+        std::cout << "  --store=<store>     : write a new surface object instead of a directory (prints surface_uuid:)," << std::endl;
+        std::cout << "                        with --name=<name>, --tag=<tag> (repeatable), --volume-uuid=<id> and" << std::endl;
+        std::cout << "                        --source-surface=<uuid> in place of --tifxyz-source" << std::endl;
         std::cout << "  --uv-metric         : UVs are metric (default; UV units == OBJ units unless --uv-to-obj is set)" << std::endl;
         std::cout << "  --uv-non-metric     : Revert to legacy behavior (measure scale from 3D mesh)" << std::endl;
         std::cout << "  --uv-to-obj=<ratio> : OBJ units per 1 UV unit (default: 1.0). Only used with --uv-metric." << std::endl;
         std::cout << "  --uv-downsample=<f> : Uniform UV decimation factor (>=1.0). Reduces grid by ~f^2." << std::endl;
         std::cout << "  --grid-cap=<pixels> : Upper bound on total grid pixels. Implies extra decimation if needed." << std::endl;
+        std::cout << "  --uuid=<id>         : Metadata UUID. Defaults to a fresh random UUID." << std::endl;
         std::cout << "  --tifxyz-source=<dir>: Original tifxyz being flattened. Its meta.json scale sizes the" << std::endl;
         std::cout << "                        output grid to the input sampling density (output scale == input" << std::endl;
-        std::cout << "                        scale). If <dir>/approval.tif exists, it is resampled onto the new" << std::endl;
-        std::cout << "                        grid via the <input.obj>.griduv sidecar. Absent: legacy metric sizing." << std::endl;
+        std::cout << "                        scale). Absent: legacy metric sizing." << std::endl;
         std::cout << std::endl;
         std::cout << "Note: Scale factors are automatically calculated from the mesh grid structure." << std::endl;
         std::cout << "Examples:" << std::endl;
@@ -524,21 +56,31 @@ int main(int argc, char *argv[])
     }
 
     std::filesystem::path obj_path = argv[1];
-    std::filesystem::path output_dir = argv[2];
+    // The output is a directory, or a store given as --store=PATH.
+    const bool output_positional = std::string(argv[2]).rfind("--", 0) != 0;
+    std::filesystem::path output_dir = output_positional ? argv[2] : "";
+    StoreOutputArgs store_output;
+    std::string source_surface;
     float stretch_factor = 1.0f;
     float mesh_units = 1.0f;      // micrometers per OBJ unit
     bool  uv_metric = true;       // treat UV as metric parametrization
     float uv_to_obj = 1.0f;       // OBJ units per UV unit (only when uv_metric)
     float uv_downsample = 1.0f;
     uint64_t grid_cap = 0;
-    std::string tifxyz_source;  // original tifxyz dir: provides scale + approval mask
+    std::string tifxyz_source;  // original tifxyz dir: provides the scale
+    std::string uuid_override;
 
     // Backward-compatible parsing:
     // positional numbers: stretch_factor, mesh_units
     // optional flags: --uv-metric (no-op default)  --uv-non-metric  --uv-to-obj=<ratio>
     int consumed_numbers = 0;
-    for (int i = 3; i < argc; ++i) {
+    for (int i = output_positional ? 3 : 2; i < argc; ++i) {
         std::string a = argv[i];
+        if (store_output.parse(a)) continue;
+        if (starts_with(a, "--source-surface=")) {
+            source_surface = a.substr(std::string("--source-surface=").size());
+            continue;
+        }
         if (starts_with(a, "--uv-metric")) {
             uv_metric = true;
             continue;
@@ -579,6 +121,14 @@ int main(int argc, char *argv[])
             tifxyz_source = a.substr(std::string("--tifxyz-source=").size());
             continue;
         }
+        if (starts_with(a, "--uuid=")) {
+            uuid_override = a.substr(std::string("--uuid=").size());
+            if (uuid_override.empty()) {
+                std::cerr << "Invalid value for --uuid (must be non-empty)\n";
+                return EXIT_FAILURE;
+            }
+            continue;
+        }
         // numbers (legacy positional)
         if (consumed_numbers == 0) {
             stretch_factor = std::atof(a.c_str());
@@ -598,6 +148,17 @@ int main(int argc, char *argv[])
             std::cerr << "Unknown argument: " << a << std::endl;
             return EXIT_FAILURE;
         }
+    }
+
+    if (output_dir.empty() == store_output.store.empty() ||
+        (store_output.store.empty() && (!store_output.name.empty() || !store_output.tags.empty() ||
+                                        store_output.volume || !source_surface.empty()))) {
+        std::cerr << "Give an output directory or --store=<store>; --name, --tag, --volume-uuid and --source-surface need --store\n";
+        return EXIT_FAILURE;
+    }
+    if (!store_output.store.empty() && (!uuid_override.empty() || !tifxyz_source.empty())) {
+        std::cerr << "In store mode the source is --source-surface=<uuid> and the store assigns the UUID\n";
+        return EXIT_FAILURE;
     }
 
     if (!std::filesystem::exists(obj_path)) {
@@ -621,24 +182,30 @@ int main(int argc, char *argv[])
     if (grid_cap > 0)
         std::cout << "Grid cap: " << grid_cap << " pixels (pre-rasterization)\n";
 
-    ObjToTifxyzConverter converter;
+    vc::meshing::UvGridRasterizer converter;
     converter.setUVMetric(uv_metric);
     converter.setUVToObj(uv_to_obj);
     converter.setUVDownsample(uv_downsample);
     converter.setGridCapPixels(grid_cap);
 
     // Load OBJ file
-    if (!converter.loadObj(obj_path.string())) {
+    vc::meshing::UvMesh mesh;
+    if (!vc::meshing::readUvObj(obj_path.string(), mesh)) {
         std::cerr << "Failed to load OBJ file" << std::endl;
         return EXIT_FAILURE;
     }
+    converter.setMesh(std::move(mesh.vertices), std::move(mesh.uvs), std::move(mesh.faces));
 
     // Source tifxyz (optional): provides the scale that sizes the output grid
-    // to the input sampling density, and (if present) the approval mask to
-    // resample. Absent -> legacy metric sizing, no approval channel.
-    if (!tifxyz_source.empty()) {
+    // to the input sampling density. Absent -> legacy metric sizing.
+    nlohmann::json sourceMeta = nlohmann::json::object();
+    if (!tifxyz_source.empty() || !source_surface.empty()) {
         try {
-            std::unique_ptr<QuadSurface> src(load_quad_from_tifxyz(tifxyz_source));
+            std::unique_ptr<QuadSurface> src(source_surface.empty()
+                ? load_quad_from_tifxyz(tifxyz_source)
+                : StoreSurfaces(store_output.store, "vc_obj2tifxyz").load(source_surface));
+            if (src->meta.is_object())
+                sourceMeta = src->meta;
             const cv::Vec2f s = src->scale();
             if (s[0] > 0.f && s[1] > 0.f) {
                 converter.setSrcScale(s);
@@ -646,19 +213,6 @@ int main(int argc, char *argv[])
                           << " (sizing output grid to input density)\n";
             } else {
                 std::cerr << "warning: source scale invalid; falling back to metric sizing\n";
-            }
-            // Approval resample: needs both the source mask and the per-vertex
-            // grid-UV sidecar emitted by vc_tifxyz2obj. Skip cleanly if either
-            // is missing.
-            cv::Mat ap = src->channel("approval", SURF_CHANNEL_NORESIZE);
-            if (ap.empty()) {
-                std::cout << "note: source has no approval channel; nothing to resample\n";
-            } else if (!converter.loadGridUV(obj_path.string())) {
-                std::cerr << "note: no usable grid-UV sidecar; approval will not be resampled\n";
-            } else {
-                converter.setSrcApproval(ap);
-                std::cout << "Resampling approval (" << ap.cols << "x" << ap.rows
-                          << ", " << ap.channels() << "ch)\n";
             }
         } catch (...) {
             std::cerr << "warning: could not load tifxyz source: " << tifxyz_source << "\n";
@@ -674,24 +228,32 @@ int main(int argc, char *argv[])
         std::cerr << "Failed to create quad surface" << std::endl;
         return EXIT_FAILURE;
     }
-
-    // Attach the resampled approval mask so save() writes approval.tif at the
-    // new grid size alongside x/y/z.tif.
-    if (converter.hasApproval()) {
-        surf->setChannel("approval", converter.outApproval());
-        std::cout << "Attached resampled approval channel\n";
-    }
+    surf->meta = std::move(sourceMeta);
     
-    // Generate a UUID for the surface
-    std::string uuid = output_dir.filename().string();
-    if (uuid.empty()) {
-        uuid = obj_path.stem().string();
+    if (!store_output.store.empty()) {
+        try {
+            nlohmann::json parameters = {{"input", obj_path.filename().string()}, {"arguments", std::vector<std::string>(argv + 2, argv + argc)}};
+            StoreSurfaces store(store_output.store, std::filesystem::path(argv[0]).filename().string());
+            const auto uuid = store.create(*surf, store_output.name.empty() ? obj_path.stem().string() : store_output.name,
+                                           parameters, source_surface.empty() ? std::vector<std::string>{} : std::vector<std::string>{source_surface}, store_output.tags, store_output.volume);
+            store.objects().finish();
+            std::cout << "surface_uuid: " << uuid << std::endl;
+        } catch (const std::exception& e) {
+            std::cerr << "Error storing surface: " << e.what() << std::endl;
+            delete surf;
+            return EXIT_FAILURE;
+        }
+        delete surf;
+        return EXIT_SUCCESS;
     }
+
+    // A converted mesh is a new object: fresh UUID unless --uuid names one.
+    surf->meta["uuid"] = uuid_override.empty() ? vc::objects::util::newUuid() : uuid_override;
     
     std::cout << "Saving to tifxyz format..." << std::endl;
     
     try {
-        surf->save(output_dir.string(), uuid);
+        surf->save(output_dir);
         std::cout << "Successfully converted to tifxyz format" << std::endl;
     }
     catch (const std::exception& e) {

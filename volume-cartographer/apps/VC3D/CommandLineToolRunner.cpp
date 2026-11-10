@@ -1,5 +1,8 @@
 #include "CommandLineToolRunner.hpp"
-#include "CWindow.hpp"
+
+#include <vc_reader/zarr.hpp>
+#include "ToolExecutable.hpp"
+#include "ToolOutput.hpp"
 #include <QDir>
 #include <QFileInfo>
 #include <QStatusBar>
@@ -10,64 +13,25 @@
 #include <QMessageBox>
 #include <QClipboard>
 #include <QApplication>
+#include <vc_object_store/objects/ObjectStoreSession.hpp>
+
+#include <cmath>
+#include <utility>
 
 
 
-namespace {
-
-QString quoteArg(const QString& arg)
-{
-    if (arg.isEmpty())
-        return "\"\"";
-
-    bool needsQuotes = false;
-    for (const QChar& ch : arg) {
-        if (ch.isSpace() || ch == '"' || ch == '\'' || ch == '\\') {
-            needsQuotes = true;
-            break;
-        }
-    }
-
-    if (!needsQuotes) {
-        return arg;
-    }
-
-    QString escaped = arg;
-    escaped.replace('\\', "\\\\");
-    escaped.replace('"', "\\\"");
-    return "\"" + escaped + "\"";
-}
-
-QString formatCommand(const QString& program, const QStringList& args, int ompThreads)
-{
-    QStringList quotedArgs;
-    quotedArgs.reserve(args.size());
-    for (const auto& arg : args) {
-        quotedArgs << quoteArg(arg);
-    }
-
-    QString base = QString("%1 %2").arg(program, quotedArgs.join(' '));
-    if (ompThreads > 0) {
-        return QString("OMP_NUM_THREADS=%1 %2").arg(ompThreads).arg(base);
-    }
-    return base;
-}
-
-} // namespace
-
-CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mainWindow, QObject* parent)
+CommandLineToolRunner::CommandLineToolRunner(
+    QStatusBar* statusBar,
+    std::function<QString()> currentVolumePath,
+    QObject* parent)
     : QObject(parent)
-    , _mainWindow(mainWindow)
+    , _currentVolumePath(std::move(currentVolumePath))
     , _progressUtil(new ProgressUtil(nullptr, this))
-    , _process(nullptr)
     , _consoleOutput(new ConsoleOutputWidget())
     , _consoleDialog(new QDialog(nullptr, Qt::Window))
-    , _autoShowConsole(true)
     , _scale(1.0f)
     , _resolution(0)
     , _layers(31)
-    , _logFile(nullptr)
-    , _logStream(nullptr)
 {
     _consoleDialog->setWindowTitle(tr("Command Output"));
     _consoleDialog->resize(700, 500);
@@ -79,24 +43,7 @@ CommandLineToolRunner::CommandLineToolRunner(QStatusBar* statusBar, CWindow* mai
 
 CommandLineToolRunner::~CommandLineToolRunner()
 {
-    if (_process) {
-        if (_process->state() != QProcess::NotRunning) {
-            _process->terminate();
-            _process->waitForFinished(3000);
-        }
-        delete _process;
-    }
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
+    delete _run;
     delete _consoleDialog;
     // _consoleOutput is deleted by _consoleDialog
 }
@@ -107,25 +54,15 @@ void CommandLineToolRunner::setVolumePath(const QString& path)
     _explicitVolumePath = !_volumePath.isEmpty();
 }
 
-void CommandLineToolRunner::setRemoteVolumeUrl(const QString& url)
+void CommandLineToolRunner::setStore(const QString& storePath, double voxelScale)
 {
-    _remoteVolumeUrl = url.trimmed();
+    _storePath = storePath;
+    _voxelScale = voxelScale;
 }
 
-void CommandLineToolRunner::setRemoteVolumeAuth(const QString& accessKey,
-                                                const QString& secretKey,
-                                                const QString& sessionToken,
-                                                const QString& region)
+void CommandLineToolRunner::setSurface(const QString& uuid)
 {
-    _remoteAccessKey = accessKey;
-    _remoteSecretKey = secretKey;
-    _remoteSessionToken = sessionToken;
-    _remoteRegion = region;
-}
-
-void CommandLineToolRunner::setSegmentPath(const QString& path)
-{
-    _segmentPath = path;
+    _surfaceUuid = uuid;
 }
 
 void CommandLineToolRunner::setOutputPattern(const QString& pattern)
@@ -140,19 +77,33 @@ void CommandLineToolRunner::setRenderParams(float scale, int resolution, int lay
     _layers = layers;
 }
 
-void CommandLineToolRunner::setTraceParams(QString volumePath, QString srcDir, QString tgtDir, QString jsonParams, QString srcSegment)
+void CommandLineToolRunner::setRenderVoxelSize(double voxelSizeUm, bool enabled)
 {
-    setVolumePath(volumePath);
-    _srcDir = srcDir;
-    _tgtDir = tgtDir;
-    _jsonParams = jsonParams;
-    _srcSegment = srcSegment;
+    _renderVoxelSizeUm = voxelSizeUm;
+    _useRenderVoxelSize = enabled && std::isfinite(voxelSizeUm) && voxelSizeUm > 0.0;
 }
 
-void CommandLineToolRunner::setToObjParams(QString tifxyzPath, QString objPath)
+void CommandLineToolRunner::setRenderOutputFormat(RenderOutputFormat format)
 {
-    _tifxyzPath = tifxyzPath;
-    _objPath = objPath;
+    _renderOutputFormat = format;
+}
+
+void CommandLineToolRunner::setTraceParams(QString volumePath, QString volumeUuid, QString sourceTag, QString outputTag,
+                                           QString jsonParams, QString srcSurface)
+{
+    setVolumePath(volumePath);
+    _volumeUuid = volumeUuid;
+    _sourceTag = sourceTag;
+    _outputTag = outputTag;
+    _jsonParams = jsonParams;
+    _sourceSurfaceUuid = srcSurface;
+}
+
+void CommandLineToolRunner::setToObjParams(QString surfaceUuid, QString objName, QString volumeUuid)
+{
+    _surfaceUuid = surfaceUuid;
+    _volumeUuid = volumeUuid;
+    _objPath = objName;
 }
 
 void CommandLineToolRunner::setIncludeTifs(bool include)
@@ -160,16 +111,9 @@ void CommandLineToolRunner::setIncludeTifs(bool include)
     _includeTifs = include;
 }
 
-void CommandLineToolRunner::setOmpThreads(int threads)
+void CommandLineToolRunner::setNextOmpThreads(int threads)
 {
-    _ompThreads = threads;
-}
-
-void CommandLineToolRunner::setFlattenOptions(bool flatten, int iterations, int downsample)
-{
-    _flatten = flatten;
-    _flattenIters = iterations;
-    _flattenDownsample = downsample;
+    _nextOmpThreads = threads;
 }
 
 void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
@@ -178,14 +122,17 @@ void CommandLineToolRunner::setToObjOptions(bool normalizeUV, bool alignGrid)
     _optAlignGrid = alignGrid;
 }
 
+void CommandLineToolRunner::setRenderVolume(const QString& volumeUuid, double voxelScale)
+{
+    _renderVolumeUuid = volumeUuid;
+    _renderVoxelScale = voxelScale;
+}
+
 void CommandLineToolRunner::setRenderAdvanced(
     int cropX,
     int cropY,
     int cropWidth,
     int cropHeight,
-    const QString& affinePath,
-    bool invertAffine,
-    float scaleSegmentation,
     double rotateDegrees,
     int flipAxis)
 {
@@ -193,95 +140,90 @@ void CommandLineToolRunner::setRenderAdvanced(
     _cropY = cropY;
     _cropWidth = cropWidth;
     _cropHeight = cropHeight;
-    _affinePath = affinePath;
-    _invertAffine = invertAffine;
-    _scaleSeg = scaleSegmentation;
     _rotateDeg = rotateDegrees;
     _flipAxis = flipAxis;
 }
 
-bool CommandLineToolRunner::execute(Tool tool)
+bool CommandLineToolRunner::execute(Tool tool, ExecutionOptions options)
 {
+    const int ompThreads = std::exchange(_nextOmpThreads, -1);
     const bool isCustom = (tool == Tool::CustomCommand);
-    if (_process && _process->state() != QProcess::NotRunning) {
-        QMessageBox::warning(nullptr, tr("Warning"), tr("A tool is already running."));
+    const auto warn = [&](const QString& title, const QString& message) {
+        if (options.presentation == Presentation::Interactive) {
+            QMessageBox::warning(nullptr, title, message);
+        }
+    };
+    if (isRunning()) {
+        warn(tr("Warning"), tr("A tool is already running."));
         return false;
     }
 
-    if (_preserveConsoleOutput) {
-        _consoleOutput->appendOutput(tr("\n========== Next Pass ==========\n\n"));
-        _preserveConsoleOutput = false;
-    } else {
-        _consoleOutput->clear();
-    }
+    _consoleOutput->clear();
 
     if (isCustom && _customCommand.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Custom command not specified."));
+        warn(tr("Error"), tr("Custom command not specified."));
         return false;
     }
 
-    QString toolCmd = isCustom ? _customCommand : toolName(tool);
-    QFileInfo toolInfo(toolCmd);
-    if (!toolInfo.exists() || !toolInfo.isExecutable()) {
-        QString errorMsg = tr("Tool executable not found or not executable: %1").arg(toolCmd);
-        _consoleOutput->appendOutput(errorMsg);
-        showConsoleOutput();
-        QMessageBox::warning(nullptr, tr("Error"), errorMsg);
-        return false;
-    }
+    const QString toolCmd = isCustom ? _customCommand : toolName(tool);
 
-    // vc_merge_tifxyz and vc_merge_patch are path-only tools (segment dirs);
-    // no volume required.
-    const bool needsVolume = !isCustom
-                             && tool != Tool::MergeTifxyz
-                             && tool != Tool::MergePatch;
-    if (needsVolume) {
+    if (!isCustom) {
         if (_explicitVolumePath) {
             if (_volumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified."));
+                warn(tr("Error"), tr("Volume path not specified."));
                 return false;
             }
         } else {
             QString resolvedVolumePath = _volumePath;
-            if (_mainWindow) {
-                resolvedVolumePath = _mainWindow->getCurrentVolumePath();
+            if (_currentVolumePath) {
+                resolvedVolumePath = _currentVolumePath();
                 if (resolvedVolumePath.isEmpty()) {
-                    QMessageBox::warning(nullptr, tr("Error"), tr("No volume selected."));
+                    warn(tr("Error"), tr("No volume selected."));
                     return false;
                 }
             } else if (resolvedVolumePath.isEmpty()) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Volume path not specified and no main window available."));
+                warn(tr("Error"), tr("Volume path not specified and no main window available."));
                 return false;
             }
             _volumePath = resolvedVolumePath;
         }
     }
 
-    if (tool == Tool::MergeTifxyz && _mergeJsonPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("merge.json path not specified."));
+    if (tool == Tool::GrowSegFromSegment || tool == Tool::AlphaCompRefine) {
+        if (vcr::zarr::isRemote(_volumePath.trimmed().toStdString())) {
+            warn(
+                tr("Unsupported Remote Volume"),
+                tr("This command accepts only a local volume path. "
+                   "Remote locators are rejected without stripping selectors."));
+            return false;
+        }
+    }
+
+    if (!isCustom && _storePath.isEmpty()) {
+        warn(tr("Error"), tr("No object store attached."));
         return false;
     }
 
-    if (tool == Tool::RenderTifXYZ && _segmentPath.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Segment path not specified."));
+    if ((tool == Tool::RenderTifXYZ || tool == Tool::tifxyz2obj) && _surfaceUuid.isEmpty()) {
+        warn(tr("Error"), tr("Surface not specified."));
         return false;
     }
 
-    if (tool == Tool::GrowSegFromSegment && _srcSegment.isEmpty()) {
-        QMessageBox::warning(nullptr, tr("Error"), tr("Source segment not specified."));
+    if (tool == Tool::GrowSegFromSegment && _sourceSurfaceUuid.isEmpty()) {
+        warn(tr("Error"), tr("Source segment not specified."));
         return false;
     }
 
     if (tool == Tool::NeighborCopy) {
-        if (_jsonParams.isEmpty() || _resumeSurfacePath.isEmpty() || _tgtDir.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Neighbor copy parameters incomplete."));
+        if (_jsonParams.isEmpty() || _resumeSurfaceUuid.isEmpty()) {
+            warn(tr("Error"), tr("Neighbor copy parameters incomplete."));
             return false;
         }
     }
 
     if (tool == Tool::RenderTifXYZ) {
         if (_outputPattern.isEmpty()) {
-            QMessageBox::warning(nullptr, tr("Error"), tr("Output pattern not specified."));
+            warn(tr("Error"), tr("Output pattern not specified."));
             return false;
         }
 
@@ -289,142 +231,101 @@ bool CommandLineToolRunner::execute(Tool tool)
         QDir outputDir = outputInfo.dir();
         if (!outputDir.exists()) {
             if (!outputDir.mkpath(".")) {
-                QMessageBox::warning(nullptr, tr("Error"), tr("Failed to create output directory: %1").arg(outputDir.path()));
+                warn(tr("Error"),
+                     tr("Failed to create output directory: %1").arg(outputDir.path()));
                 return false;
             }
         }
     }
 
+    auto launch = launchFor(tool);
+    launch.tool = toolCmd;
+    launch.ompThreads = ompThreads;
+    const QString toolLabel = isCustom && !_customLabel.isEmpty() ? _customLabel : QFileInfo(toolCmd).baseName();
+    launch.logPath = QStringLiteral("%1/%2_%3.txt")
+        .arg(QDir::tempPath(), QFileInfo(toolCmd).baseName(),
+             QDateTime::currentDateTime().toString(QStringLiteral("yyyyMMdd_HHmmss")));
+
+    delete _run;
+    _run = new vc3d::ToolProcess(this);
+    connect(_run, &vc3d::ToolProcess::started, this, [this, toolLabel] {
+        if (_progressUtil) _progressUtil->startAnimation(tr("Running %1...").arg(toolLabel));
+    });
+    connect(_run, &vc3d::ToolProcess::output, this, [this](const QString& chunk) {
+        _consoleOutput->appendOutput(chunk);
+        emit consoleOutputReceived(chunk);
+    });
+    connect(_run, &vc3d::ToolProcess::line, this, [this](const QString& line) {
+        if (line.trimmed().startsWith(QStringLiteral("obj:"))) _exportedObj = line.trimmed().mid(4).trimmed();
+    });
+    connect(_run, &vc3d::ToolProcess::finished, this, [this, toolLabel](const vc3d::ToolProcess::Result& result) {
+        _createdSurfaces = result.surfaces;
+        if (result.ok) {
+            const QString message = tr("%1 completed successfully").arg(toolLabel);
+            const QString outputPath = getOutputPath();
+            // A render's output directory goes to the clipboard to open it quickly.
+            const bool copyToClipboard = _currentTool == Tool::RenderTifXYZ;
+            if (copyToClipboard) QApplication::clipboard()->setText(outputPath);
+            if (_progressUtil)
+                _progressUtil->stopAnimation(copyToClipboard ? message + tr(" - Path copied to clipboard") : message);
+            finishExecution(true, message, outputPath, copyToClipboard);
+            return;
+        }
+        const QString message = result.cancelled ? tr("%1 cancelled").arg(toolLabel) : result.error;
+        _consoleOutput->appendOutput(message);
+        if (_executionOptions.showConsole) showConsoleOutput();
+        if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
+        finishExecution(false, message);
+    });
+
     _currentTool = tool;
-
-    QString timestamp = QDateTime::currentDateTime().toString("yyyyMMdd_HHmmss");
-    QString toolBaseName = QFileInfo(toolCmd).baseName();
-    QString logFilePath = QString("/tmp/%1_%2.txt").arg(toolBaseName).arg(timestamp);
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
+    _createdSurfaces.clear();
+    _exportedObj.clear();
+    _executionOptions = options;
+    _terminalReported = false;
+    if (!_run->start(launch)) {
+        _consoleOutput->appendOutput(_run->error());
+        if (options.showConsole) showConsoleOutput();
+        warn(tr("Error"), _run->error());
+        _terminalReported = true;
+        _executionOptions = {};
+        return false;
     }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
-    _logFile = new QFile(logFilePath);
-    if (_logFile->open(QIODevice::WriteOnly | QIODevice::Text)) {
-        _logStream = new QTextStream(_logFile);
-        _logStream->setAutoDetectUnicode(true);
-
-        *_logStream << "Tool: " << toolCmd << Qt::endl;
-        *_logStream << "Started: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        QStringList argsForLog = isCustom ? _customArgs : buildArguments(tool);
-        *_logStream << "Arguments: " << argsForLog.join(" ") << Qt::endl;
-        *_logStream << "===================================" << Qt::endl << Qt::endl;
-        _logStream->flush();
-
-        _consoleOutput->appendOutput(tr("Logging output to: %1\n").arg(logFilePath));
-    } else {
-        _consoleOutput->appendOutput(tr("Warning: Failed to create log file: %1\n").arg(logFilePath));
-    }
-
-    if (!_process) {
-        _process = new QProcess(this);
-        _process->setProcessChannelMode(QProcess::MergedChannels);
-
-        connect(_process, &QProcess::started, this, &CommandLineToolRunner::onProcessStarted);
-        connect(_process, QOverload<int, QProcess::ExitStatus>::of(&QProcess::finished),
-                this, &CommandLineToolRunner::onProcessFinished);
-        connect(_process, &QProcess::errorOccurred, this, &CommandLineToolRunner::onProcessError);
-        connect(_process, &QProcess::readyRead, this, &CommandLineToolRunner::onProcessReadyRead);
-    }
-
-    // Apply per-run environment variables (e.g., OMP_NUM_THREADS)
-    {
-        QProcessEnvironment env = QProcessEnvironment::systemEnvironment();
-        if (_ompThreads > 0) {
-            env.insert("OMP_NUM_THREADS", QString::number(_ompThreads));
-            if (_logStream) {
-                *_logStream << "ENV: OMP_NUM_THREADS=" << _ompThreads << Qt::endl;
-                _logStream->flush();
-            }
-        }
-        if (!_remoteVolumeUrl.isEmpty() && !_remoteAccessKey.isEmpty() && !_remoteSecretKey.isEmpty()) {
-            env.insert("AWS_ACCESS_KEY_ID", _remoteAccessKey);
-            env.insert("AWS_SECRET_ACCESS_KEY", _remoteSecretKey);
-            if (!_remoteSessionToken.isEmpty()) {
-                env.insert("AWS_SESSION_TOKEN", _remoteSessionToken);
-            }
-            if (!_remoteRegion.isEmpty()) {
-                env.insert("AWS_DEFAULT_REGION", _remoteRegion);
-            }
-            if (_logStream) {
-                *_logStream << "ENV: AWS_ACCESS_KEY_ID=<set>" << Qt::endl;
-                *_logStream << "ENV: AWS_SECRET_ACCESS_KEY=<set>" << Qt::endl;
-                if (!_remoteSessionToken.isEmpty()) {
-                    *_logStream << "ENV: AWS_SESSION_TOKEN=<set>" << Qt::endl;
-                }
-                if (!_remoteRegion.isEmpty()) {
-                    *_logStream << "ENV: AWS_DEFAULT_REGION=" << _remoteRegion << Qt::endl;
-                }
-                _logStream->flush();
-            }
-        }
-        _process->setProcessEnvironment(env);
-    }
-
-    QStringList args = isCustom ? _customArgs : buildArguments(tool);
-    QString toolCommand = toolCmd;
-    QString formattedCommand = formatCommand(toolCommand, args, _ompThreads);
-
-    QString startMessage;
-    const QString toolLabel = isCustom
-                              ? (_customLabel.isEmpty() ? QFileInfo(toolCommand).baseName()
-                                                       : _customLabel)
-                              : QFileInfo(toolCommand).baseName();
-
-    startMessage = isCustom ? tr("Starting %1").arg(toolLabel)
-                           : tr("Starting %1 for: %2")
-                                 .arg(toolLabel)
-                                 .arg(QFileInfo(_segmentPath).fileName());
-    emit toolStarted(_currentTool, startMessage);
-
+    emit toolStarted(_currentTool, isCustom ? tr("Starting %1").arg(toolLabel)
+                                            : tr("Starting %1 for: %2")
+                                                  .arg(toolLabel, _surfaceUuid.isEmpty() ? _sourceSurfaceUuid : _surfaceUuid));
     _consoleOutput->setTitle(tr("Running: %1").arg(toolLabel));
-    _consoleOutput->appendOutput(tr("Command: %1\n").arg(formattedCommand));
-    if (_logStream) {
-        *_logStream << "Command: " << formattedCommand << Qt::endl;
-        _logStream->flush();
-    }
-
-    if (_autoShowConsole) {
-        showConsoleOutput();
-    }
-
-    _process->start(toolCommand, args);
-
+    _consoleOutput->appendOutput(tr("Logging output to: %1\n").arg(launch.logPath));
+    _consoleOutput->appendOutput(tr("Command: %1\n").arg(_run->command()));
+    if (options.showConsole) showConsoleOutput();
     return true;
 }
 
 bool CommandLineToolRunner::executeCustomCommand(const QString& command,
                                                  const QStringList& args,
-                                                 const QString& label)
+                                                 const QString& label,
+                                                 ExecutionOptions options,
+                                                 const QString& store,
+                                                 const QString& volume,
+                                                 double voxelScale)
 {
     _customCommand = command;
     _customArgs = args;
     _customLabel = label;
-    return execute(Tool::CustomCommand);
+    _customStore = store;
+    _customVolume = volume;
+    _customVoxelScale = voxelScale;
+    return execute(Tool::CustomCommand, options);
 }
 
 void CommandLineToolRunner::cancel()
 {
-    if (_process && _process->state() != QProcess::NotRunning) {
-        _process->terminate();
-    }
+    if (_run) _run->cancel();
 }
 
 bool CommandLineToolRunner::isRunning() const
 {
-    return (_process && _process->state() != QProcess::NotRunning);
+    return _run && _run->running();
 }
 
 void CommandLineToolRunner::showConsoleOutput()
@@ -436,139 +337,43 @@ void CommandLineToolRunner::showConsoleOutput()
     }
 }
 
-void CommandLineToolRunner::hideConsoleOutput()
+void CommandLineToolRunner::finishExecution(bool success,
+                                            const QString& message,
+                                            const QString& outputPath,
+                                            bool copyToClipboard)
 {
-    if (_consoleDialog) {
-        _consoleDialog->hide();
+    if (_terminalReported) {
+        return;
     }
-}
-
-void CommandLineToolRunner::setAutoShowConsoleOutput(bool autoShow)
-{
-    _autoShowConsole = autoShow;
-}
-
-void CommandLineToolRunner::setPreserveConsoleOutput(bool preserve)
-{
-    _preserveConsoleOutput = preserve;
-}
-
-void CommandLineToolRunner::onProcessReadyRead()
-{
-    if (_process) {
-        QByteArray output = _process->readAll();
-        QString outputText = QString::fromUtf8(output);
-
-        _consoleOutput->appendOutput(outputText);
-
-        if (_logStream) {
-            *_logStream << outputText;
-            _logStream->flush();
-        }
-
-        emit consoleOutputReceived(outputText);
-    }
-}
-
-void CommandLineToolRunner::onProcessStarted()
-{
-    QString message = tr("Running %1...").arg(toolName(_currentTool));
-    if (_progressUtil) _progressUtil->startAnimation(message);
-}
-
-void CommandLineToolRunner::onProcessFinished(int exitCode, QProcess::ExitStatus exitStatus)
-{
-    if (_logStream) {
-        *_logStream << Qt::endl << "===================================" << Qt::endl;
-        *_logStream << "Process finished at: " << QDateTime::currentDateTime().toString(Qt::ISODate) << Qt::endl;
-        *_logStream << "Exit code: " << exitCode << Qt::endl;
-        *_logStream << "Exit status: " << (exitStatus == QProcess::NormalExit ? "Normal" : "Crashed") << Qt::endl;
-        _logStream->flush();
-    }
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
+    _terminalReported = true;
     _explicitVolumePath = false;
 
-    if (exitCode == 0 && exitStatus == QProcess::NormalExit) {
-        QString message = tr("%1 completed successfully").arg(toolName(_currentTool));
-        QString outputPath = getOutputPath();
-
-        // the runner can copy the output of a process to the clipboard, currently this only makes sense for rendering
-        // so the user can quickly open the output dir
-        bool copyToClipboard = (_currentTool == Tool::RenderTifXYZ);
-
-        if (copyToClipboard) {
-            QApplication::clipboard()->setText(outputPath);
-            if (_progressUtil) _progressUtil->stopAnimation(message + tr(" - Path copied to clipboard"));
-        } else {
-            if (_progressUtil) _progressUtil->stopAnimation(message);
-        }
-
-        emit toolFinished(_currentTool, true, message, outputPath, copyToClipboard);
-    } else {
-        QString errorMessage = tr("%1 failed with exit code: %2")
-                                .arg(toolName(_currentTool))
-                                .arg(exitCode);
-
-        if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
-
-        emit toolFinished(_currentTool, false, errorMessage, QString(), false);
-    }
+    // Move the completed run out of the active slot before notifying observers.
+    // A toolFinished handler may synchronously start another process.
+    _completionOptions = _executionOptions;
+    _executionOptions = {};
+    _deliveringCompletion = true;
+    emit toolFinished(
+        _currentTool, success, message, outputPath, copyToClipboard);
+    _deliveringCompletion = false;
 }
 
-void CommandLineToolRunner::onProcessError(QProcess::ProcessError error)
+vc3d::ToolProcess::Launch CommandLineToolRunner::launchFor(Tool tool)
 {
-    QString errorMessage = tr("Error running %1: ").arg(toolName(_currentTool));
-
-    switch (error) {
-        case QProcess::FailedToStart:
-            errorMessage += tr("failed to start - Tool executable not found or not executable. Command: %1").arg(toolName(_currentTool));
-            break;
-        case QProcess::Crashed: errorMessage += tr("crashed"); break;
-        case QProcess::Timedout: errorMessage += tr("timed out"); break;
-        case QProcess::WriteError: errorMessage += tr("write error"); break;
-        case QProcess::ReadError: errorMessage += tr("read error"); break;
-        default: errorMessage += tr("unknown error"); break;
+    vc3d::ToolProcess::Launch launch;
+    if (tool == Tool::CustomCommand) {
+        launch.args = _customArgs;
+        launch.store = _customStore;
+        launch.volume = _customVolume;
+        launch.voxelScale = _customVoxelScale;
+        return launch;
     }
-
-    QStringList args = buildArguments(_currentTool);
-    errorMessage += tr("\nArguments: %1").arg(args.join(" "));
-
-    if (_logStream) {
-        *_logStream << Qt::endl << "ERROR: " << errorMessage << Qt::endl;
-        _logStream->flush();
-    }
-
-    if (_logStream) {
-        delete _logStream;
-        _logStream = nullptr;
-    }
-    if (_logFile) {
-        _logFile->close();
-        delete _logFile;
-        _logFile = nullptr;
-    }
-
-    if (_progressUtil) _progressUtil->stopAnimation(tr("Process failed"));
-
-    _explicitVolumePath = false;
-
-    emit toolFinished(_currentTool, false, errorMessage, QString(), false);
-
-    if (_consoleOutput) {
-        _consoleOutput->appendOutput(errorMessage);
-    }
-
-    showConsoleOutput();
+    launch.args = buildArguments(tool);
+    launch.store = _storePath;
+    launch.volume = tool == Tool::RenderTifXYZ ? _renderVolumeUuid
+                                               : _volumeUuid;
+    launch.voxelScale = tool == Tool::RenderTifXYZ ? _renderVoxelScale : _voxelScale;
+    return launch;
 }
 
 QStringList CommandLineToolRunner::buildArguments(Tool tool)
@@ -578,13 +383,17 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
     switch (tool) {
         case Tool::RenderTifXYZ:
             args << "--volume" << _volumePath
-                 << "--tif-output" << _outputPattern
-                 << "--segmentation" << _segmentPath
+                 << (_renderOutputFormat == RenderOutputFormat::Zarr
+                         ? QStringLiteral("--zarr-output")
+                         : QStringLiteral("--tif-output"))
+                 << _outputPattern
+                 << "--surface" << _surfaceUuid
                  << "--scale" << QString::number(_scale)
                  << "--group-idx" << QString::number(_resolution)
                  << "--num-slices" << QString::number(_layers);
-            if (!_remoteVolumeUrl.isEmpty()) {
-                args << "--remote-url" << _remoteVolumeUrl;
+            if (_useRenderVoxelSize) {
+                args << "--voxel-size" << QString::number(_renderVoxelSizeUm, 'g', 17)
+                     << "--voxel-unit" << "micrometer";
             }
             // Advanced / optional args
             if (_cropWidth > 0 && _cropHeight > 0) {
@@ -593,107 +402,53 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
                      << "--crop-width" << QString::number(_cropWidth)
                      << "--crop-height" << QString::number(_cropHeight);
             }
-            if (!_affinePath.isEmpty()) {
-                args << "--affine-transform" << _affinePath;
-                if (_invertAffine) args << "--invert-affine";
-            }
-            if (std::abs(_scaleSeg - 1.0f) > 1e-6f) {
-                args << "--scale-segmentation" << QString::number(_scaleSeg);
-            }
             if (std::abs(_rotateDeg) > 1e-6) {
                 args << "--rotate" << QString::number(_rotateDeg);
             }
             if (_flipAxis >= 0) {
                 args << "--flip" << QString::number(_flipAxis);
             }
-            if (_includeTifs) {
-                args << "--include-tifs";
-            }
-            if (_flatten) {
-                args << "--flatten";
-                args << "--flatten-iterations" << QString::number(_flattenIters);
-                args << "--flatten-downsample" << QString::number(_flattenDownsample);
+            // "Also write TIFF slices" only adds anything when the primary
+            // output is the zarr -- a TifStack render already writes them.
+            // vc_render_tifxyz accepts --zarr-output and --tif-output together,
+            // so ask for the slices in a sibling directory of the .zarr rather
+            // than through a flag of its own.
+            if (_includeTifs && _renderOutputFormat == RenderOutputFormat::Zarr) {
+                const QFileInfo zarrInfo(_outputPattern);
+                args << "--tif-output"
+                     << zarrInfo.dir().filePath(zarrInfo.completeBaseName()
+                                                + QStringLiteral("_layers"));
             }
             break;
 
         case Tool::GrowSegFromSegment:
-            args << _volumePath
-                 << _srcDir
-                 << _tgtDir
-                 << _jsonParams
-                 << _srcSegment;
+            args << "--volume" << _volumePath
+                 << "--params" << _jsonParams
+                 << "--surface" << _sourceSurfaceUuid
+                 << "--source-tag" << _sourceTag
+                 << "--tag" << _outputTag;
             break;
 
-
         case Tool::tifxyz2obj:
-            args << _tifxyzPath
-                 << _objPath;
+            args << "--surface" << _surfaceUuid
+                 << "--name" << _objPath;
             if (_optNormalizeUV) args << "--normalize-uv";
             if (_optAlignGrid)   args << "--align-grid";
             break;
-        case Tool::obj2tifxyz:
-            args << _objPath
-                 << _objOutputDir
-                 << QString::number(_objStretchFactor)
-                 << QString::number(_objMeshUnits)
-                 << QString::number(_objStepSize);
-            break;
         case Tool::AlphaCompRefine:
-            args << _volumePath
-                 << _segmentPath
-                 << _refineDst
-                 << _jsonParams;
+            // Without a new name the surface is refined in place.
+            args << "--surface" << _surfaceUuid;
+            if (!_refineName.isEmpty()) args << "--name" << _refineName;
+            args << _volumePath << _jsonParams;
             break;
         case Tool::NeighborCopy:
             args << "-v" << _volumePath
                  << "-p" << _jsonParams
-                 << "--resume" << _resumeSurfacePath
-                 << "-t" << _tgtDir;
+                 << "--surface" << _resumeSurfaceUuid
+                 << "--tag" << _outputTag;
             if (!_resumeOpt.isEmpty()) {
                 args << "--resume-opt" << _resumeOpt;
             }
-            break;
-        case Tool::MergeTifxyz:
-            args << "--merge" << _mergeJsonPath;
-            // The tool defaults paths-dir to <merge.parent>/paths; pass
-            // the resolved segments dir (e.g. paths_2um_ds2/) explicitly
-            // so this works regardless of the volpkg's directory layout.
-            if (!_mergePathsDir.isEmpty()) {
-                args << "--paths-dir" << _mergePathsDir;
-            }
-            // Empty refSurface -> let vc_merge_tifxyz auto-pick the
-            // surface with the largest valid-cell count. Otherwise pass
-            // the user's pick straight through.
-            if (!_mergeRefSurface.isEmpty()) {
-                args << "--ref" << _mergeRefSurface;
-            }
-            args << "--ransac-iters"      << QString::number(_mergeRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_mergeRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_mergeRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_mergeRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_mergeRansacSeed)
-                 << "--anchor-cap"        << QString::number(_mergeAnchorCap)
-                 << "--strip-cols"        << QString::number(_mergeStripCols);
-            break;
-        case Tool::MergePatch:
-            // Either positional (auto-detect roles by valid-cell count) or
-            // explicit --parent / --child when the user swapped via the
-            // dialog. The binary requires exactly one of these forms.
-            if (_patchExplicitRoles) {
-                args << "--parent" << _patchParentPath
-                     << "--child"  << _patchChildPath;
-            } else {
-                args << _patchParentPath << _patchChildPath;
-            }
-            args << "--border-cells"      << QString::number(_patchBorderCells)
-                 << "--blend-cells"       << QString::number(_patchBlendCells)
-                 << "--idw-k"             << QString::number(_patchIdwK)
-                 << "--ransac-iters"      << QString::number(_patchRansacIters)
-                 << "--ransac-min-thresh" << QString::number(_patchRansacMinThresh, 'g', 10)
-                 << "--ransac-max-thresh" << QString::number(_patchRansacMaxThresh, 'g', 10)
-                 << "--ransac-mad-k"      << QString::number(_patchRansacMadK,      'g', 10)
-                 << "--ransac-seed"       << QString::number(_patchRansacSeed)
-                 << "--anchor-cap"        << QString::number(_patchAnchorCap);
             break;
         case Tool::CustomCommand:
             args = _customArgs;
@@ -705,31 +460,26 @@ QStringList CommandLineToolRunner::buildArguments(Tool tool)
 
 QString CommandLineToolRunner::toolName(Tool tool) const
 {
-    QString basePath = QCoreApplication::applicationDirPath() + "/";
+    // The resolved executable, or its bare name (the launch then reports it missing).
+    const auto resolved = [](const QString& name) {
+        const QString path = vc3d::findToolExecutable(name);
+        return path.isEmpty() ? name : path;
+    };
     switch (tool) {
         case Tool::RenderTifXYZ:
-            return basePath + "vc_render_tifxyz";
+            return resolved(QStringLiteral("vc_render_tifxyz"));
 
         case Tool::GrowSegFromSegment:
-            return basePath + "vc_grow_seg_from_segments";
+            return resolved(QStringLiteral("vc_grow_seg_from_segments"));
 
         case Tool::tifxyz2obj:
-            return basePath + "vc_tifxyz2obj";
-
-        case Tool::obj2tifxyz:
-            return basePath + "vc_obj2tifxyz_legacy";
+            return resolved(QStringLiteral("vc_tifxyz2obj"));
 
         case Tool::AlphaCompRefine:
-            return basePath + "vc_objrefine";
+            return resolved(QStringLiteral("vc_objrefine"));
 
         case Tool::NeighborCopy:
-            return basePath + "vc_grow_seg_from_seed";
-
-        case Tool::MergeTifxyz:
-            return basePath + "vc_merge_tifxyz";
-
-        case Tool::MergePatch:
-            return basePath + "vc_merge_patch";
+            return resolved(QStringLiteral("vc_grow_seg_from_seed"));
 
         case Tool::CustomCommand:
             return _customCommand.isEmpty() ? "custom_command" : _customCommand;
@@ -741,110 +491,59 @@ QString CommandLineToolRunner::toolName(Tool tool) const
 
 QString CommandLineToolRunner::getOutputPath() const
 {
-    if (_currentTool == Tool::AlphaCompRefine) {
-        return _refineDst;
+    switch (_currentTool) {
+        case Tool::RenderTifXYZ: return QFileInfo(_outputPattern).dir().path();
+        case Tool::tifxyz2obj: return exportedObjCopy();
+        // An in-place refinement creates nothing: the source changed.
+        case Tool::AlphaCompRefine: return _createdSurfaces.isEmpty() ? _surfaceUuid : _createdSurfaces.join('\n');
+        case Tool::CustomCommand: return QString();
+        default: return _createdSurfaces.join('\n');
     }
-    if (_currentTool == Tool::NeighborCopy) {
-        return _tgtDir;
-    }
-    if (_currentTool == Tool::MergeTifxyz) {
-        // The tool auto-names the output dir under <volpkg>/paths/; we
-        // surface the merge.json instead so the user can find the run.
-        return _mergeJsonPath;
-    }
-    if (_currentTool == Tool::MergePatch) {
-        // The binary overwrites the parent in place; surface that path so
-        // the post-run notification can point users at what changed.
-        return _patchParentPath;
-    }
-    if (_currentTool == Tool::CustomCommand) {
-        return QString();
-    }
-
-    QFileInfo outputInfo(_outputPattern);
-    return outputInfo.dir().path();
 }
 
-void CommandLineToolRunner::setMergeParams(const QString& mergeJsonPath,
-                                           const QString& pathsDir,
-                                           const QString& refSurface,
-                                           int ransacIters,
-                                           double ransacMinThresh,
-                                           double ransacMaxThresh,
-                                           double ransacMadK,
-                                           int ransacSeed,
-                                           int anchorCap,
-                                           int stripCols)
+QString CommandLineToolRunner::exportedObjCopy() const
 {
-    _mergeJsonPath        = mergeJsonPath;
-    _mergePathsDir        = pathsDir;
-    _mergeRefSurface      = refSurface;
-    _mergeRansacIters     = ransacIters;
-    _mergeRansacMinThresh = ransacMinThresh;
-    _mergeRansacMaxThresh = ransacMaxThresh;
-    _mergeRansacMadK      = ransacMadK;
-    _mergeRansacSeed      = ransacSeed;
-    _mergeAnchorCap       = anchorCap;
-    _mergeStripCols       = stripCols;
-}
-
-void CommandLineToolRunner::setMergePatchParams(const QString& parentPath,
-                                                const QString& childPath,
-                                                bool explicitRoles,
-                                                int borderCells,
-                                                int blendCells,
-                                                int idwK,
-                                                int ransacIters,
-                                                double ransacMinThresh,
-                                                double ransacMaxThresh,
-                                                double ransacMadK,
-                                                int ransacSeed,
-                                                int anchorCap)
-{
-    _patchParentPath      = parentPath;
-    _patchChildPath       = childPath;
-    _patchExplicitRoles   = explicitRoles;
-    _patchBorderCells     = borderCells;
-    _patchBlendCells      = blendCells;
-    _patchIdwK            = idwK;
-    _patchRansacIters     = ransacIters;
-    _patchRansacMinThresh = ransacMinThresh;
-    _patchRansacMaxThresh = ransacMaxThresh;
-    _patchRansacMadK      = ransacMadK;
-    _patchRansacSeed      = ransacSeed;
-    _patchAnchorCap       = anchorCap;
-}
-
-void CommandLineToolRunner::setObj2TifxyzParams(const QString& objPath, const QString& outputDir,
-                                                float stretchFactor, float meshUnits, int stepSize)
-{
-    _objPath = objPath;
-    _objOutputDir = outputDir;
-    _objStretchFactor = stretchFactor;
-    _objMeshUnits = meshUnits;
-    _objStepSize = stepSize;
+    // The tool published the OBJ as an artifact of the surface; a copy goes
+    // to the surface's export directory for the user (and agents).
+    if (_exportedObj.isEmpty() || _storePath.isEmpty() || _surfaceUuid.isEmpty()) return {};
+    try {
+        vc::objects::ObjectStoreSession session;
+        vc::objects::OpenOptions options;
+        options.readOnly = true;
+        const auto store = session.attach(_storePath.toStdString(), options);
+        const auto directory = std::filesystem::path(vc3d::surfaceExportDirectory(_surfaceUuid).toStdString());
+        for (const auto& file : session.materializeArtifacts(store, _surfaceUuid.toStdString(), directory))
+            if (file.name == _exportedObj.toStdString()) return QString::fromStdString((directory / file.name).string());
+    } catch (const std::exception& error) {
+        _consoleOutput->appendOutput(tr("Cannot copy the exported OBJ: %1\n").arg(QString::fromUtf8(error.what())));
+    }
+    return {};
 }
 
 void CommandLineToolRunner::setObjRefineParams(const QString& volumePath,
                                                const QString& srcSurface,
-                                               const QString& dstSurface,
-                                               const QString& jsonParams)
+                                               const QString& newName,
+                                               const QString& jsonParams,
+                                               const QString& volumeUuid)
 {
     setVolumePath(volumePath);
-    _segmentPath = srcSurface;
-    _refineDst = dstSurface;
+    _volumeUuid = volumeUuid;
+    _surfaceUuid = srcSurface;
+    _refineName = newName;
     _jsonParams = jsonParams;
 }
 
 void CommandLineToolRunner::setNeighborCopyParams(const QString& volumePath,
                                                   const QString& paramsJson,
                                                   const QString& resumeSurface,
-                                                  const QString& outputDir,
+                                                  const QString& volumeUuid,
+                                                  const QString& outputTag,
                                                   const QString& resumeOpt)
 {
     setVolumePath(volumePath);
     _jsonParams = paramsJson;
-    _resumeSurfacePath = resumeSurface;
-    _tgtDir = outputDir;
+    _resumeSurfaceUuid = resumeSurface;
+    _volumeUuid = volumeUuid;
+    _outputTag = outputTag;
     _resumeOpt = resumeOpt;
 }

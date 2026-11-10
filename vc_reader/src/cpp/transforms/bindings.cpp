@@ -1,0 +1,446 @@
+#include "replay.hpp"
+#include <nanobind/nanobind.h>
+#include <nanobind/ndarray.h>
+#include <nanobind/stl/map.h>
+#include <nanobind/stl/pair.h>
+#include <nanobind/stl/shared_ptr.h>
+#include <nanobind/stl/string.h>
+#include <nanobind/stl/variant.h>
+#include <nanobind/stl/vector.h>
+
+namespace nb = nanobind;
+using namespace nb::literals;
+using namespace vcr::transforms;
+using Input = nb::ndarray<nb::ro, nb::c_contig, nb::device::cpu>;
+#ifdef VC_READER_CUDA
+#include "device_bindings.hpp"
+#endif
+
+// Constructor parsing only. C++ execution never reads Python objects.
+struct Arguments {
+    nb::args positional;
+    nb::dict keywords;
+    std::size_t index = 0;
+    Arguments(nb::args args, nb::kwargs kwargs) : positional(args), keywords(nb::dict(kwargs)) {}
+    nb::object take(const char* name, nb::object fallback) {
+        if (index < positional.size()) {
+            require(!keywords.contains(name), std::string("duplicate argument: ") + name);
+            return nb::borrow<nb::object>(positional[index++]);
+        }
+        return keyword(name, fallback);
+    }
+    nb::object keyword(const char* name, nb::object fallback) {
+        if (!keywords.contains(name)) return fallback;
+        auto result = nb::borrow<nb::object>(keywords[name]); nb::del(keywords[name]); return result;
+    }
+    template<class T> T get(const char* name, T fallback) { return nb::cast<T>(take(name, nb::cast(fallback))); }
+    template<class T> T kw(const char* name, T fallback) { return nb::cast<T>(keyword(name, nb::cast(fallback))); }
+    void finish() {
+        require(index == positional.size(), "too many positional arguments");
+        if (keywords.size()) throw nb::type_error(("unexpected arguments: " + nb::cast<std::string>(nb::repr(keywords))).c_str());
+    }
+};
+static Scalar scalar(nb::handle value) {
+    if (nb::isinstance<Uniform>(value)) return nb::cast<Uniform>(value);
+    if (nb::isinstance<Normal>(value)) return nb::cast<Normal>(value);
+    if (nb::isinstance<Choice>(value)) return nb::cast<Choice>(value);
+    if (nb::isinstance<Named>(value)) return nb::cast<Named>(value);
+    if (nb::isinstance<nb::tuple>(value) || nb::isinstance<nb::list>(value)) {
+        auto values = nb::cast<std::vector<double>>(value); require(values.size() == 2, "range needs two bounds"); return Uniform{values[0], values[1]};
+    }
+    return nb::cast<double>(value);
+}
+static Scalar parameter(Arguments& a, const char* name, const Scalar& fallback) {
+    return scalar(a.take(name, std::visit([](const auto& v) { return nb::cast(v); }, fallback)));
+}
+static std::vector<std::string> names(nb::handle value) {
+    if (value.is_none()) return {};
+    if (nb::isinstance<nb::str>(value)) return {nb::cast<std::string>(value)};
+    return nb::cast<std::vector<std::string>>(value);
+}
+static ChannelOptions options(Arguments& a) {
+    ChannelOptions o; o.p = a.kw("p", o.p); o.p_channel = a.kw("p_channel", o.p_channel); o.shared = a.kw("shared", o.shared);
+    o.channels = a.kw("channels", std::vector<std::size_t>{}); o.on = names(a.keyword("on", nb::none()));
+    return o;
+}
+static LocalOptions local_options(Arguments& a) {
+    LocalOptions o; o.scale = parameter(a, "scale", o.scale); o.loc = scalar(a.keyword("loc", std::visit([](const auto& v) { return nb::cast(v); }, o.loc))); return o;
+}
+template<class T, class F> void bind(nb::module_& m, const char* name, F initialize, const char* doc = nullptr) {
+    nb::class_<T>(m, name, doc).def("__init__", [initialize](T* self, nb::args args, nb::kwargs kwargs) {
+        Arguments a(args, kwargs); T value; initialize(value, a);
+        if constexpr (requires { value.options; }) value.options = options(a);
+        else if constexpr (requires { value.p; }) value.p = a.kw("p", value.p);
+        a.finish(); validate_transform(value); new (self) T(std::move(value));
+    });
+}
+static Morph morph(nb::handle object) {
+    auto value = nb::cast<std::string>(object);
+    if (value == "dilate") return Morph::Dilate;
+    if (value == "erode") return Morph::Erode;
+    if (value == "open") return Morph::Open;
+    if (value == "close") return Morph::Close;
+    throw nb::value_error("morphology operation must be dilate, erode, open or close");
+}
+static nb::object export_array(Array array, const std::map<std::string, Input>& inputs, bool inplace) {
+    // A safe call returns independent outputs even when no transform wrote a
+    // borrowed input. Explicit inplace calls can return views of reader buffers.
+    if (array.borrowed && !inplace) array.data();
+    nb::object input_owner = array.borrowed ? nb::cast(inputs.at(array.owner)) : nb::none();
+    auto owner = std::make_unique<Array>(std::move(array)); auto* ptr = owner.get();
+    nb::capsule capsule(owner.release(), [](void* p) noexcept { delete static_cast<Array*>(p); });
+    nb::dlpack::dtype dtype;
+    dtype.code = std::uint8_t(ptr->kind == 'f' ? nb::dlpack::dtype_code::Float : ptr->kind == 'i' ? nb::dlpack::dtype_code::Int : ptr->kind == 'b' ? nb::dlpack::dtype_code::Bool : nb::dlpack::dtype_code::UInt);
+    dtype.bits = std::uint8_t(ptr->bytes * 8); dtype.lanes = 1;
+    return nb::cast(nb::ndarray<nb::numpy>(const_cast<void*>(std::as_const(*ptr).data()), ptr->shape.size(), ptr->shape.data(), ptr->borrowed ? input_owner : nb::borrow<nb::object>(capsule), nullptr, dtype));
+}
+// An array that owns its storage: borrowed views (here, of batch slots) are copied.
+static Array own(Array array) {
+    if (array.borrowed) { Array copy(array); return copy; }
+    return array;
+}
+static void writable_inputs(const std::map<std::string, Input>& inputs) {
+    for (auto it = inputs.begin(); it != inputs.end(); ++it) {
+        nb::ndarray<nb::c_contig, nb::device::cpu> writable;
+        require(nb::try_cast(nb::cast(it->second), writable, false), "inplace transform requires writable contiguous arrays");
+        auto begin = reinterpret_cast<std::uintptr_t>(it->second.data());
+        require(begin % std::max<std::size_t>(1, it->second.dtype().bits / 8) == 0, "inplace transform requires aligned arrays");
+        auto end = begin + it->second.nbytes();
+        for (auto other = inputs.begin(); other != it; ++other) {
+            auto other_begin = reinterpret_cast<std::uintptr_t>(other->second.data());
+            auto other_end = other_begin + other->second.nbytes();
+            require(begin == end || other_begin == other_end || end <= other_begin || other_end <= begin,
+                    "inplace transform requires nonoverlapping target arrays");
+        }
+    }
+}
+static Sample import_sample(const Pipeline& pipeline, const std::map<std::string, Input>& inputs, bool inplace = false) {
+    Sample result;
+    for (const auto& [name, input] : inputs) {
+        require(pipeline.targets().count(name), "undeclared array field: " + name);
+        Shape shape; for (std::size_t a = 0; a < input.ndim(); ++a) shape.push_back(input.shape(a));
+        auto type = input.dtype(); char kind = 0;
+        if (type.code == std::uint8_t(nb::dlpack::dtype_code::Float)) kind = 'f';
+        if (type.code == std::uint8_t(nb::dlpack::dtype_code::Int)) kind = 'i';
+        if (type.code == std::uint8_t(nb::dlpack::dtype_code::UInt)) kind = 'u';
+        if (type.code == std::uint8_t(nb::dlpack::dtype_code::Bool)) kind = 'b';
+        require(type.lanes == 1 && type.bits % 8 == 0, "unsupported input dtype");
+        Array array(shape, kind, type.bits / 8, input.data(), name, inplace);
+        if (reinterpret_cast<std::uintptr_t>(input.data()) % array.bytes) array.data();
+        result.emplace(name, Field{std::move(array), pipeline.targets().at(name), name});
+    }
+    return result;
+}
+static nb::tuple export_result(RunResult result, bool plan, const std::map<std::string, Input>& inputs, bool inplace = false) {
+    nb::dict arrays, sources;
+    for (auto& [name, f] : result.sample) {
+        if (f.pyramid.empty()) arrays[nb::str(name.c_str())] = export_array(std::move(f.array), inputs, inplace);
+        else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(std::move(level), inputs, inplace)); arrays[nb::str(name.c_str())] = levels; }
+        sources[nb::str(name.c_str())] = nb::str(f.source.c_str());
+    }
+    return nb::make_tuple(arrays, sources, plan ? nb::cast(std::move(result.plan)) : nb::none());
+}
+
+// CPU batch in one native loop, no per-sample Python. Sample b borrows slice b of each input,
+// with its slot of a (B, ...) output buffer as the copy-on-write destination (Array::spare):
+// transforms writing in place, or into Array::fresh(), leave results in their slots, with no
+// separate copy into the stacked output. Outputs that agree in shape and dtype across samples
+// are stacked (from their slots when possible); others are per-sample lists.
+static nb::tuple run_host_batch(const Pipeline& pipeline, const std::map<std::string, Input>& inputs,
+                                const std::vector<std::uint64_t>& seeds, const std::map<std::string, std::vector<double>>& params) {
+    require(!inputs.empty(), "batch has no declared array targets");
+    const auto count = seeds.size();
+    for (const auto& [name, input] : inputs)
+        require(input.ndim() >= 1 && input.shape(0) == count, name + ": batch dimension must match seeds");
+    for (const auto& [name, values] : params) require(values.size() == count, "parameter " + name + " needs one value per sample");
+    // Input dtype, then output dtype: uint8 images leave as float32, written into their slots.
+    struct Slots { Array stacked; Shape shape; char kind; std::size_t bytes, sample_bytes; std::vector<bool> in_place;
+                   char out_kind; std::size_t out_bytes, out_sample_bytes; };
+    std::map<std::string, Slots> slots;
+    for (const auto& [name, input] : inputs) {
+        require(pipeline.targets().count(name), "undeclared array field: " + name);
+        const auto type = input.dtype();
+        require(type.lanes == 1 && type.bits % 8 == 0, "unsupported input dtype");
+        const char kind = type.code == std::uint8_t(nb::dlpack::dtype_code::Float) ? 'f' : type.code == std::uint8_t(nb::dlpack::dtype_code::Int) ? 'i' :
+                          type.code == std::uint8_t(nb::dlpack::dtype_code::UInt) ? 'u' : type.code == std::uint8_t(nb::dlpack::dtype_code::Bool) ? 'b' : 0;
+        Shape full; for (std::size_t a = 0; a < input.ndim(); ++a) full.push_back(input.shape(a));
+        Shape shape(full.begin() + 1, full.end());
+        const auto bytes = std::size_t(type.bits / 8);
+        const bool widen = pipeline.targets().at(name).role == Role::Image && kind == 'u' && bytes == 1;
+        const char out_kind = widen ? 'f' : kind; const std::size_t out_bytes = widen ? 4 : bytes;
+        slots.emplace(name, Slots{Array::uninitialized(full, out_kind, out_bytes), shape, kind, bytes, product(shape) * bytes, std::vector<bool>(count, false),
+                                  out_kind, out_bytes, product(shape) * out_bytes});
+    }
+    std::vector<RunResult> results(count);
+    {
+        nb::gil_scoped_release release;
+        for (std::size_t b = 0; b < count; ++b) {
+            Sample sample;
+            for (auto& [name, slot] : slots) {
+                const auto* source = static_cast<const std::byte*>(inputs.at(name).data()) + b * slot.sample_bytes;
+                Array array(slot.shape, slot.kind, slot.bytes, source, name, false);
+                auto* destination = static_cast<std::byte*>(slot.stacked.data()) + b * slot.out_sample_bytes;
+                if (slot.out_kind == slot.kind) array.spare = destination; else array.widened = destination;
+                if (reinterpret_cast<std::uintptr_t>(source) % slot.bytes) array.data();
+                sample.emplace(name, Field{std::move(array), pipeline.targets().at(name), name});
+            }
+            NamedValues values; for (const auto& [name, v] : params) values[name] = v[b];
+            NamedScope named(&values);
+            results[b] = pipeline.run(std::move(sample), seeds[b], false);
+            for (auto& [name, slot] : slots) {
+                const auto it = results[b].sample.find(name);
+                const auto* target = static_cast<const std::byte*>(std::as_const(slot.stacked).data()) + b * slot.out_sample_bytes;
+                slot.in_place[b] = it != results[b].sample.end() && it->second.pyramid.empty() && it->second.array.borrowed == target &&
+                                   it->second.array.shape == slot.shape && it->second.array.kind == slot.out_kind && it->second.array.bytes == slot.out_bytes;
+            }
+        }
+    }
+    nb::dict arrays, sources;
+    for (auto& [name, first] : results.front().sample) {
+        bool stacked = first.pyramid.empty();
+        for (const auto& r : results) {
+            const auto it = r.sample.find(name);
+            require(it != r.sample.end(), "samples produced different fields");
+            stacked = stacked && it->second.pyramid.empty() && it->second.array.shape == first.array.shape &&
+                      it->second.array.kind == first.array.kind && it->second.array.bytes == first.array.bytes;
+        }
+        const auto slot = slots.find(name);
+        if (stacked && slot != slots.end() && first.array.shape == slot->second.shape &&
+            first.array.kind == slot->second.out_kind && first.array.bytes == slot->second.out_bytes && !slot->second.stacked.shape.empty()) {
+            // Samples left elsewhere are copied into their slots; the slot buffer is the output.
+            auto& s = slot->second;
+            auto* base = static_cast<std::byte*>(s.stacked.data());
+            for (std::size_t b = 0; b < count; ++b)
+                if (!s.in_place[b] && s.out_sample_bytes) std::memmove(base + b * s.out_sample_bytes, std::as_const(results[b].sample.at(name).array).data(), s.out_sample_bytes);
+            arrays[nb::str(name.c_str())] = export_array(std::move(s.stacked), inputs, false);
+            s.stacked.shape.clear();  // exported; later samples' views remain valid
+        } else if (stacked) {
+            Shape shape{count}; shape.insert(shape.end(), first.array.shape.begin(), first.array.shape.end());
+            Array out(shape, first.array.kind, first.array.bytes, nullptr, {}, false, false);
+            const auto bytes = first.array.size() * first.array.bytes;
+            auto* target = static_cast<std::byte*>(out.data());
+            for (std::size_t b = 0; b < count; ++b)
+                if (bytes) std::memcpy(target + b * bytes, std::as_const(results[b].sample.at(name).array).data(), bytes);
+            arrays[nb::str(name.c_str())] = export_array(std::move(out), inputs, false);
+        } else {
+            nb::list items;
+            for (auto& r : results) {
+                auto& f = r.sample.at(name);
+                if (f.pyramid.empty()) items.append(export_array(own(std::move(f.array)), inputs, false));
+                else { nb::list levels; for (auto& level : f.pyramid) levels.append(export_array(own(std::move(level)), inputs, false)); items.append(levels); }
+            }
+            arrays[nb::str(name.c_str())] = items;
+        }
+        sources[nb::str(name.c_str())] = nb::str(first.source.c_str());
+    }
+    return nb::make_tuple(arrays, sources);
+}
+
+#include "volumetric_bindings.hpp"
+
+NB_MODULE(_transforms, m) {
+    m.doc() = "CPU/CUDA transform: configuration, sampling, execution and replay.";
+    nb::class_<Uniform>(m, "Uniform").def(nb::init<double, double>(), "low"_a, "high"_a);
+    nb::class_<Normal>(m, "Normal").def(nb::init<double, double>(), "mean"_a = 0., "std"_a = .1);
+    nb::class_<Choice>(m, "Choice").def(nb::init<std::vector<double>>(), "values"_a);
+    nb::class_<Named>(m, "Param").def(nb::init<std::string>(), "name"_a);
+    nb::class_<Target>(m, "Target");
+    m.def("default_targets", &default_targets);
+    m.def("Image", [](double fill, nb::object valid, bool refill) { Target t; t.fill = fill; t.valid = valid.is_none() ? "" : nb::cast<std::string>(valid); t.refill = refill; return t; }, "fill"_a = 0., "valid"_a.none() = nb::str("padding_mask"), "refill"_a = true);
+    m.def("Label", [](double fill) { Target t; t.role = Role::Label; t.fill = fill; return t; }, "fill"_a = 0.);
+    m.def("ScalarField", [](double fill) { Target t; t.role = Role::Scalar; t.fill = fill; return t; }, "fill"_a = 0.);
+    m.def("ValidMask", [] { Target t; t.role = Role::Valid; return t; });
+    m.def("Points", [](const std::string& order, const std::string& outside) { Target t; t.role = Role::Points; t.components = order; t.outside = outside; return t; }, "order"_a = "zyx", "outside"_a = "keep");
+    m.def("Vectors", [](const std::string& components, bool normalize) { Target t; t.role = Role::Vectors; t.components = components; t.normalize = normalize; return t; }, "components"_a = "zyx", "normalize"_a = false);
+    m.def("VectorField", [](const std::string& components, bool normalize, double fill) { Target t; t.role = Role::VectorField; t.components = components; t.normalize = normalize; t.fill = fill; return t; }, "components"_a = "zyx", "normalize"_a = false, "fill"_a = 0.);
+    m.def("NormalField", [](const std::string& components, double fill) { Target t; t.role = Role::NormalField; t.components = components; t.fill = fill; return t; }, "components"_a = "zyx", "fill"_a = 0.);
+    m.def("CoordinateField", [](const std::string& components, const std::string& frame, double fill) { require(frame == "external" || frame == "local", "frame must be external or local"); Target t; t.role = Role::CoordinateField; t.components = components; t.external = frame == "external"; t.fill = fill; return t; }, "components"_a = "zyx", "frame"_a = "external", "fill"_a = 0.);
+
+    bind<BrightnessMultiply>(m, "BrightnessMultiply", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); });
+    bind<BrightnessAdd>(m, "BrightnessAdd", [](auto& t, auto& a) { t.shift = parameter(a, "shift", t.shift); });
+    bind<Contrast>(m, "Contrast", [](auto& t, auto& a) { t.factor = parameter(a, "factor", t.factor); t.preserve_range = a.get("preserve_range", t.preserve_range); t.masked = a.get("masked", t.masked); });
+    bind<Gamma>(m, "Gamma", [](auto& t, auto& a) { t.gamma = parameter(a, "gamma", t.gamma); t.p_invert = a.get("p_invert", t.p_invert); t.p_retain_stats = a.get("p_retain_stats", t.p_retain_stats); t.masked = a.get("masked", t.masked); t.clip = a.get("clip", t.clip); t.eps = a.get("eps", t.eps); });
+    bind<Invert>(m, "Invert", [](auto&, auto&) {});
+    bind<Normalize>(m, "Normalize", [](auto& t, auto& a) {
+        const auto mode = a.get("mode", std::string("zscore"));
+        const std::map<std::string, Normalization> modes{{"minmax", Normalization::MinMax}, {"zscore", Normalization::ZScore},
+            {"robust", Normalization::Robust}, {"percentile", Normalization::Percentile}, {"fixed", Normalization::Fixed}};
+        require(modes.count(mode), "normalization mode must be minmax, zscore, robust, percentile or fixed");
+        t.mode = modes.at(mode);
+        // Each option belongs to one mode; reject options another mode would ignore.
+        const auto option = [&](const char* name, std::initializer_list<Normalization> owners, auto fallback) {
+            if (a.keywords.contains(name))
+                require(std::find(owners.begin(), owners.end(), t.mode) != owners.end(), std::string(name) + " does not apply to normalization mode " + mode);
+            return a.kw(name, fallback);
+        };
+        using N = Normalization;
+        t.masked = option("masked", {N::MinMax, N::ZScore, N::Robust, N::Percentile}, t.masked);
+        t.nonzero = option("nonzero", {N::ZScore}, t.nonzero);
+        t.eps = option("eps", {N::MinMax, N::ZScore}, t.eps);
+        t.lower = option("lower", {N::Robust, N::Percentile}, t.lower);
+        t.upper = option("upper", {N::Robust, N::Percentile}, t.upper);
+        t.clip = option("clip", {N::Robust}, t.clip);
+        t.median = option("median", {N::Percentile}, t.median);
+        t.center = option("center", {N::Fixed}, t.center);
+        t.scale = option("scale", {N::Fixed}, t.scale);
+        auto bounds = option("bounds", {N::Fixed}, nb::object(nb::none()));
+        if (!bounds.is_none()) {
+            auto values = nb::cast<std::vector<double>>(bounds); require(values.size() == 2, "bounds needs (low, high)");
+            t.low = values[0]; t.high = values[1];
+        }
+    });
+    bind<GaussianNoise>(m, "GaussianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", t.shared_noise); });
+    bind<RicianNoise>(m, "RicianNoise", [](auto& t, auto& a) { t.std = parameter(a, "std", t.std); t.shared_noise = a.get("shared_noise", t.shared_noise); });
+    bind<ClipOutliers>(m, "ClipOutliers", [](auto& t, auto& a) { t.lower = parameter(a, "lower", t.lower); t.upper = parameter(a, "upper", t.upper); t.p_retain_std = a.get("p_retain_std", t.p_retain_std); });
+    bind<GaussianBlur>(m, "GaussianBlur", [](auto& t, auto& a) {
+        t.sigma = parameter(a, "sigma", t.sigma); t.shared_axes = a.get("shared_axes", t.shared_axes); t.truncate = a.get("truncate", t.truncate); t.full_width = a.get("full_width", t.full_width);
+        auto boundary = a.get("boundary", std::string("mirror"));
+        require(boundary == "mirror" || boundary == "reflect" || boundary == "nearest", "boundary must be mirror, reflect or nearest");
+        t.boundary = boundary == "mirror" ? Boundary::Mirror : boundary == "nearest" ? Boundary::Nearest : Boundary::Reflect;
+    });
+    bind<OrientedBlur>(m, "OrientedBlur", [](auto& t, auto& a) {
+        t.sigma_along = parameter(a, "sigma_along", t.sigma_along); t.sigma_across = parameter(a, "sigma_across", t.sigma_across);
+        auto axis = a.take("axis", nb::none());
+        if (nb::isinstance<nb::str>(axis)) t.axis_from = nb::cast<std::string>(axis);
+        else if (!axis.is_none()) {
+            t.axis = nb::cast<std::vector<double>>(axis);
+            require(!t.axis.empty(), "axis must be a finite nonzero (y, x) or (z, y, x) vector");
+        }
+    });
+    bind<MedianFilter>(m, "MedianFilter", [](auto& t, auto& a) { t.size = parameter(a, "size", t.size); t.quantize = a.kw("quantize", t.quantize); });
+    bind<Sharpen>(m, "Sharpen", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.p_clamp = a.get("p_clamp", t.p_clamp); });
+    bind<BrightnessGradient>(m, "BrightnessGradient", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.mean_centered = a.get("mean_centered", t.mean_centered); t.clip = a.get("clip", t.clip); });
+    bind<LocalContrast>(m, "LocalContrast", [](auto& t, auto& a) { t.local = local_options(a); t.factor = parameter(a, "factor", t.factor); });
+    bind<LocalGamma>(m, "LocalGamma", [](auto& t, auto& a) { t.local = local_options(a); t.gamma = parameter(a, "gamma", t.gamma); });
+    bind<LocalSmoothing>(m, "LocalSmoothing", [](auto& t, auto& a) { t.local = local_options(a); t.strength = parameter(a, "strength", t.strength); t.sigma = parameter(a, "sigma", t.sigma); });
+    bind<BlankRectangle>(m, "BlankRectangle", [](auto& t, auto& a) {
+        auto size = a.take("size", nb::int_(16)); t.size.clear();
+        if (nb::isinstance<nb::tuple>(size) || nb::isinstance<nb::list>(size)) { for (auto item : nb::borrow<nb::iterable>(size)) t.size.push_back(scalar(item)); } else t.size.push_back(scalar(size));
+        auto value = a.take("value", nb::str("mean")); if (nb::isinstance<nb::str>(value)) t.statistic = nb::cast<std::string>(value); else { t.statistic.clear(); t.value = scalar(value); }
+        t.count = parameter(a, "count", t.count); t.square = a.get("square", t.square);
+    });
+    bind<SliceIllumination>(m, "SliceIllumination", [](auto& t, auto& a) {
+        auto ax = a.get("axis", std::string("z")); require(ax.size() == 1, "axis must be one character"); t.axis = ax[0];
+        t.defects = parameter(a, "defects", t.defects); t.width = parameter(a, "width", t.width); t.reduction = parameter(a, "reduction", t.reduction); t.base_p = parameter(a, "base_p", t.base_p); t.base_reduction = parameter(a, "base_reduction", t.base_reduction);
+    });
+    bind<Smear>(m, "Smear", [](auto& t, auto& a) { auto ax = a.get("axis", std::string("z")); require(ax.size() == 1, "axis must be one character"); t.axis = ax[0]; t.shift = a.get("shift", t.shift); t.alpha = a.get("alpha", t.alpha); t.previous = a.get("previous", t.previous); });
+    bind<Flip>(m, "Flip", [](auto& t, auto& a) { t.axes = a.get("axes", t.axes); t.p_axis = a.get("p_axis", t.p_axis); });
+    bind<Rotate90>(m, "Rotate90", [](auto& t, auto& a) { t.planes = a.get("planes", t.planes); auto turns = a.take("turns", nb::cast(t.turns)); t.turns = nb::isinstance<Choice>(turns) ? nb::cast<Choice>(turns) : Choice{nb::cast<std::vector<double>>(turns)}; t.resize = a.get("resize", t.resize); });
+    bind<Transpose>(m, "Transpose", [](auto& t, auto& a) { t.order = a.get("order", t.order); });
+    bind<CropPad>(m, "CropPad", [](auto& t, auto& a) { t.shape = a.get("shape", t.shape); t.random = a.get("random", t.random); });
+    bind<Affine>(m, "Affine", [](auto& t, auto& a) { t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale); t.translate = parameter(a, "translate", t.translate); t.shear = parameter(a, "shear", t.shear); t.rotation_axes = a.get("rotation_axes", t.rotation_axes); t.shared_scale = a.get("shared_scale", t.shared_scale); t.border = a.get("border", t.border); t.shape = a.get("shape", t.shape); });
+    bind<Elastic>(m, "Elastic", [](auto& t, auto& a) { t.sigma = parameter(a, "sigma", t.sigma); t.magnitude = parameter(a, "magnitude", t.magnitude); t.border = a.get("border", t.border); });
+    bind<SheetCompression>(m, "SheetCompression", [](auto& t, auto& a) { t.strength = parameter(a, "strength", t.strength); t.intensity_sigma = parameter(a, "intensity_sigma", t.intensity_sigma); t.smoothing = parameter(a, "smoothing", t.smoothing); t.axes = a.get("axes", t.axes); t.image = a.get("image", t.image); t.threshold = a.get("threshold", t.threshold); });
+    bind<LowResolution>(m, "LowResolution", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.shared_axes = a.get("shared_axes", t.shared_axes); });
+    bind<ThickSlice>(m, "ThickSlice", [](auto& t, auto& a) { t.scale = parameter(a, "scale", t.scale); t.axes = a.get("axes", t.axes); t.labels = a.get("labels", t.labels); });
+    bind<Morphology>(m, "Morphology", [](auto& t, auto& a) { t.operation = morph(a.take("operation", nb::str("close"))); t.radius = parameter(a, "radius", t.radius); t.on = names(a.take("on", nb::none())); t.neutral_border = a.get("neutral_border", t.neutral_border); const std::map<std::string, MorphFootprint> footprints{{"ball", MorphFootprint::Ball}, {"cross", MorphFootprint::Cross}, {"cube", MorphFootprint::Cube}, {"repeated_cross", MorphFootprint::RepeatedCross}}; auto footprint = footprints.find(a.get("footprint", std::string("ball"))); require(footprint != footprints.end(), "footprint must be ball, cross, cube or repeated_cross"); t.footprint = footprint->second; });
+    bind<RandomBinaryOperator>(m, "RandomBinaryOperator", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.radius = parameter(a, "radius", t.radius); auto ops = a.take("operations", nb::none()); if (!ops.is_none()) { t.operations.clear(); for (auto op : nb::borrow<nb::iterable>(ops)) t.operations.push_back(morph(op)); } t.p_channel = a.get("p_channel", t.p_channel); });
+    bind<RemoveComponents>(m, "RemoveComponents", [](auto& t, auto& a) { t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); t.max_fraction = a.get("max_fraction", t.max_fraction); t.p_fill = a.get("p_fill", t.p_fill); t.p_channel = a.get("p_channel", t.p_channel); t.full_connectivity = a.get("full_connectivity", t.full_connectivity); });
+    bind<ReplaceLabel>(m, "ReplaceLabel", [](auto& t, auto& a) { t.value = a.get("value", t.value); t.replacement = a.get("replacement", t.replacement); t.on = a.get("on", t.on); t.channels = a.get("channels", t.channels); });
+    bind<Regions>(m, "Regions", [](auto& t, auto& a) { auto labels = a.take("labels", nb::tuple()); for (auto group : nb::borrow<nb::iterable>(labels)) { if (nb::isinstance<nb::list>(group) || nb::isinstance<nb::tuple>(group)) t.labels.push_back(nb::cast<std::vector<double>>(group)); else t.labels.push_back({nb::cast<double>(group)}); } t.on = a.get("on", t.on); t.output = a.get("output", t.output); t.channel = a.get("channel", t.channel); });
+    bind<OneHot>(m, "OneHot", [](auto& t, auto& a) { t.labels = a.get("labels", t.labels); t.on = a.get("on", t.on); t.output = a.get("output", t.output); t.append_to = a.get("append_to", t.append_to); t.channel = a.get("channel", t.channel); t.remove_source = a.get("remove_source", t.remove_source); });
+    bind<MaskImage>(m, "MaskImage", [](auto& t, auto& a) { t.mask = a.get("mask", t.mask); t.on = a.get("on", t.on); t.mask_channel = a.get("mask_channel", t.mask_channel); t.channels = a.get("channels", t.channels); t.fill = a.get("fill", t.fill); });
+    bind<DeepSupervision>(m, "DeepSupervision", [](auto& t, auto& a) { auto scales = a.take("scales", nb::tuple()); for (auto v : nb::borrow<nb::iterable>(scales)) { if (nb::isinstance<nb::tuple>(v) || nb::isinstance<nb::list>(v)) t.scales.push_back(nb::cast<std::vector<double>>(v)); else t.scales.push_back({nb::cast<double>(v)}); } t.on = a.get("on", t.on); t.output = a.get("output", t.output); });
+    bind<ToPseudo2D>(m, "ToPseudo2D", [](auto&, auto&) {});
+    bind<FromPseudo2D>(m, "FromPseudo2D", [](auto&, auto&) {});
+    bind<ConnectedComponents>(m,"ConnectedComponents",[](auto& t,auto& a){t.on=names(a.take("on",nb::none()));t.suffix=a.get("suffix",t.suffix);t.connectivity=a.get("connectivity",t.connectivity);});
+    bind<RidgeTrace>(m,"RidgeTrace",[](auto& t,auto& a){t.on=names(a.take("on",nb::none()));t.suffix=a.get("suffix",t.suffix);});
+    bind<MedialSurface>(m, "MedialSurface", [](auto& t, auto& a) { t.method=vcr::thinning::algorithmFromName(a.get("method",std::string("zhang_suen"))); t.preserve_border=a.get("preserve_border",t.preserve_border); t.on = names(a.take("on", nb::none())); t.suffix = a.get("suffix", t.suffix); t.tube = a.get("tube", t.tube); t.open = a.get("open", t.open); t.close = a.get("close", t.close); t.ignore = a.get("ignore", t.ignore); });
+    bind<StripGeometry>(m, "StripGeometry", [](auto& t, auto& a) {
+        t.shift_x = parameter(a, "shift_x", t.shift_x); t.shift_y = parameter(a, "shift_y", t.shift_y); t.degrees = parameter(a, "degrees", t.degrees); t.scale = parameter(a, "scale", t.scale);
+        t.shear_x = parameter(a, "shear_x", t.shear_x); t.shear_y = parameter(a, "shear_y", t.shear_y); t.smooth_offset = parameter(a, "smooth_offset", t.smooth_offset); t.stride = parameter(a, "stride", t.stride);
+        t.p_flip_x = a.get("p_flip_x", t.p_flip_x); t.p_flip_y = a.get("p_flip_y", t.p_flip_y); t.shape = a.get("shape", t.shape);
+    });
+    bind<SurfacePerturb>(m, "SurfacePerturb", [](auto& t, auto& a) {
+        t.on = a.get("on", t.on); t.blobs = parameter(a, "blobs", t.blobs); t.sigma_fraction = parameter(a, "sigma_fraction", t.sigma_fraction); t.amplitude = parameter(a, "amplitude", t.amplitude);
+        t.points_affected = a.get("points_affected", t.points_affected); t.radius_sigma = a.get("radius_sigma", t.radius_sigma); t.max_displacement = a.get("max_displacement", t.max_displacement);
+    });
+    bind<DistanceTransform>(m, "DistanceTransform", [](auto& t, auto& a) {
+        t.implicit_background = a.kw("implicit_background", t.implicit_background);
+        t.on = names(a.take("on", nb::none())); t.channel = a.get("channel", t.channel); t.threshold = a.get("threshold", t.threshold);
+        const auto mode = a.get("mode", std::string("signed"));
+        require(mode == "signed" || mode == "inside" || mode == "outside", "distance mode must be signed, inside or outside");
+        t.mode = mode == "signed" ? DistanceMode::Signed : mode == "inside" ? DistanceMode::Inside : DistanceMode::Outside;
+        t.suffix = a.get("suffix", t.suffix); auto normals = a.get("normals", nb::object(nb::none()));
+        t.normals = normals.is_none() ? "" : nb::cast<std::string>(normals); t.components = a.get("components", t.components);
+        auto indices = a.get("indices", nb::object(nb::none())); t.indices = indices.is_none() ? "" : nb::cast<std::string>(indices);
+    });
+    bind<Ridges>(m, "Ridges", [](auto& t, auto& a) {
+        t.sigma=a.get("sigma",t.sigma); t.gamma=a.get("gamma",t.gamma);
+        t.beta1=a.get("beta1",t.beta1); t.beta2=a.get("beta2",t.beta2);
+    });
+    bind<CoherenceEnhancingDiffusion>(m, "CoherenceEnhancingDiffusion", [](auto& t, auto& a) {
+        t.sigma = a.get("sigma", t.sigma); t.rho = a.get("rho", t.rho);
+        t.lambda = a.get("lambda_", t.lambda); t.exponent = a.get("exponent", t.exponent);
+        t.alpha = a.get("alpha", t.alpha); t.step_size = a.get("step_size", t.step_size);
+        t.num_steps = a.get("num_steps", t.num_steps);
+    });
+    bind<StructureTensor>(m, "StructureTensor", [](auto& t, auto& a) {
+        t.gradient = a.kw("gradient", t.gradient);
+        t.on = a.get("on", t.on); t.channel = a.get("channel", t.channel); t.output = a.get("output", t.output);
+        t.sigma = a.get("sigma", t.sigma); t.rho = a.get("rho", t.rho); t.truncate = a.get("truncate", t.truncate); t.scale = a.get("scale", t.scale);
+        const auto derivative = a.get("derivative", std::string("pavel"));
+        require(derivative == "pavel" || derivative == "gaussian", "derivative must be pavel or gaussian");
+        t.derivative = derivative == "pavel" ? Derivative::Pavel : Derivative::Gaussian;
+        const auto boundary = a.get("boundary", std::string(t.derivative == Derivative::Pavel ? "zero" : "nearest"));
+        const std::map<std::string, Boundary> edges{{"zero", Boundary::Zero}, {"nearest", Boundary::Nearest}, {"reflect", Boundary::Reflect}, {"mirror", Boundary::Mirror}};
+        require(edges.count(boundary), "boundary must be zero, nearest, reflect or mirror"); t.boundary = edges.at(boundary);
+        const auto field = a.get("field", std::string("components"));
+        require(field == "components" || field == "normal" || field == "tangent", "field must be components, normal or tangent");
+        t.field = field == "components" ? StructureField::Components : field == "normal" ? StructureField::Normal : StructureField::Tangent;
+        t.components = a.get("components", t.components); auto confidence = a.get("confidence", nb::object(nb::none()));
+        t.confidence = confidence.is_none() ? "" : nb::cast<std::string>(confidence);
+        auto at = a.get("at", nb::object(nb::none())); if (!at.is_none()) t.at = nb::cast<std::vector<double>>(at);
+    });
+    bind_volumetric(m);
+    bind<OneOf>(m, "OneOf", [](auto& t, auto& a) { t.transforms = a.get("transforms", t.transforms); t.weights = a.get("weights", t.weights); });
+
+    nb::class_<Plan>(m, "Plan")
+        .def("dump", [](const Plan& p) { auto bytes = save_plan(p); return nb::bytes(bytes.data(), bytes.size()); });
+    m.def("cuda_available", &vcr::cuda::available);
+#ifdef VC_READER_CUDA
+    nb::class_<BoundOutputs>(m, "DeviceOutputs")
+        .def("export", &BoundOutputs::mark_exported)
+        .def("check", &BoundOutputs::check, nb::call_guard<nb::gil_scoped_release>())
+        .def("wait", &BoundOutputs::wait, nb::call_guard<nb::gil_scoped_release>());
+#endif
+    nb::class_<Pipeline>(m, "Pipeline")
+        .def(nb::init<std::vector<Op>, std::map<std::string, Target>, bool, std::string>(), "transforms"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu")
+        .def_prop_ro("backend", &Pipeline::backend)
+        .def_prop_ro("targets", &Pipeline::targets)
+        .def("continuous", [](const Pipeline& p, const std::string& target) { return continuous(p.targets().at(target)); }, "target"_a)
+#ifdef VC_READER_CUDA
+        .def("run_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, std::uint64_t seed, bool record, bool inplace,
+                              const NamedValues& params) {
+            return run_device(p,inputs,seed,record,inplace,nullptr,params);
+        }, "inputs"_a, "seed"_a, "record"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
+        .def("run_batch", &run_batch, "inputs"_a, "seeds"_a, "params"_a, "allocator"_a, "stream"_a)
+        .def("replay_device", [](const Pipeline& p, const std::map<std::string,DeviceInputArray>& inputs, const Plan& plan) {
+            return run_device(p,inputs,0,false,false,&plan);
+        })
+#endif
+        .def("load_plan", [](const Pipeline& p, nb::bytes bytes) { return load_plan(p.program(), std::string(bytes.c_str(), bytes.size())); })
+        .def("run", [](const Pipeline& p, const std::map<std::string, Input>& inputs, std::uint64_t seed, bool record, bool inplace, const NamedValues& params) {
+            if (inplace) writable_inputs(inputs);
+            RunResult result;
+            { nb::gil_scoped_release release; NamedScope named(&params); result = p.run(import_sample(p, inputs, inplace), seed, record); }
+            return export_result(std::move(result), record, inputs, inplace);
+        }, "inputs"_a, "seed"_a, "record"_a = false, "inplace"_a = false, "params"_a = NamedValues{})
+        .def("run_host_batch", &run_host_batch, "inputs"_a, "seeds"_a, "params"_a = std::map<std::string, std::vector<double>>{})
+        .def("replay", [](const Pipeline& p, const std::map<std::string, Input>& inputs, const Plan& plan) {
+            RunResult result; { nb::gil_scoped_release release; result = p.replay(import_sample(p, inputs), plan); }
+            return export_result(std::move(result), false, inputs);
+        });
+    m.def("direct_pipeline", &Pipeline::direct, "transform"_a, "targets"_a, "compact"_a = true, "backend"_a = "cpu");
+    m.def("direct_input", &direct_input, "transform"_a);
+    m.def("direct_output", &direct_output, "input"_a, "fields"_a);
+    m.attr("DIRECT_SEED") = direct_seed;
+    m.def("seed", [](nb::args parts) {
+        std::vector<SeedPart> values;
+        for (auto part : parts) {
+            require(nb::isinstance<nb::int_>(part) || nb::isinstance<nb::str>(part), "seed identifiers must be integers or strings");
+            values.push_back({nb::isinstance<nb::str>(part), nb::cast<std::string>(nb::str(part))});
+        }
+        return make_seed(values);
+    });
+}

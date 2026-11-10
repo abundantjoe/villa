@@ -1,0 +1,431 @@
+"""Validate and atomically stage portable inference bundles for Atlas ingestion."""
+from __future__ import annotations
+
+from dataclasses import dataclass
+from functools import cached_property
+import hashlib
+import importlib
+import json
+from pathlib import Path, PurePosixPath
+import re
+import subprocess
+import tempfile
+from typing import Any, Iterable, Protocol
+from urllib.parse import urlparse
+
+import vc_reader.reader
+
+try:
+    from inference_provenance import validate_portable_bundle
+except ImportError:  # pragma: no cover - monorepo package import mode.
+    from lasagna.inference_provenance import validate_portable_bundle
+
+from .config import ManagerConfig
+from .fiberlets import (
+    resolve_bundle_relative, validate_published_fiberlet_dataset,
+)
+from .runs import atomic_json, resolve_run, utc_now
+from .snapshots import SnapshotRecord, index_snapshots
+
+
+SUPPORTED_LICENSE = "CC BY-NC 4.0"
+SUPPORTED_ARTIFACTS = {"fiber3d-prediction", "lasagna", "fiberlets"}
+INCOMPLETE_MARKER = "_INCOMPLETE"
+_RUN_TIMESTAMP = re.compile(r"(?<!\d)(\d{8}_\d{6})(?!\d)")
+
+
+class StagingStore(Protocol):
+    def put_file(self, key: str, path: Path) -> None: ...
+    def put_bytes(self, key: str, value: bytes) -> None: ...
+    def delete(self, key: str) -> None: ...
+
+
+@dataclass(frozen=True)
+class UploadPlan:
+    run_dir: Path
+    bundle_dir: Path
+    provenance: dict[str, Any]
+    model_id: str | None
+    bucket: str
+    prefix: str
+    files: tuple[str, ...] | None
+
+
+class S3ObjectStore:
+    def __init__(
+        self,
+        bucket: str,
+        *,
+        rclone_params: Iterable[str] = (),
+    ) -> None:
+        self.bucket = bucket
+        self.rclone_params = tuple(rclone_params)
+
+    @cached_property
+    def store(self) -> vc_reader.reader.ObjectStore:
+        return vc_reader.reader.ObjectStore(f"s3://{self.bucket}")
+
+    def put_file(self, key: str, path: Path) -> None:
+        self.store.write(key, path.read_bytes())
+
+    def put_files(self, prefix: str, bundle: Path, files: Iterable[str]) -> None:
+        """Upload a fixed bundle inventory concurrently with rclone."""
+        paths = tuple(files)
+        with tempfile.NamedTemporaryFile("w", encoding="utf-8") as file_list:
+            file_list.write("\n".join(paths))
+            file_list.write("\n")
+            file_list.flush()
+            destination = f":s3:{self.bucket}/{prefix.strip('/')}/"
+            command = [
+                "rclone", "copy", str(bundle), destination,
+                *self.rclone_params,
+                "--files-from-raw", file_list.name,
+            ]
+            subprocess.run(command, check=True)
+
+    def put_tree(self, prefix: str, bundle: Path) -> None:
+        """Stream a sparse tree directly; rclone owns bounded traversal."""
+        destination = f":s3:{self.bucket}/{prefix.strip('/')}/"
+        subprocess.run([
+            "rclone", "copy", str(bundle), destination,
+            *self.rclone_params,
+            "--exclude", INCOMPLETE_MARKER,
+            "--exclude", f"**/{INCOMPLETE_MARKER}",
+        ], check=True)
+
+    def put_bytes(self, key: str, value: bytes) -> None:
+        self.store.write(key, value)
+
+    def delete(self, key: str) -> None:
+        self.store.remove(key)
+
+
+def _sha256(path: Path) -> str:
+    digest = hashlib.sha256()
+    with path.open("rb") as handle:
+        for block in iter(lambda: handle.read(8 * 1024 * 1024), b""):
+            digest.update(block)
+    return digest.hexdigest()
+
+
+def _bundle_files(bundle: Path) -> tuple[str, ...]:
+    files: list[str] = []
+    for path in sorted((item for item in bundle.rglob("*") if item.is_file()), key=lambda p: p.as_posix()):
+        relative = path.relative_to(bundle).as_posix()
+        if relative == INCOMPLETE_MARKER:
+            raise ValueError(f"reserved upload filename in bundle: {relative}")
+        files.append(relative)
+    return tuple(files)
+
+
+def _parse_staging(value: str, run_uuid: str, namespace: str = "inference") -> tuple[str, str]:
+    parsed = urlparse(value)
+    if parsed.scheme != "s3" or not parsed.netloc:
+        raise ValueError("upload_staging_s3 must be an s3://bucket[/prefix] URL")
+    root = parsed.path.strip("/")
+    prefix = "/".join(part for part in (root, namespace, run_uuid) if part)
+    return parsed.netloc, prefix
+
+
+def _matching_snapshot(config: ManagerConfig, model: dict[str, Any]) -> SnapshotRecord:
+    expected_hash = str(model.get("sha256") or "").lower()
+    if len(expected_hash) != 64:
+        raise ValueError("inference model.sha256 is required for Atlas model resolution")
+    candidates = [
+        record for record in index_snapshots(config, write_cache=False)
+        if record.sha256.lower() == expected_hash
+    ]
+    verified: list[SnapshotRecord] = []
+    for record in candidates:
+        path = Path(record.path)
+        if path.is_file() and _sha256(path) == expected_hash:
+            verified.append(record)
+    if not verified:
+        raise ValueError("no configured snapshot matches inference model.sha256")
+    normalized = {
+        (record.backend, record.run, record.model_creation_utc, record.model_identifier)
+        for record in verified
+    }
+    if len(normalized) != 1:
+        raise ValueError("matching snapshot copies have conflicting identity metadata")
+    expected_run = model.get("run")
+    expected_checkpoint = model.get("checkpoint")
+    named = [record for record in verified if not expected_checkpoint or record.checkpoint == str(expected_checkpoint)]
+    if expected_checkpoint and not named:
+        raise ValueError("inference model.checkpoint does not match any byte-identical snapshot copy")
+    chosen = sorted(named or verified, key=lambda record: record.path)[0]
+    if model.get("model_identifier") is not None and model["model_identifier"] != chosen.model_identifier:
+        raise ValueError("inference model.model_identifier conflicts with trusted snapshot metadata")
+    if expected_run and str(expected_run) != chosen.run:
+        raise ValueError("inference model.run does not match the hashed snapshot")
+    expected_snapshot = f"{chosen.run}/snapshots/{chosen.checkpoint}"
+    if model.get("snapshot") is not None and str(model["snapshot"]) != expected_snapshot:
+        raise ValueError("inference model.snapshot does not match the hashed snapshot")
+    expected_architecture = "fiber3d/unet" if chosen.backend == "fiber3d" else "unet"
+    if model.get("architecture") is not None and str(model["architecture"]) != expected_architecture:
+        raise ValueError("inference model.architecture does not match the hashed snapshot backend")
+    if chosen.atlas_model_id and model.get("atlas_model_id"):
+        if str(chosen.atlas_model_id)[:14] != str(model["atlas_model_id"])[:14]:
+            raise ValueError("inference Atlas model ID conflicts with trusted snapshot metadata")
+    if chosen.model_creation_utc and model.get("model_creation_utc"):
+        if str(chosen.model_creation_utc) != str(model["model_creation_utc"]):
+            raise ValueError("inference model creation time conflicts with trusted snapshot metadata")
+    return chosen
+
+
+def _canonical_model_id(record: SnapshotRecord, model: dict[str, Any]) -> str:
+    carried = record.atlas_model_id
+    if carried:
+        value = str(carried)
+        if not re.match(r"^\d{14}(?:-|$)", value):
+            raise ValueError(f"invalid checkpoint Atlas model ID: {value!r}")
+        return value if "-" in value else f"{value}-lasagna"
+    creation = record.model_creation_utc
+    if creation:
+        try:
+            from datetime import datetime, timezone
+
+            stamp = datetime.fromisoformat(str(creation).replace("Z", "+00:00"))
+        except ValueError as error:
+            raise ValueError(f"invalid model creation UTC: {creation!r}") from error
+        if stamp.tzinfo is None:
+            raise ValueError("model creation time must include a UTC offset")
+        stamp = stamp.astimezone(timezone.utc)
+        canonical = stamp.strftime("%Y%m%d%H%M%S")
+    else:
+        matches = _RUN_TIMESTAMP.findall(record.run)
+        if len(matches) != 1:
+            raise ValueError("snapshot run must contain exactly one YYYYMMDD_HHMMSS UTC timestamp")
+        canonical = matches[0].replace("_", "")
+    return f"{canonical}-lasagna"
+
+
+def resolve_model_id(config: ManagerConfig, provenance: dict[str, Any]) -> str:
+    model = provenance.get("model") if isinstance(provenance.get("model"), dict) else {}
+    record = _matching_snapshot(config, model)
+    return _canonical_model_id(record, model)
+
+
+def validate_inference(
+    config: ManagerConfig,
+    selector: str,
+) -> UploadPlan:
+    run_dir, record = resolve_run(config, selector)
+    phase = str(record.get("active_lifecycle_phase") or "inference")
+    if record.get("status") != "completed" or record.get("lifecycle", {}).get(phase) != "completed":
+        raise ValueError(f"run {record.get('run_name', selector)!r} is not completed")
+    bundle = run_dir / str(record.get("artifacts", {}).get("root", "artifacts"))
+    artifact_root = Path(str(record.get("artifacts", {}).get("root", "artifacts")))
+    provenance_relative = Path(str(
+        record.get("artifacts", {}).get("provenance", "artifacts/inference.json")
+    ))
+    try:
+        provenance_name = provenance_relative.relative_to(artifact_root)
+    except ValueError as error:
+        raise ValueError("portable provenance must be inside the artifact bundle") from error
+    provenance = validate_portable_bundle(
+        bundle, provenance_name=provenance_name.as_posix(),
+    )
+    if provenance.get("artifact_kind") not in SUPPORTED_ARTIFACTS:
+        raise ValueError(
+            f"unsupported inference artifact {provenance.get('artifact_kind')!r}; "
+            f"expected one of {sorted(SUPPORTED_ARTIFACTS)}"
+        )
+    if provenance.get("run_uuid") != record.get("run_uuid"):
+        raise ValueError("run UUID differs between durable record and inference.json")
+    source = provenance.get("source") if isinstance(provenance.get("source"), dict) else {}
+    license_value = source.get("license") if isinstance(source.get("license"), dict) else {}
+    if license_value.get("name") != SUPPORTED_LICENSE:
+        raise ValueError(f"publication requires source license {SUPPORTED_LICENSE!r}")
+    is_fiberlet = provenance.get("artifact_kind") == "fiberlets"
+    resolved_model = None if is_fiberlet else resolve_model_id(config, provenance)
+    bucket, prefix = _parse_staging(
+        config.upload_staging_s3,
+        str(record["run_uuid"]),
+        "fiberlets" if is_fiberlet else "inference",
+    )
+    if is_fiberlet:
+        entries = [
+            entry for entry in provenance.get("artifacts", ())
+            if isinstance(entry, dict) and entry.get("kind") == "fiberlet-zarr"
+        ]
+        if len(entries) != 1 or not isinstance(entries[0].get("path"), str):
+            raise ValueError(
+                "Fiberlet provenance must record exactly one dataset path"
+            )
+        relative = str(entries[0]["path"])
+        expected = resolve_bundle_relative(
+            bundle, relative, label="Fiberlet provenance dataset path",
+        )
+        artifact_root = Path(str(record["artifacts"].get("root", "artifacts")))
+        dataset_record = Path(str(record["artifacts"].get("dataset", "")))
+        try:
+            recorded_relative = dataset_record.relative_to(artifact_root).as_posix()
+        except ValueError as error:
+            raise ValueError(
+                "recorded Fiberlet dataset must be inside the artifact bundle"
+            ) from error
+        if recorded_relative != Path(relative).as_posix():
+            raise ValueError(
+                "Fiberlet provenance dataset path differs from the durable run record"
+            )
+        validate_published_fiberlet_dataset(expected)
+        metadata_hash = str(entries[0].get("metadata_sha256") or "").lower()
+        if metadata_hash != hashlib.sha256(
+            (expected / ".zattrs").read_bytes()
+        ).hexdigest():
+            raise ValueError(
+                "Fiberlet root metadata differs from portable provenance"
+            )
+        if (bundle / INCOMPLETE_MARKER).exists():
+            raise ValueError(f"reserved upload filename in bundle: {INCOMPLETE_MARKER}")
+        files = None
+    else:
+        files = _bundle_files(bundle)
+        if not files:
+            raise ValueError("portable artifact bundle is empty")
+    return UploadPlan(
+        run_dir=run_dir,
+        bundle_dir=bundle,
+        provenance=provenance,
+        model_id=str(resolved_model) if resolved_model is not None else None,
+        bucket=bucket,
+        prefix=prefix,
+        files=files,
+    )
+
+
+def _key(plan: UploadPlan, relative: str) -> str:
+    safe = PurePosixPath(relative)
+    if safe.is_absolute() or ".." in safe.parts:
+        raise ValueError(f"unsafe upload path: {relative}")
+    return f"{plan.prefix}/{safe.as_posix()}"
+
+
+def stage_upload(plan: UploadPlan, store: StagingStore) -> str:
+    """Upload through rclone, with a marker guarding manager-side commit."""
+    marker_key = _key(plan, INCOMPLETE_MARKER)
+    store.put_bytes(marker_key, b"")
+    tree_put = getattr(store, "put_tree", None)
+    bulk_put = getattr(store, "put_files", None)
+    if plan.files is None and callable(tree_put):
+        tree_put(plan.prefix, plan.bundle_dir)
+    elif plan.files is None:
+        for path in plan.bundle_dir.rglob("*"):
+            if path.is_file():
+                relative = path.relative_to(plan.bundle_dir).as_posix()
+                if Path(relative).name == INCOMPLETE_MARKER:
+                    raise ValueError(f"reserved upload filename in bundle: {relative}")
+                store.put_file(_key(plan, relative), path)
+    elif callable(bulk_put):
+        bulk_put(plan.prefix, plan.bundle_dir, plan.files)
+    else:
+        for relative in plan.files:
+            store.put_file(_key(plan, relative), plan.bundle_dir / relative)
+    store.delete(marker_key)
+    return f"s3://{plan.bucket}/{plan.prefix}/"
+
+
+def _load_atlas_api(config: ManagerConfig, artifact_kind: str):
+    atlas = config.resolved_path("atlas_dir", required=True)
+    assert atlas is not None
+    source = atlas / "vesuvius-atlas-py" / "src"
+    if not source.is_dir():
+        raise FileNotFoundError(f"Atlas Python source does not exist: {source}")
+    import sys
+    sys.path.insert(0, str(source))
+    try:
+        if artifact_kind == "fiberlets":
+            module = importlib.import_module("vesuvius_atlas.fiberlet_bundle")
+            return module.validate_fiberlet_bundle_for_atlas, module.ingest_fiberlet_bundle
+        module = importlib.import_module("vesuvius_atlas.inference_bundle")
+        return module.validate_inference_bundle_for_atlas, module.ingest_inference_bundle
+    finally:
+        try:
+            sys.path.remove(str(source))
+        except ValueError:
+            pass
+
+
+def upload_inference(
+    config: ManagerConfig,
+    selector: str,
+    *,
+    store: StagingStore | None = None,
+    validator: Any | None = None,
+    ingester: Any | None = None,
+) -> dict[str, Any]:
+    plan = validate_inference(config, selector)
+    if validator is None or ingester is None:
+        atlas_validator, atlas_ingester = _load_atlas_api(
+            config, str(plan.provenance["artifact_kind"]),
+        )
+        validator = validator or atlas_validator
+        ingester = ingester or atlas_ingester
+    atlas_dir = config.resolved_path("atlas_dir", required=True)
+    atlas_kwargs = {"atlas_dir": atlas_dir, "bundle_dir": plan.bundle_dir}
+    if plan.model_id is not None:
+        atlas_kwargs["model_id"] = plan.model_id
+    atlas_preflight = validator(**atlas_kwargs)
+    record_path = plan.run_dir / "metadata.json"
+    record = json.loads(record_path.read_text(encoding="utf-8"))
+    lifecycle = record.setdefault("lifecycle", {})
+    lifecycle["staging_upload"] = "uploading"
+    record["updated_at"] = utc_now()
+    atomic_json(record_path, record)
+    try:
+        staging_url = stage_upload(
+            plan,
+            store or S3ObjectStore(
+                plan.bucket,
+                rclone_params=config.rclone_params,
+            ),
+        )
+        lifecycle["staging_upload"] = "completed"
+        record["upload"] = {
+            "staging_url": staging_url,
+        }
+        lifecycle["atlas_ingest"] = "ingesting"
+        atomic_json(record_path, record)
+        ingest_kwargs = {
+            "atlas_dir": atlas_dir,
+            "bundle_dir": plan.bundle_dir,
+            "staging_url": staging_url,
+        }
+        if plan.model_id is not None:
+            ingest_kwargs["model_id"] = plan.model_id
+        result = ingester(**ingest_kwargs)
+        lifecycle["atlas_ingest"] = "completed"
+        record["atlas"] = result
+        record["atlas_preflight"] = atlas_preflight
+        record["updated_at"] = utc_now()
+        atomic_json(record_path, record)
+        return record
+    except Exception as error:
+        if lifecycle.get("staging_upload") == "uploading":
+            lifecycle["staging_upload"] = "failed"
+        elif lifecycle.get("atlas_ingest") == "ingesting":
+            lifecycle["atlas_ingest"] = "failed"
+        record["upload_error"] = str(error)
+        record["updated_at"] = utc_now()
+        atomic_json(record_path, record)
+        raise
+
+
+def validate_atlas_inference(
+    config: ManagerConfig,
+    selector: str,
+    *,
+    validator: Any | None = None,
+) -> tuple[UploadPlan, dict[str, Any]]:
+    plan = validate_inference(config, selector)
+    if validator is None:
+        validator, _ingester = _load_atlas_api(
+            config, str(plan.provenance["artifact_kind"]),
+        )
+    atlas_dir = config.resolved_path("atlas_dir", required=True)
+    kwargs = {"atlas_dir": atlas_dir, "bundle_dir": plan.bundle_dir}
+    if plan.model_id is not None:
+        kwargs["model_id"] = plan.model_id
+    result = validator(**kwargs)
+    return plan, result

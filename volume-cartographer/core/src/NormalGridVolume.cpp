@@ -1,19 +1,28 @@
 #include "vc/core/util/NormalGridVolume.hpp"
 #include "vc/core/util/HashFunctions.hpp"
 
-#include "utils/Json.hpp"
- 
+#include <nlohmann/json.hpp>
+#include "vc/core/util/RemoteCacheSettings.hpp"
+
+#include <vc_reader/source_reader.hpp>
+#include <vc_reader/zarr.hpp>
+
  #include <filesystem>
  #include <fstream>
 #include <algorithm>
 #include <cmath>
+#include <cstdlib>
 #include <iostream>
 #include <unordered_map>
+#include <vector>
 #include <random>
 #include <chrono>
 #include <atomic>
+#include <condition_variable>
 #include <mutex>
 #include <shared_mutex>
+#include <thread>
+#include <unordered_set>
 
  namespace fs = std::filesystem;
  
@@ -22,47 +31,221 @@
     struct CacheEntry {
         std::shared_ptr<GridStore> grid_store;
         uint64_t generation;
+        // Index of this entry's key in pimpl::cache_keys. Keeping it here is
+        // what lets eviction sample and erase in O(1) instead of rebuilding
+        // the key list from the map every time.
+        size_t key_slot = 0;
+        // Bytes charged to the budget when this entry was last (re)counted,
+        // held here so eviction subtracts exactly what was added.
+        size_t bytes = 0;
     };
+
+    // A positive integer from the environment, else `fallback`.
+    static size_t env_size(const char* name, size_t fallback)
+    {
+        if (const char* e = std::getenv(name)) {
+            const long long v = std::atoll(e);
+            if (v > 0) {
+                return static_cast<size_t>(v);
+            }
+        }
+        return fallback;
+    }
+
+    // A byte count from the environment, or nullopt when the variable is unset
+    // or not a number. Unlike env_size, 0 is a value here: it is how the byte
+    // budget is switched off.
+    static std::optional<size_t> env_bytes(const char* name)
+    {
+        const char* e = std::getenv(name);
+        if (!e || !*e) {
+            return std::nullopt;
+        }
+        char* end = nullptr;
+        const long long v = std::strtoll(e, &end, 10);
+        if (end == e || v < 0) {
+            return std::nullopt;
+        }
+        return static_cast<size_t>(v);
+    }
 
      struct NormalGridVolume::pimpl {
          std::string base_path;
          int sparse_volume;
-         utils::Json metadata;
+         nlohmann::json metadata;
          double coordinate_scale = 1.0;
          double output_spiral_step = 20.0;
          int selected_level = 0;
          bool multiscale = false;
          mutable std::shared_mutex mutex;
          mutable std::unordered_map<cv::Vec2i, CacheEntry> grid_cache;
+         // Dense, unordered view of the resident keys, kept in step with
+         // grid_cache so eviction can draw its random sample by index. Erase
+         // is the usual swap-with-last, which is why each entry remembers its
+         // own slot.
+         mutable std::vector<cv::Vec2i> cache_keys;
          mutable uint64_t generation_counter = 0;
-         // Cap at 512 entries. Each cached GridStore holds up to 2 MiB of
-         // decoded seglists (GridStore.cpp:813) plus metadata, so 512 ≈
-         // ~1 GiB ceiling on this cache alone. The prior 4096 could have
-         // reached 8 GiB if every slot held a fully-populated store.
-         size_t max_cache_size = 512;
+         // Budget in BYTES instead of the entry cap, on by default.
+         //
+         // With VC_GRID_CACHE_BYTES unset the cache is bounded by
+         // kDefaultCacheBytes of accounted bytes (but see budget_floor_entries),
+         // and the entry cap relaxes to a 65,536 backstop unless
+         // VC_GRID_CACHE_ENTRIES says otherwise. VC_GRID_CACHE_BYTES=<bytes>
+         // sets another budget. VC_GRID_CACHE_BYTES=0 switches the budget off:
+         // the cache then holds at most 512 entries, as it did before, and none
+         // of the byte accounting below runs.
+         //
+         // An entry count is the wrong unit here. A cached GridStore costs the
+         // .grid file it maps -- whose size varies by an order of magnitude
+         // between slices -- plus up to 2 MiB of decoded seglists and the
+         // bucket indices it has decoded, so any entry cap is simultaneously
+         // too loose (a worst case of entries x 2 MiB and more) and too tight
+         // (it evicts small stores that cost almost nothing to keep). A byte
+         // budget bounds the cache directly and does not need retuning when
+         // the grids change.
+         //
+         // The old cap of 512 entries was far below a real tracing working
+         // set. Measured on one resume round of a large patch, whose grid
+         // working set was 7424 distinct slices totalling 4.0 GB: the tracer
+         // opened .grid files 110631 times, i.e. it reopened, remapped and
+         // re-parsed each file about 15 times over, and threw away each
+         // store's decoded polylines with it. A budget that holds the working
+         // set turns that into one construction per distinct slice.
+         //
+         // A budget of 4 GiB is the value that measured best. Sweeping the budget
+         // on that same round gave:
+         //
+         //     budget    GridStore constructions   resident entries
+         //     256 MiB   112447                      659
+         //       1 GiB    50426                     2162
+         //       2 GiB    32423                     3730
+         //       4 GiB     7427                     7427
+         //       8 GiB     7427                     7427
+         //
+         // 4 GiB is the knee (VC_GRID_CACHE_BYTES=4294967296): it holds the whole working set with no
+         // evictions, and 8 GiB buys nothing. All budgets produced
+         // byte-identical output -- the cache is transparent, so a store that
+         // is evicted is simply reloaded from the same immutable file.
+         //
+         // The accounting charges each store its whole mapped file plus what
+         // it has put on the heap: the polylines and the bucket indices it has
+         // decoded, each counted as it is allocated (GridStore::residentBytes).
+         // The file is charged in full although only touched pages are
+         // resident, and on the stores measured it is nearly all of the charge
+         // (PHerc1447 at eight threads: 95.6 % at the end of a 1 cm^2 trace,
+         // against 3.5 % for the polylines and 0.9 % for the bucket indices,
+         // and 96-100 % through a 47 cm^2 trace held at the default budget), so
+         // the RSS cost stays well under the budget there (1.8 GB at a 4 GiB
+         // budget in the sweep above). That is a property of those stores,
+         // not of the accounting: a store keeps about 110 bytes of heap for
+         // every bucket it was asked for, a pass over all buckets of a sparse
+         // slice can hold many times its file, and the charge then follows
+         // the heap. Mappings are file-backed, so concurrent tracers working
+         // the same grids share those pages through the page cache.
+         //
+         // The default of 2 GiB keeps the resident cost near the ~1 GiB the
+         // 512-entry cap was sized for (on that store the charge is about 2x
+         // what is resident, see above) and holds the working set of a seeded
+         // trace of up to about 1 cm^2 on an 8.64 um store; larger traces
+         // evict, as before (a 200-generation patch, VC3D's default, stops
+         // gaining at about 8 GiB at eight threads).
+         // It is kept small and fixed because batch runs start one tracer per
+         // core. On a store of large slices the charge is much further above
+         // what is resident (about 9x on PHercParis4 at 2.4 um, where a trace
+         // reads a small window of slices of up to 5 MiB), so such a store
+         // wants a larger VC_GRID_CACHE_BYTES.
+         static constexpr size_t kDefaultCacheBytes = size_t{2} << 30;
+         // The entry cap the cache had before the byte budget.
+         static constexpr size_t kLegacyCacheEntries = 512;
+         std::optional<size_t> env_cache_bytes = env_bytes("VC_GRID_CACHE_BYTES");
+         // 0 = byte budget off.
+         size_t max_cache_bytes = env_cache_bytes.value_or(kDefaultCacheBytes);
+         bool byte_budget = max_cache_bytes > 0;
+         // The built-in budget never evicts below the old cap. Slices of a
+         // large volume can be big enough (PHercParis4's 2.4 um grids run to
+         // about 5 MiB each) that fewer than 512 of them fit in the default,
+         // and the default must not hold less than the cache used to. An
+         // explicit VC_GRID_CACHE_BYTES is taken at its word.
+         size_t budget_floor_entries = env_cache_bytes ? 0 : kLegacyCacheEntries;
+         // Entry cap. 512 without a byte budget. With one it becomes a backstop so
+         // a volume of unusually tiny slices cannot grow the map without bound.
+         size_t max_cache_entries =
+             env_size("VC_GRID_CACHE_ENTRIES", byte_budget ? 65536 : kLegacyCacheEntries);
+         mutable size_t cache_bytes = 0;
+         // A store's caches (decoded polylines, bucket indices) keep growing
+         // AFTER it is inserted (on hits), so the running total drifts low. It
+         // is therefore re-summed from the stores themselves, both every
+         // kResyncEveryInserts insertions and every kResyncEveryHits hits, so a
+         // working set that is fully resident (no more insertions) is still
+         // held to the budget.
+         static constexpr uint64_t kResyncEveryInserts = 1024;
+         static constexpr uint64_t kResyncEveryHits = 1ull << 16;
+         mutable uint64_t inserts_since_resync = 0;
+         mutable std::atomic<uint64_t> hits_since_resync{0};
          size_t eviction_sample_size = 10;
+         // Seeded once. This used to be constructed -- 2.5 KiB of state,
+         // seeded from std::random_device -- on every single eviction, while
+         // holding the exclusive cache lock.
+         mutable std::mt19937 eviction_rng{std::random_device{}()};
         
          mutable std::atomic<uint64_t> cache_hits{0};
          mutable std::atomic<uint64_t> cache_misses{0};
          mutable std::chrono::steady_clock::time_point last_stat_time = std::chrono::steady_clock::now();
 
          std::vector<std::string> plane_dirs = {"xy", "xz", "yz"};
- 
+
+         // Remote streaming (kNormalGridsRemoteMarker in base_path): base_path is
+         // remote_url's place under a cache root, <root>/<scheme>/<host>/<path>, and
+         // files missing there are downloaded by vc_reader's file cache under the
+         // root's disk budget and free-space floor (VC3D's cache settings). A grid
+         // the store does not have is remembered in grid_cache as a null entry.
+         bool remote = false;
+         std::string remote_url;
+         mutable std::unique_ptr<vcr::sources::EncodedFiles> files;
+         mutable std::atomic<uint64_t> fetch_failures{0};
+         mutable std::mutex fetch_error_mutex;
+         mutable std::string last_fetch_error;
+         // Read-ahead: when a slice has to be fetched, its neighbours on the same plane (the
+         // tracer's frontier reaches them next) are opened too, each as one plain blocking
+         // open on its own background thread. No queue: a neighbour already cached, already
+         // in flight, or over the in-flight limit is simply not started; the file cache's
+         // per-file lock makes a tracer thread that needs one of them wait for that download.
+         static constexpr int readahead_radius = 4;
+         static constexpr int readahead_limit = 16;
+         mutable std::mutex readahead_mutex;
+         mutable std::condition_variable readahead_cv;
+         mutable std::unordered_set<uint64_t> readahead_inflight;
+         mutable int readahead_running = 0;
+
          pimpl(const std::string& path, int requested_level) : base_path(path) {
-            metadata = utils::Json::parse_file(fs::path(base_path) / "metadata.json");
+            load_remote_marker();
+            if (!ensure_local_file("metadata.json")) {
+                throw std::runtime_error(missing_file_error("metadata.json"));
+            }
+            metadata = nlohmann::json::parse(std::ifstream(fs::path(base_path) / "metadata.json"));
             multiscale = metadata.value("format", std::string()) == "normal-grid-multiscale";
             if (multiscale) {
                 const int min_level = metadata.value("min-level", 0);
                 const int max_level = metadata.value("max-level", 0);
                 selected_level = std::clamp(requested_level, min_level, max_level);
+                if (selected_level != requested_level) {
+                    std::cerr << "warning: normal_grid_level=" << requested_level
+                              << " is outside the levels " << min_level << ".." << max_level
+                              << " available in " << base_path
+                              << "; using level " << selected_level << std::endl;
+                }
 
-                utils::Json level_metadata;
-                const fs::path level_metadata_path =
-                    fs::path(base_path) / ("metadata.level" + std::to_string(selected_level) + ".json");
-                if (fs::exists(level_metadata_path)) {
-                    level_metadata = utils::Json::parse_file(level_metadata_path);
+                nlohmann::json level_metadata;
+                const std::string level_metadata_name =
+                    "metadata.level" + std::to_string(selected_level) + ".json";
+                const fs::path level_metadata_path = fs::path(base_path) / level_metadata_name;
+                const bool level_present = ensure_local_file(level_metadata_name);
+                if (level_present && fs::exists(level_metadata_path)) {
+                    level_metadata = nlohmann::json::parse(std::ifstream(level_metadata_path));
                 } else if (metadata.contains("source-metadata")) {
                     level_metadata = metadata["source-metadata"];
+                } else if (remote && !level_present) {
+                    throw std::runtime_error(missing_file_error(level_metadata_name));
                 } else {
                     throw std::runtime_error("multiscale normal grids missing level metadata: " +
                                              level_metadata_path.string());
@@ -76,8 +259,152 @@
                 output_spiral_step = level_step / coordinate_scale;
             } else {
                 selected_level = 0;
+                if (requested_level != 0) {
+                    std::cerr << "warning: normal_grid_level=" << requested_level
+                              << " ignored; store at " << base_path
+                              << " is single-scale (no \"format\":\"normal-grid-multiscale\" in metadata.json)"
+                              << "; using level 0. A multiscale store can be derived from a local copy with"
+                              << " vc_gen_normalgrids pyramid -i <store> -o <multiscale store>" << std::endl;
+                }
                 sparse_volume = metadata.value("sparse-volume", 1);
                 output_spiral_step = metadata.value("spiral-step", 20.0);
+            }
+
+        }
+
+        ~pimpl() {
+            std::unique_lock<std::mutex> lock(readahead_mutex);
+            readahead_cv.wait(lock, [&] { return readahead_running == 0; });
+        }
+
+        static uint64_t slice_key(int plane_idx, int slice_idx) {
+            return (static_cast<uint64_t>(static_cast<uint32_t>(plane_idx)) << 32) | static_cast<uint32_t>(slice_idx);
+        }
+
+        // Start background opens of the slices around (plane_idx, slice_idx) that are not cached yet.
+        void read_ahead(int plane_idx, int slice_idx) const {
+            std::error_code ec;
+            std::lock_guard<std::mutex> lock(readahead_mutex);
+            for (int distance = 1; distance <= readahead_radius; ++distance) {
+                for (const int sign : {1, -1}) {
+                    const int slice = slice_idx + sign * distance * sparse_volume;
+                    if (slice < 0 || readahead_running >= readahead_limit) continue;
+                    const uint64_t key = slice_key(plane_idx, slice);
+                    if (readahead_inflight.count(key)) continue;
+                    const std::string rel = relative_grid_path(plane_idx, slice);
+                    if (fs::exists(fs::path(base_path) / rel, ec)) continue;
+                    {
+                        std::shared_lock<std::shared_mutex> cache(mutex);
+                        if (grid_cache.count(cv::Vec2i(plane_idx, slice))) continue;  // known, present or absent
+                    }
+                    readahead_inflight.insert(key);
+                    ++readahead_running;
+                    std::thread([this, key, rel, plane_idx, slice] {
+                        try {
+                            (void)files->open(remote_url + "/" + rel);
+                        } catch (const vcr::zarr::NotFound&) {
+                            // The store does not have it: remember that, so nobody asks again.
+                            std::unique_lock<std::shared_mutex> cache(mutex);
+                            if (!grid_cache.count(cv::Vec2i(plane_idx, slice))) insert_locked(cv::Vec2i(plane_idx, slice), nullptr);
+                        } catch (const std::exception&) {
+                            // The tracer's own open reports failures.
+                        }
+                        std::lock_guard<std::mutex> done(readahead_mutex);
+                        readahead_inflight.erase(key);
+                        --readahead_running;
+                        readahead_cv.notify_all();
+                    }).detach();
+                }
+            }
+        }
+
+        // The cache root under which `dir` is `url`'s place, <root>/<scheme>/<host>/<path>
+        // (vcr::zarr::decodedCachePath), so that files vc_reader caches for url/<rel> land at dir/<rel>.
+        static fs::path streamingCacheRoot(const fs::path& dir, const std::string& url) {
+            const fs::path place = vcr::zarr::decodedCachePath(fs::path(), url);
+            auto root = fs::absolute(dir).lexically_normal();
+            if (root.filename().empty()) root = root.parent_path();
+            const std::vector<fs::path> parts(place.begin(), place.end());
+            for (auto it = parts.rbegin(); it != parts.rend(); ++it) {
+                if (root.filename() != *it) {
+                    throw std::runtime_error("streaming normal grids for " + url + " must be cached at <root>/" +
+                                             place.generic_string() + ", not at " + dir.string());
+                }
+                root = root.parent_path();
+            }
+            return root;
+        }
+
+        void load_remote_marker() {
+            remote_url = normalGridsRemoteUrl(base_path).value_or(std::string());
+            remote = !remote_url.empty();
+            if (!remote) {
+                return;
+            }
+            const fs::path root = streamingCacheRoot(base_path, remote_url);
+            files = std::make_unique<vcr::sources::EncodedFiles>([root](const std::string& location) {
+                auto options = vc::settings::remoteOpenOptions(root);
+                options.access = vcr::zarr::resolveAccess(location);
+                return options;
+            });
+        }
+
+        // Build an intentional, actionable error message for a normal-grid file
+        // that could not be made available locally. Distinguishes the remote-
+        // streaming failure (fetch from remote_url failed) from a plain missing
+        // local file so the caller can surface it instead of the generic
+        // "Cannot open" thrown by Json::parse_file on a still-absent file.
+        std::string missing_file_error(const std::string& rel) const {
+            if (remote) {
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                return "Failed to fetch remote normal-grid file '" + rel +
+                       "' from " + remote_url +
+                       " (cached under " + base_path + ")" +
+                       (last_fetch_error.empty() ? std::string(": the store does not have it")
+                                                 : ": " + last_fetch_error);
+            }
+            return "normal-grid file not found: " +
+                   (fs::path(base_path) / rel).string();
+        }
+
+        std::string relative_grid_path(int plane_idx, int slice_idx) const {
+            char filename[64];
+            snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
+            std::string rel = plane_dirs[plane_idx];
+            if (multiscale) {
+                rel += "/" + std::to_string(selected_level);
+            }
+            rel += "/";
+            rel += filename;
+            return rel;
+        }
+
+        // Make base_path/rel available: present for a plain store; for a streaming store,
+        // cached already or downloaded now by vc_reader (one download per file, concurrent
+        // misses wait for it; budget and free-space floor apply). `pinned` keeps the
+        // streamed file's descriptor, so eviction cannot take it before it is mapped.
+        // False when the store does not have the file, or when fetching it failed: that
+        // is counted, kept in last_fetch_error and reported on stderr once per message.
+        bool ensure_local_file(const std::string& rel,
+                               std::optional<vcr::sources::EncodedFiles::Opened>* pinned = nullptr) const {
+            if (!remote) {
+                std::error_code ec;
+                return fs::exists(fs::path(base_path) / rel, ec);
+            }
+            try {
+                auto opened = files->open(remote_url + "/" + rel);
+                if (pinned) pinned->emplace(std::move(opened));
+                return true;
+            } catch (const vcr::zarr::NotFound&) {
+                return false;
+            } catch (const std::exception& e) {
+                fetch_failures.fetch_add(1, std::memory_order_relaxed);
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                if (last_fetch_error != e.what()) {
+                    last_fetch_error = e.what();
+                    std::cerr << "normal-grid fetch failed for " << rel << ": " << e.what() << std::endl;
+                }
+                return false;
             }
         }
 
@@ -126,29 +453,43 @@
 
             // Use shared_lock for read-only cache lookup (hot path)
             {
-                std::shared_lock<std::shared_mutex> lock(mutex);
-                auto it = grid_cache.find(key);
-                if (it != grid_cache.end()) {
-                    cache_hits++;
-                    // Note: Removed generation update from hot path to avoid write contention
-                    // LRU eviction will still work reasonably well without per-access updates
-                    return it->second.grid_store;
+                std::shared_ptr<GridStore> hit;
+                bool found = false;
+                {
+                    std::shared_lock<std::shared_mutex> lock(mutex);
+                    auto it = grid_cache.find(key);
+                    if (it != grid_cache.end()) {
+                        cache_hits++;
+                        // Note: Removed generation update from hot path to avoid write contention
+                        // LRU eviction will still work reasonably well without per-access updates
+                        hit = it->second.grid_store;
+                        found = true;
+                    }
+                }
+                if (found) {
+                    if (byte_budget &&
+                        hits_since_resync.fetch_add(1, std::memory_order_relaxed)
+                            % kResyncEveryHits == kResyncEveryHits - 1) {
+                        std::unique_lock<std::shared_mutex> lock(mutex);
+                        resync_bytes_locked();
+                        evict_to_budget_locked();
+                    }
+                    return hit;
                 }
             }
  
             cache_misses++;
-             const std::string& dir = plane_dirs[plane_idx];
-            char filename[256];
-            snprintf(filename, sizeof(filename), "%06d.grid", slice_idx);
-            fs::path grid_path_fs = fs::path(base_path) / dir;
-            if (multiscale) {
-                grid_path_fs /= std::to_string(selected_level);
-            }
-            std::string grid_path = (grid_path_fs / filename).string();
+            const std::string rel = relative_grid_path(plane_idx, slice_idx);
+            std::string grid_path = (fs::path(base_path) / rel).string();
 
-            if (!fs::exists(grid_path)) {
+            std::optional<vcr::sources::EncodedFiles::Opened> pinned;
+            if (remote) {
+                std::error_code ec;
+                if (!fs::exists(fs::path(base_path) / rel, ec)) read_ahead(plane_idx, slice_idx);
+            }
+            if (!ensure_local_file(rel, &pinned)) {
                 std::unique_lock<std::shared_mutex> lock(mutex);
-                grid_cache[key] = {nullptr, ++generation_counter};
+                insert_locked(key, nullptr);
                 return nullptr;
             }
  
@@ -174,46 +515,125 @@
                     return it->second.grid_store;
                 }
  
-                grid_cache[key] = {grid_store, ++generation_counter};
+                insert_locked(key, grid_store);
 
-                // Eviction logic
-                if (grid_cache.size() > max_cache_size) {
-                    std::vector<cv::Vec2i> keys;
-                    keys.reserve(grid_cache.size());
-                    for (const auto& pair : grid_cache) {
-                        keys.push_back(pair.first);
-                    }
-
-                    std::mt19937 gen(std::random_device{}());
-                    std::uniform_int_distribution<size_t> dist(0, keys.size() - 1);
-
-                    cv::Vec2i key_to_evict;
-                    uint64_t min_generation = std::numeric_limits<uint64_t>::max();
-
-                    for (size_t i = 0; i < eviction_sample_size && !keys.empty(); ++i) {
-                        size_t rand_idx = dist(gen);
-                        const auto& key = keys[rand_idx];
-                        const auto& entry = grid_cache.at(key);
-                        if (entry.generation < min_generation) {
-                            min_generation = entry.generation;
-                            key_to_evict = key;
-                        }
-                    }
-
-                    if (min_generation != std::numeric_limits<uint64_t>::max()) {
-                        grid_cache.erase(key_to_evict);
-                    }
+                if (byte_budget && ++inserts_since_resync >= kResyncEveryInserts) {
+                    resync_bytes_locked();
                 }
+                evict_to_budget_locked();
 
                 check_print_stats();
             }
             return grid_store;
         }
 
+        // Caller must hold the exclusive lock.
+        void insert_locked(const cv::Vec2i& key, std::shared_ptr<GridStore> store) const
+        {
+            // Only measured when a byte budget is on: residentBytes() walks the
+            // store's cells, and the entry-cap mode does not need it.
+            const size_t entry_bytes = (byte_budget && store) ? store->residentBytes() : 0;
+            auto it = grid_cache.find(key);
+            if (it != grid_cache.end()) {
+                cache_bytes -= std::min(cache_bytes, it->second.bytes);
+                it->second.grid_store = std::move(store);
+                it->second.generation = ++generation_counter;
+                it->second.bytes = entry_bytes;
+                cache_bytes += entry_bytes;
+                return;
+            }
+            cache_keys.push_back(key);
+            grid_cache.emplace(key,
+                CacheEntry{std::move(store), ++generation_counter, cache_keys.size() - 1,
+                           entry_bytes});
+            cache_bytes += entry_bytes;
+        }
+
+        // Caller must hold the exclusive lock. Recompute every entry's charge
+        // from the store itself (its decoded-polyline and bucket-index caches
+        // grow after insertion; each store keeps running counts, so this is
+        // one sum over the entries). O(entries), so it is called rarely.
+        void resync_bytes_locked() const
+        {
+            inserts_since_resync = 0;
+            size_t total = 0;
+            for (auto& [k, e] : grid_cache) {
+                (void)k;
+                e.bytes = e.grid_store ? e.grid_store->residentBytes() : 0;
+                total += e.bytes;
+            }
+            cache_bytes = total;
+        }
+
+        // Caller must hold the exclusive lock. Erases in O(1) by swapping the
+        // victim's slot with the last key rather than searching cache_keys.
+        void erase_locked(std::unordered_map<cv::Vec2i, CacheEntry>::iterator it) const
+        {
+            cache_bytes -= std::min(cache_bytes, it->second.bytes);
+            const size_t slot = it->second.key_slot;
+            const cv::Vec2i moved = cache_keys.back();
+            cache_keys[slot] = moved;
+            cache_keys.pop_back();
+            if (moved != it->first) {
+                grid_cache.at(moved).key_slot = slot;
+            }
+            grid_cache.erase(it);
+        }
+
+        // Caller must hold the exclusive lock. Same policy as before -- draw
+        // eviction_sample_size keys uniformly at random and drop the one with
+        // the oldest generation stamp -- but the sample is now drawn straight
+        // from cache_keys, so it costs O(sample) instead of O(cache size).
+        //
+        // Evicting is always safe: the cache is transparent, so a dropped
+        // store is reloaded from the same immutable .grid file on the next
+        // miss. Eviction policy affects timing, never results.
+        bool evict_one_locked() const
+        {
+            if (cache_keys.empty()) {
+                return false;
+            }
+            std::uniform_int_distribution<size_t> dist(0, cache_keys.size() - 1);
+            auto victim = grid_cache.end();
+            uint64_t min_generation = std::numeric_limits<uint64_t>::max();
+            for (size_t i = 0; i < eviction_sample_size; ++i) {
+                auto it = grid_cache.find(cache_keys[dist(eviction_rng)]);
+                if (it != grid_cache.end() && it->second.generation < min_generation) {
+                    min_generation = it->second.generation;
+                    victim = it;
+                }
+            }
+            if (victim == grid_cache.end()) {
+                return false;
+            }
+            erase_locked(victim);
+            return true;
+        }
+
+        // Caller must hold the exclusive lock. Evict until both the byte
+        // budget and the entry backstop hold. Always keeps at least one entry,
+        // and the byte budget alone never goes below budget_floor_entries.
+        void evict_to_budget_locked() const
+        {
+            while (((byte_budget && cache_bytes > max_cache_bytes
+                     && grid_cache.size() > budget_floor_entries)
+                    || grid_cache.size() > max_cache_entries)
+                   && grid_cache.size() > 1) {
+                if (!evict_one_locked()) {
+                    break;
+                }
+            }
+        }
+
         NormalGridVolume::CacheStats cacheStats() const {
             NormalGridVolume::CacheStats stats;
             stats.gridHits = cache_hits.load(std::memory_order_relaxed);
             stats.gridMisses = cache_misses.load(std::memory_order_relaxed);
+            stats.fetchFailures = fetch_failures.load(std::memory_order_relaxed);
+            {
+                std::lock_guard<std::mutex> lock(fetch_error_mutex);
+                stats.lastFetchError = last_fetch_error;
+            }
 
             std::shared_lock<std::shared_mutex> lock(mutex);
             stats.liveGridEntries = grid_cache.size();
@@ -228,6 +648,8 @@
                 stats.decodedPathEvictions += grid_stats.decodedPathEvictions;
                 stats.decodedPathEntries += grid_stats.decodedPathEntries;
                 stats.decodedPathBytes += grid_stats.decodedPathBytes;
+                stats.bucketIndexEntries += grid_stats.bucketIndexEntries;
+                stats.bucketIndexBytes += grid_stats.bucketIndexBytes;
             }
             return stats;
         }
@@ -304,7 +726,52 @@
     NormalGridVolume::~NormalGridVolume() = default;
     NormalGridVolume::NormalGridVolume(NormalGridVolume&&) noexcept = default;
     NormalGridVolume& NormalGridVolume::operator=(NormalGridVolume&&) noexcept = default;
-    const utils::Json& NormalGridVolume::metadata() const {
+    const nlohmann::json& NormalGridVolume::metadata() const {
         return pimpl_->metadata;
     }
+std::optional<std::string> normalGridsRemoteUrl(const std::filesystem::path& dir)
+{
+    const fs::path marker = dir / kNormalGridsRemoteMarker;
+    std::error_code ec;
+    if (!fs::is_regular_file(marker, ec)) {
+        return std::nullopt;
+    }
+    std::string url;
+    try {
+        url = nlohmann::json::parse(std::ifstream(marker)).value("url", std::string());
+    } catch (const std::exception& e) {
+        std::cerr << "Ignoring unreadable " << marker << ": " << e.what() << std::endl;
+        return std::nullopt;
+    }
+    while (!url.empty() && url.back() == '/') {
+        url.pop_back();
+    }
+    return url;
+}
+
+bool writeNormalGridsRemoteMarker(const std::filesystem::path& dir, const std::string& url)
+{
+    if (normalGridsRemoteUrl(dir) == url) {
+        return true;
+    }
+    std::error_code ec;
+    fs::create_directories(dir, ec);
+    if (ec) {
+        return false;
+    }
+    auto marker = nlohmann::json::object();
+    marker["url"] = url;
+    std::ofstream out(dir / kNormalGridsRemoteMarker, std::ios::trunc);
+    out << marker.dump(2);
+    out.close();
+    return static_cast<bool>(out);
+}
+
+bool hasNormalGridFiles(const std::filesystem::path& dir)
+{
+    std::error_code ec;
+    return fs::is_directory(dir / "xy", ec) && fs::is_directory(dir / "xz", ec) &&
+           fs::is_directory(dir / "yz", ec) && fs::is_regular_file(dir / "metadata.json", ec);
+}
+
 } // namespace vc::core::util

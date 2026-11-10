@@ -24,9 +24,6 @@ public:
     explicit SegmentationCorrectionsPanel(const QString& settingsGroup,
                                           QWidget* parent = nullptr);
 
-    // Getters
-    [[nodiscard]] bool correctionsEnabled() const { return _correctionsEnabled; }
-
     // Setters
     void setCorrectionsEnabled(bool enabled);
     void setCorrectionCollections(const QVector<QPair<uint64_t, QString>>& collections,
@@ -38,6 +35,7 @@ public:
 signals:
     void correctionsCreateRequested();
     void correctionsCollectionSelected(uint64_t collectionId);
+    void correctionsCollectionSelectionCleared();
 
 private:
     void writeSetting(const QString& key, const QVariant& value);
@@ -48,6 +46,5 @@ private:
 
     bool _correctionsEnabled{false};
 
-    bool _restoringSettings{false};
     const QString _settingsGroup;
 };
